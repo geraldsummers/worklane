@@ -20,14 +20,12 @@ build tooling, as well as Codex, Herdr, Git, and GitHub CLI.
 ## First lane
 
 ```sh
-worklane image build --context . --tag localhost/worklane:latest
 worklane lane create my-project
 worklane lane attach my-project
 ```
 
-`create` defaults both `--project` and `--build-context` to the project path,
-and uses Worklane's standard embedded Containerfile unless `--containerfile`
-is supplied. If the declared image is missing, it is built automatically before
+`create` defaults the project and build context to the current directory and
+uses the `default` profile. If the declared image is missing, it is built automatically before
 the lane starts. `lane attach` starts or reattaches the lane's default persistent Herdr session.
 Detach with `Ctrl-B q`; panes and agents keep running in the lane. Use
 `worklane lane attach my-project --shell` for a plain zsh login shell. Use
@@ -40,7 +38,7 @@ To build for a managed host, the Containerfile and build context must already ex
 ```sh
 worklane image build --host lab --context /home/gerald/worklane --tag localhost/worklane:latest
 worklane lane create my-project --host lab --project /home/gerald/projects/my-project \
-  --image worklane:latest
+  --profile default
 ```
 
 The canonical controller registry is `~/.local/share/worklane/worklane.db`. Each local lane has a recoverable specification at `~/.local/share/worklane/lanes/<id>/lane.toml` and persistent home under the same directory. `destroy` archives that directory and never touches the project. `purge --yes` is explicitly destructive.
@@ -56,3 +54,24 @@ worklane host deploy lab --binary target/x86_64-unknown-linux-gnu/release/workla
 The SSH transport uses the existing OpenSSH configuration with `StrictHostKeyChecking=yes`; unknown or changed keys are rejected. Deployment copies a versioned binary, verifies SHA-256 on the host, then atomically updates `~/.local/bin/worklane`.
 
 All control commands accept `--json`. `image build` and `image inspect` accept `--host`; `image push` is intentionally unavailable. `lane upgrade` rebuilds the lane image from its stored host-native build context before recreating the container. Run `lane` for the keyboard-first terminal view; it uses cached lane state when hosts are unreachable.
+
+## Profiles
+
+Profiles are named entries in `~/.config/worklane/profiles.toml`. The built-in
+`default` profile uses the embedded Containerfile, outbound networking, and no
+extra mounts. A profile is snapshotted when a lane is created.
+
+```toml
+[profiles.docs]
+image = "worklane:latest"
+network = "outbound"
+
+[[profiles.docs.mounts]]
+source = "/home/gerald/.cache/pip"
+target = "/home/gerald/.cache/pip"
+read_only = false
+```
+
+Create with `worklane lane create docs --profile docs`. Mount sources and
+targets must be absolute; Worklane rejects mounts that overlap its managed home
+or project workspace.

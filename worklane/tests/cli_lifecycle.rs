@@ -1,4 +1,8 @@
-use std::{env, fs, path::PathBuf, process::Command};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 fn temp(name: &str) -> PathBuf {
     let path = env::temp_dir().join(format!("worklane-cli-{name}-{}", std::process::id()));
@@ -7,7 +11,7 @@ fn temp(name: &str) -> PathBuf {
     path
 }
 
-fn run(binary: &str, data: &PathBuf, bin: &PathBuf, args: &[&str]) -> String {
+fn run(binary: &str, data: &Path, bin: &Path, args: &[&str]) -> String {
     let output = Command::new(binary)
         .args(args)
         .env("XDG_DATA_HOME", data)
@@ -25,7 +29,7 @@ fn run(binary: &str, data: &PathBuf, bin: &PathBuf, args: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap()
 }
 
-fn run_failure(binary: &str, data: &PathBuf, bin: &PathBuf, args: &[&str]) -> String {
+fn run_failure(binary: &str, data: &Path, bin: &Path, args: &[&str]) -> String {
     let output = Command::new(binary)
         .args(args)
         .env("XDG_DATA_HOME", data)
@@ -79,14 +83,10 @@ esac
             "smoke",
             "--project",
             &project_arg,
-            "--image",
-            "test:latest",
             "--id",
             "smoke-fixed-id",
             "--user",
             "dev",
-            "--build-context",
-            &project_arg,
         ],
     );
     assert!(created.contains("\"state\":\"running\""));
@@ -94,14 +94,7 @@ esac
         binary,
         &data,
         &bin_dir,
-        &[
-            "--json",
-            "lane",
-            "create",
-            "defaults",
-            "--image",
-            "test:latest"
-        ]
+        &["--json", "lane", "create", "defaults",]
     )
     .contains("\"state\":\"running\""));
     let default_lane = run(
@@ -215,8 +208,6 @@ esac
             "create",
             "drift",
             "--project",
-            &project_arg,
-            "--build-context",
             &project_arg,
         ],
     );
@@ -350,10 +341,13 @@ fn remote_controller_relays_json_lifecycle() {
     fs::create_dir_all(&bin_dir).unwrap();
     let ssh = bin_dir.join("ssh");
     fs::write(&ssh, r#"#!/bin/sh
+payload=$(cat)
 case "$*" in
   *"id -un") echo gerald; exit 0;;
-  *"lane upgrade"*) echo '[]'; exit 0;;
-  *"lane diff"*) echo '{"lane":"remote-id","diff":["C /etc/example"]}'; exit 0;;
+esac
+case "$payload" in
+  *"upgrade"*) echo '[]'; exit 0;;
+  *"diff"*) echo '{"lane":"remote-id","diff":["C /etc/example"]}'; exit 0;;
 esac
 cat <<'JSON'
 {"spec":{"version":1,"id":"remote-id","name":"remote","host":"local","user":"gerald","project_path":"/tmp/project","profile":{"image":"localhost/test:latest","build_context":null,"containerfile":"Containerfile","network":"outbound","mounts":[]},"created_at":"2026-01-01T00:00:00Z","image_digest":null},"state":"running","drift":false,"cached_at":"2026-01-01T00:00:00Z"}
@@ -413,10 +407,6 @@ JSON
             "lab",
             "--project",
             "/tmp/project",
-            "--image",
-            "localhost/test:latest",
-            "--build-context",
-            "/tmp/build"
         ]
     )
     .contains("running"));

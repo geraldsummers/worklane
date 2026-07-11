@@ -4,6 +4,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::{
     fs, io,
     path::{Path, PathBuf},
@@ -12,6 +13,7 @@ use std::{
 use uuid::Uuid;
 
 pub const DEFAULT_IMAGE: &str = "worklane:latest";
+pub const EXECUTOR_PROTOCOL: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Host {
@@ -36,7 +38,19 @@ pub struct Profile {
     #[serde(default = "default_network")]
     pub network: String,
     #[serde(default)]
-    pub mounts: Vec<String>,
+    pub mounts: Vec<MountSpec>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MountSpec {
+    pub source: PathBuf,
+    pub target: PathBuf,
+    #[serde(default)]
+    pub read_only: bool,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ProfilesFile {
+    #[serde(default)]
+    pub profiles: BTreeMap<String, Profile>,
 }
 fn default_containerfile() -> PathBuf {
     PathBuf::from("Containerfile")
@@ -59,6 +73,51 @@ impl Default for Profile {
         }
     }
 }
+pub fn config_dir() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from(".config"))
+        .join("worklane")
+}
+pub fn profiles_path() -> PathBuf {
+    config_dir().join("profiles.toml")
+}
+pub fn load_profiles() -> Result<BTreeMap<String, Profile>> {
+    let mut profiles = BTreeMap::from([("default".into(), Profile::default())]);
+    let path = profiles_path();
+    if path.exists() {
+        profiles.extend(toml::from_str::<ProfilesFile>(&fs::read_to_string(path)?)?.profiles);
+    }
+    Ok(profiles)
+}
+pub fn validate_profile(
+    profile: &Profile,
+    home: &Path,
+    workspace: &Path,
+    require_sources: bool,
+) -> Result<()> {
+    if !matches!(profile.network.as_str(), "outbound" | "none") {
+        bail!("profile network must be 'outbound' or 'none'")
+    }
+    for mount in &profile.mounts {
+        if !mount.source.is_absolute() || !mount.target.is_absolute() {
+            bail!("profile mount source and target must be absolute paths")
+        }
+        if mount.target == home
+            || mount.target == workspace
+            || mount.target.starts_with(home)
+            || mount.target.starts_with(workspace)
+        {
+            bail!("profile mount target conflicts with Worklane-managed home or workspace")
+        }
+        if require_sources && !mount.source.exists() {
+            bail!(
+                "profile mount source does not exist: {}",
+                mount.source.display()
+            )
+        }
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LaneSpec {
@@ -71,9 +130,14 @@ pub struct LaneSpec {
     pub project_path: PathBuf,
     #[serde(default)]
     pub profile: Profile,
+    #[serde(default = "default_profile_name")]
+    pub profile_name: String,
     pub created_at: DateTime<Utc>,
     #[serde(default)]
     pub image_digest: Option<String>,
+}
+fn default_profile_name() -> String {
+    "default".into()
 }
 fn default_lane_user() -> String {
     "dev".into()
@@ -100,6 +164,7 @@ impl LaneSpec {
             user: std::env::var("USER").unwrap_or_else(|_| default_lane_user()),
             project_path: project_path.canonicalize().unwrap_or(project_path),
             profile,
+            profile_name: default_profile_name(),
             created_at: Utc::now(),
             image_digest: None,
         })
@@ -124,6 +189,11 @@ pub struct LaneStatus {
     pub state: String,
     pub drift: bool,
     pub cached_at: DateTime<Utc>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutorRequest {
+    pub protocol: u32,
+    pub args: Vec<String>,
 }
 
 pub fn data_dir() -> PathBuf {
@@ -154,6 +224,19 @@ impl Store {
     }
     fn migrate(&self) -> Result<()> {
         self.conn.execute_batch("CREATE TABLE IF NOT EXISTS hosts(name TEXT PRIMARY KEY, ssh_target TEXT NOT NULL, local INTEGER NOT NULL, installed_version TEXT, last_seen TEXT); CREATE TABLE IF NOT EXISTS lanes(id TEXT PRIMARY KEY, name TEXT NOT NULL, host TEXT NOT NULL, spec_toml TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'unknown', drift INTEGER NOT NULL DEFAULT 0, cached_at TEXT NOT NULL);")?;
+        let duplicate: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT name FROM lanes GROUP BY name HAVING COUNT(*) > 1 LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .ok();
+        if let Some(name) = duplicate {
+            bail!("database contains duplicate lane name '{name}'; resolve it before migrating")
+        }
+        self.conn
+            .execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS lanes_unique_name ON lanes(name);")?;
         Ok(())
     }
     pub fn upsert_host(&self, h: &Host) -> Result<()> {
@@ -219,10 +302,27 @@ impl Store {
         self.conn.execute("DELETE FROM lanes WHERE id=?1", [id])?;
         Ok(())
     }
+    pub fn rename_lane(&self, id: &str, new_name: &str) -> Result<LaneSpec> {
+        let mut spec = self.lane(id)?;
+        if !new_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            || new_name.is_empty()
+        {
+            bail!("lane name must contain only letters, digits, '-' or '_'")
+        }
+        spec.name = new_name.into();
+        self.save_lane(&spec, "unknown", false)?;
+        Ok(spec)
+    }
 }
 
 pub trait Runner {
     fn run(&self, program: &str, args: &[String]) -> Result<String>;
+    fn run_with_input(&self, program: &str, args: &[String], input: &[u8]) -> Result<String> {
+        let _ = input;
+        self.run(program, args)
+    }
     fn run_streaming(&self, program: &str, args: &[String]) -> Result<String> {
         self.run(program, args)
     }
@@ -245,6 +345,33 @@ impl Runner for SystemRunner {
             )
         };
         Ok(String::from_utf8_lossy(&o.stdout).trim().into())
+    }
+    fn run_with_input(&self, program: &str, args: &[String], input: &[u8]) -> Result<String> {
+        let mut child = Command::new(program)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(if program == "ssh" {
+                Stdio::inherit()
+            } else {
+                Stdio::piped()
+            })
+            .spawn()
+            .with_context(|| format!("run {program}"))?;
+        use std::io::Write;
+        child
+            .stdin
+            .take()
+            .context("child stdin")?
+            .write_all(input)?;
+        let output = child.wait_with_output()?;
+        if !output.status.success() {
+            bail!(
+                "{program} failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().into())
     }
     fn run_streaming(&self, program: &str, args: &[String]) -> Result<String> {
         let mut child = Command::new(program)
@@ -293,6 +420,21 @@ pub fn ssh_command(target: &str, remote_args: &[String]) -> Vec<String> {
     ];
     a.extend(remote_args.iter().cloned());
     a
+}
+pub fn executor_command(target: &str) -> Vec<String> {
+    vec![
+        "-o".into(),
+        "StrictHostKeyChecking=yes".into(),
+        target.into(),
+        "~/.local/bin/worklane".into(),
+        "executor".into(),
+    ]
+}
+pub fn executor_request(args: Vec<String>) -> Result<Vec<u8>> {
+    Ok(serde_json::to_vec(&ExecutorRequest {
+        protocol: EXECUTOR_PROTOCOL,
+        args,
+    })?)
 }
 pub fn host_state(r: &impl Runner, spec: &LaneSpec) -> Result<(String, bool)> {
     let name = spec.container_name();
@@ -464,6 +606,42 @@ mod tests {
         assert_eq!(profile.containerfile, PathBuf::from("Containerfile"));
         assert!(profile.embedded_containerfile);
         assert!(profile.build_context.is_none());
+    }
+
+    #[test]
+    fn profiles_validate_network_and_managed_mount_targets() {
+        let mut profile = Profile {
+            network: "invalid".into(),
+            ..Profile::default()
+        };
+        assert!(validate_profile(
+            &profile,
+            Path::new("/home/gerald"),
+            Path::new("/home/gerald/workspace"),
+            false
+        )
+        .is_err());
+        profile.network = "none".into();
+        profile.mounts.push(MountSpec {
+            source: PathBuf::from("/tmp"),
+            target: PathBuf::from("/home/gerald/workspace/tools"),
+            read_only: true,
+        });
+        assert!(validate_profile(
+            &profile,
+            Path::new("/home/gerald"),
+            Path::new("/home/gerald/workspace"),
+            false
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn executor_requests_are_versioned_json() {
+        let body = executor_request(vec!["lane".into(), "list".into()]).unwrap();
+        let request: ExecutorRequest = serde_json::from_slice(&body).unwrap();
+        assert_eq!(request.protocol, EXECUTOR_PROTOCOL);
+        assert_eq!(request.args, ["lane", "list"]);
     }
 
     #[test]

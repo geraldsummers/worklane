@@ -2,7 +2,12 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
-use std::{fs, path::PathBuf, process::Command};
+use std::{
+    fs,
+    io::{self, Read, Write},
+    path::PathBuf,
+    process::Command,
+};
 use worklane_core::*;
 
 /// The standard lane image recipe travels with every `worklane` binary.
@@ -21,6 +26,8 @@ enum Top {
     Host(HostCmd),
     Image(ImageCmd),
     Lane(LaneCmd),
+    #[command(hide = true)]
+    Executor,
 }
 #[derive(Args)]
 struct HostCmd {
@@ -84,21 +91,27 @@ enum LaneAction {
         host: String,
         #[arg(long, default_value = ".")]
         project: PathBuf,
-        #[arg(long,default_value=DEFAULT_IMAGE)]
-        image: String,
-        #[arg(long)]
-        build_context: Option<PathBuf>,
-        /// Use this host-native Containerfile instead of Worklane's standard embedded recipe.
-        #[arg(long)]
-        containerfile: Option<PathBuf>,
         #[arg(long, hide = true)]
         id: Option<String>,
         #[arg(long, hide = true)]
         user: Option<String>,
+        #[arg(long, hide = true)]
+        profile_json: Option<String>,
+        #[arg(long, default_value = "default")]
+        profile: String,
     },
     List,
     Inspect {
         lane: String,
+    },
+    Rename {
+        lane: String,
+        new_name: String,
+    },
+    Refresh {
+        lane: Option<String>,
+        #[arg(long)]
+        all: bool,
     },
     /// Show writable-root changes that would be lost on recreation.
     Diff {
@@ -162,7 +175,11 @@ fn remote<R: Runner>(
     if host.local {
         return Ok(None);
     }
-    let out = runner.run("ssh", &ssh_command(&host.ssh_target, &args))?;
+    let out = runner.run_with_input(
+        "ssh",
+        &executor_command(&host.ssh_target),
+        &executor_request(args)?,
+    )?;
     Ok(Some(out))
 }
 fn remote_host<R: Runner>(
@@ -182,9 +199,11 @@ fn remote_host<R: Runner>(
     if host.local {
         return Ok(None);
     }
-    Ok(Some(
-        runner.run("ssh", &ssh_command(&host.ssh_target, &args))?,
-    ))
+    Ok(Some(runner.run_with_input(
+        "ssh",
+        &executor_command(&host.ssh_target),
+        &executor_request(args)?,
+    )?))
 }
 fn remote_username<R: Runner>(runner: &R, store: &Store, name: &str) -> Result<String> {
     if name == "local" {
@@ -218,7 +237,7 @@ fn embedded_containerfile_path() -> Result<PathBuf> {
 fn image_build_args<R: Runner>(
     runner: &R,
     file: Option<&PathBuf>,
-    context: &PathBuf,
+    context: &std::path::Path,
     tag: &str,
 ) -> Result<Vec<String>> {
     let file = match file {
@@ -277,8 +296,25 @@ fn local_start<R: Runner>(r: &R, spec: &LaneSpec) -> Result<()> {
             spec.container_home().display()
         ),
     ];
+    for mount in &spec.profile.mounts {
+        a.extend([
+            "--mount".into(),
+            format!(
+                "type=bind,src={},dst={},{}",
+                mount.source.display(),
+                mount.target.display(),
+                if mount.read_only {
+                    "ro=true"
+                } else {
+                    "rw=true"
+                }
+            ),
+        ]);
+    }
     if spec.profile.network == "outbound" {
         a.extend(["--network".into(), "slirp4netns".into()]);
+    } else if spec.profile.network == "none" {
+        a.extend(["--network".into(), "none".into()]);
     }
     a.push(
         spec.image_digest
@@ -359,11 +395,33 @@ grep -qxF 'source "$HOME/.config/worklane/prompt.zsh"' "$HOME/.zshrc" || \
     }
     Ok(())
 }
+fn run_executor() -> Result<()> {
+    let mut input = Vec::new();
+    io::stdin().read_to_end(&mut input)?;
+    let request: ExecutorRequest = serde_json::from_slice(&input)?;
+    if request.protocol != EXECUTOR_PROTOCOL {
+        bail!("executor protocol mismatch: deploy a matching worklane binary")
+    }
+    if request.args.first().is_some_and(|arg| arg == "executor") {
+        bail!("nested executor request rejected")
+    }
+    let output = Command::new(std::env::current_exe()?)
+        .arg("--json")
+        .args(&request.args)
+        .output()?;
+    io::stderr().write_all(&output.stderr)?;
+    io::stdout().write_all(&output.stdout)?;
+    if !output.status.success() {
+        bail!("executor command failed")
+    }
+    Ok(())
+}
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let store = Store::open_default()?;
     let runner = SystemRunner;
     match cli.command {
+        Top::Executor => run_executor(),
         Top::Host(c) => match c.command {
             HostAction::Add { name, ssh } => {
                 let h = Host {
@@ -386,7 +444,7 @@ fn main() -> Result<()> {
                         SystemRunner
                             .run(
                                 "ssh",
-                                &ssh_command(&h.ssh_target, &vec!["host".into(), "list".into()]),
+                                &ssh_command(&h.ssh_target, &["host".into(), "list".into()]),
                             )
                             .is_ok()
                     };
@@ -406,7 +464,7 @@ fn main() -> Result<()> {
                     .context("unknown host")?;
                 SystemRunner.run(
                     "ssh",
-                    &vec![
+                    &[
                         h.ssh_target,
                         "mkdir -p ~/.local/share/worklane/{bin,lanes,archives}".into(),
                     ],
@@ -421,7 +479,7 @@ fn main() -> Result<()> {
                 binary,
                 checksum,
             } => {
-                let h = store
+                let mut h = store
                     .hosts()?
                     .into_iter()
                     .find(|x| x.name == name)
@@ -436,13 +494,15 @@ fn main() -> Result<()> {
                 let remote_path = format!("~/.local/share/worklane/bin/worklane-{version}");
                 SystemRunner.run(
                     "scp",
-                    &vec![
+                    &[
                         binary.display().to_string(),
                         format!("{}:{}", h.ssh_target, remote_path),
                     ],
                 )?;
                 let script=format!("set -eu; test \"$(sha256sum {remote_path} | cut -d' ' -f1)\" = '{sum}'; chmod 755 {remote_path}; ln -sfn {remote_path} ~/.local/bin/worklane");
-                SystemRunner.run("ssh", &vec![h.ssh_target, script])?;
+                SystemRunner.run("ssh", &[h.ssh_target.clone(), script])?;
+                h.installed_version = Some(version.into());
+                store.upsert_host(&h)?;
                 emit(
                     cli.json,
                     &serde_json::json!({"host":name,"sha256":sum,"activated":true}),
@@ -508,11 +568,10 @@ fn main() -> Result<()> {
                 name,
                 host,
                 project,
-                image,
-                build_context,
-                containerfile,
                 id,
                 user,
+                profile_json,
+                profile: profile_name,
             } => {
                 let p = if host == "local" {
                     project
@@ -521,21 +580,17 @@ fn main() -> Result<()> {
                 } else {
                     project
                 };
-                let build_context = build_context.or_else(|| Some(p.clone()));
-                let embedded_containerfile = containerfile.is_none();
-                let mut spec = LaneSpec::new(
-                    name,
-                    host,
-                    p,
-                    Profile {
-                        image,
-                        build_context,
-                        containerfile: containerfile
-                            .unwrap_or_else(|| PathBuf::from("Containerfile")),
-                        embedded_containerfile,
-                        ..Profile::default()
-                    },
-                )?;
+                let mut selected_profile: Profile = match profile_json {
+                    Some(json) => serde_json::from_str(&json)?,
+                    None => load_profiles()?
+                        .remove(&profile_name)
+                        .with_context(|| format!("unknown profile '{profile_name}'"))?,
+                };
+                selected_profile
+                    .build_context
+                    .get_or_insert_with(|| p.clone());
+                let mut spec = LaneSpec::new(name, host, p, selected_profile)?;
+                spec.profile_name = profile_name;
                 if let Some(id) = id {
                     spec.id = id;
                 }
@@ -545,6 +600,12 @@ fn main() -> Result<()> {
                 if spec.host != "local" {
                     spec.user = remote_username(&runner, &store, &spec.host)?;
                 }
+                validate_profile(
+                    &spec.profile,
+                    &spec.container_home(),
+                    &spec.container_home().join("workspace"),
+                    spec.host == "local",
+                )?;
                 if spec.host == "local" {
                     write_lane_spec(&spec)?;
                     local_start(&runner, &spec)?;
@@ -563,23 +624,22 @@ fn main() -> Result<()> {
                         "local".into(),
                         "--project".into(),
                         spec.project_path.display().to_string(),
-                        "--image".into(),
-                        spec.profile.image.clone(),
                         "--id".into(),
                         spec.id.clone(),
                         "--user".into(),
                         spec.user.clone(),
                     ];
-                    if !spec.profile.embedded_containerfile {
-                        args.extend([
-                            "--containerfile".into(),
-                            spec.profile.containerfile.display().to_string(),
-                        ]);
-                    }
-                    if let Some(context) = &spec.profile.build_context {
-                        args.extend(["--build-context".into(), context.display().to_string()]);
-                    }
-                    let out = SystemRunner.run("ssh", &ssh_command(&h.ssh_target, &args))?;
+                    args.extend([
+                        "--profile".into(),
+                        spec.profile_name.clone(),
+                        "--profile-json".into(),
+                        serde_json::to_string(&spec.profile)?,
+                    ]);
+                    let out = SystemRunner.run_with_input(
+                        "ssh",
+                        &executor_command(&h.ssh_target),
+                        &executor_request(args)?,
+                    )?;
                     let status: LaneStatus = serde_json::from_str(&out)?;
                     store.save_lane(&spec, &status.state, status.drift)?;
                 };
@@ -589,6 +649,25 @@ fn main() -> Result<()> {
             LaneAction::Inspect { lane } => {
                 let s = store.lane(&lane)?;
                 emit(cli.json, &refresh(&runner, &store, &s)?)
+            }
+            LaneAction::Rename { lane, new_name } => {
+                emit(cli.json, &store.rename_lane(&lane, &new_name)?)
+            }
+            LaneAction::Refresh { lane, all } => {
+                let specs = if all {
+                    store
+                        .lanes()?
+                        .into_iter()
+                        .map(|status| status.spec)
+                        .collect()
+                } else {
+                    vec![store.lane(&lane.context("provide a lane or --all")?)?]
+                };
+                let mut statuses = Vec::new();
+                for spec in specs {
+                    statuses.push(refresh(&runner, &store, &spec)?);
+                }
+                emit(cli.json, &statuses)
             }
             LaneAction::Diff { lane, raw } => {
                 let s = store.lane(&lane)?;
@@ -729,7 +808,7 @@ fn main() -> Result<()> {
                     bail!("container has writable-root drift; inspect it or rerun with --force")
                 };
                 if s.host == "local" {
-                    let _ = podman(&SystemRunner, ["rm", "-f", &s.container_name()]);
+                    podman(&SystemRunner, ["rm", "-f", &s.container_name()])?;
                 } else {
                     let out = remote(
                         &runner,

@@ -143,10 +143,13 @@ fn action_with_args(app: &mut App, verb: &str, extra: &[&str]) -> Result<()> {
     args.extend(extra.iter().copied());
     let mut command = Command::new("worklane");
     command.args(args);
-    let status = if verb == "attach" {
-        command.status()?
-    } else {
-        let output = command.output()?;
+    if verb == "attach" {
+        let status = command.status()?;
+        app.message = format!("{verb}: {}", if status.success() { "ok" } else { "failed" });
+        return Ok(());
+    }
+    let output = command.output()?;
+    if output.status.success() {
         if verb == "diff" {
             let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
             let lines = value["diff"]
@@ -165,21 +168,44 @@ fn action_with_args(app: &mut App, verb: &str, extra: &[&str]) -> Result<()> {
         } else {
             app.detail.clear();
         }
-        output.status
-    };
-    app.message = format!("{verb}: {}", if status.success() { "ok" } else { "failed" });
-    app.lanes = Store::open_default()?.lanes()?;
+        app.message = format!("{verb}: ok");
+        app.lanes = Store::open_default()?.lanes()?;
+    } else {
+        app.message = format!("{verb}: failed");
+        app.detail = String::from_utf8_lossy(&output.stderr).trim().into();
+    }
     Ok(())
+}
+fn refresh_all(app: &mut App) -> Result<()> {
+    let output = Command::new("worklane")
+        .args(["lane", "refresh", "--all"])
+        .output()?;
+    if output.status.success() {
+        app.lanes = Store::open_default()?.lanes()?;
+        app.message = "refreshed reachable lanes".into();
+        app.detail.clear();
+    } else {
+        app.message = "refresh: failed".into();
+        app.detail = String::from_utf8_lossy(&output.stderr).trim().into();
+    }
+    Ok(())
+}
+struct TerminalGuard;
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let mut stdout = io::stdout();
+        let _ = execute!(stdout, LeaveAlternateScreen);
+    }
 }
 fn main() -> Result<()> {
     enable_raw_mode()?;
+    let _guard = TerminalGuard;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     let result = run(&mut terminal);
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     result
 }
@@ -225,8 +251,7 @@ fn run_app(
                 }
             }
             UiAction::Reload => {
-                app.lanes = Store::open_default()?.lanes()?;
-                app.message = "reloaded cached status".into()
+                refresh_all(app)?;
             }
             UiAction::None => {}
         }
@@ -523,7 +548,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(redraws, 6);
-        assert_eq!(app.message, "reloaded cached status");
+        assert_eq!(app.message, "refreshed reachable lanes");
         let mut attach_key = Some(KeyCode::Char('a'));
         let mut attach_redraws = 0;
         run_app(
