@@ -7,7 +7,7 @@ use crossterm::{
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     widgets::{Block, Borders, List, ListItem, Paragraph},
     Terminal,
 };
@@ -18,6 +18,7 @@ struct App {
     lanes: Vec<LaneStatus>,
     selected: usize,
     filter: String,
+    filtering: bool,
     message: String,
 }
 #[derive(Debug, PartialEq, Eq)]
@@ -33,7 +34,8 @@ impl App {
             lanes: Store::open_default()?.lanes()?,
             selected: 0,
             filter: String::new(),
-            message: "j/k move • a Herdr • S shell • s start • x stop • u upgrade • i inspect • r refresh • q quit"
+            filtering: false,
+            message: "j/k move • / filter • a Herdr • S shell • s start • x stop • u upgrade • i inspect • r refresh • q quit"
                 .into(),
         })
     }
@@ -44,6 +46,31 @@ impl App {
             .collect()
     }
     fn handle_key(&mut self, key: KeyCode) -> UiAction {
+        if self.filtering {
+            return match key {
+                KeyCode::Esc => {
+                    self.filter.clear();
+                    self.filtering = false;
+                    self.selected = 0;
+                    UiAction::None
+                }
+                KeyCode::Enter => {
+                    self.filtering = false;
+                    UiAction::None
+                }
+                KeyCode::Backspace => {
+                    self.filter.pop();
+                    self.selected = 0;
+                    UiAction::None
+                }
+                KeyCode::Char(c) => {
+                    self.filter.push(c);
+                    self.selected = 0;
+                    UiAction::None
+                }
+                _ => UiAction::None,
+            };
+        }
         match key {
             KeyCode::Char('q') => UiAction::Quit,
             KeyCode::Char('j') | KeyCode::Down => {
@@ -64,13 +91,14 @@ impl App {
             KeyCode::Char('S') => UiAction::Command("attach", true),
             KeyCode::Char('i') => UiAction::Command("inspect", false),
             KeyCode::Char('r') => UiAction::Reload,
-            KeyCode::Backspace => {
-                self.filter.pop();
+            KeyCode::Char('/') => {
+                self.filter.clear();
+                self.filtering = true;
                 self.selected = 0;
                 UiAction::None
             }
-            KeyCode::Char(c) => {
-                self.filter.push(c);
+            KeyCode::Backspace => {
+                self.filter.pop();
                 self.selected = 0;
                 UiAction::None
             }
@@ -145,6 +173,29 @@ fn run_app(
     }
     Ok(())
 }
+fn column(value: &str, width: usize) -> String {
+    if value.chars().count() > width {
+        format!(
+            "{:<width$}",
+            format!("{}~", value.chars().take(width - 1).collect::<String>())
+        )
+    } else {
+        format!("{value:<width$}")
+    }
+}
+fn lane_style(state: &str, drift: bool) -> Style {
+    let color = if drift {
+        Color::Red
+    } else {
+        match state {
+            "running" => Color::Green,
+            "created" | "starting" => Color::Cyan,
+            "exited" | "stopped" | "absent" => Color::Red,
+            _ => Color::Yellow,
+        }
+    };
+    Style::default().fg(color)
+}
 fn draw(f: &mut ratatui::Frame, app: &App) {
     let areas = Layout::default()
         .direction(Direction::Vertical)
@@ -154,23 +205,32 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             Constraint::Length(3),
         ])
         .split(f.area());
-    let items = app
-        .visible()
-        .iter()
-        .enumerate()
-        .map(|(i, x)| {
-            let flag = if x.drift { " drift" } else { "" };
-            ListItem::new(format!(
-                "{}  {:<10} {:<10} {}{}",
-                x.spec.name, x.spec.host, x.state, x.spec.profile.image, flag
-            ))
-            .style(if i == app.selected {
-                Style::default().fg(Color::Yellow)
-            } else {
-                Style::default()
-            })
+    let mut items = vec![ListItem::new(format!(
+        "{} {} {} {}",
+        column("NAME", 18),
+        column("HOST", 14),
+        column("STATE", 10),
+        "IMAGE"
+    ))
+    .style(Style::default().fg(Color::DarkGray))];
+    items.extend(app.visible().iter().enumerate().map(|(i, x)| {
+        let flag = if x.drift { " drift" } else { "" };
+        ListItem::new(format!(
+            "{} {} {} {}{}",
+            column(&x.spec.name, 18),
+            column(&x.spec.host, 14),
+            column(&x.state, 10),
+            x.spec.profile.image,
+            flag
+        ))
+        .style(if i == app.selected {
+            lane_style(&x.state, x.drift)
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            lane_style(&x.state, x.drift)
         })
-        .collect::<Vec<_>>();
+    }));
     f.render_widget(
         List::new(items).block(
             Block::default()
@@ -180,8 +240,16 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         areas[0],
     );
     f.render_widget(
-        Paragraph::new(format!("Filter: {}", app.filter))
-            .block(Block::default().borders(Borders::ALL)),
+        Paragraph::new(format!(
+            "Filter{}: {}",
+            if app.filtering {
+                " (typing; Enter keeps, Esc clears)"
+            } else {
+                " (/ to edit)"
+            },
+            app.filter
+        ))
+        .block(Block::default().borders(Borders::ALL)),
         areas[1],
     );
     f.render_widget(
@@ -217,6 +285,7 @@ mod tests {
             }],
             selected: 0,
             filter: String::new(),
+            filtering: false,
             message: String::new(),
         }
     }
@@ -228,6 +297,12 @@ mod tests {
     #[test]
     fn reducer_covers_navigation_filter_and_actions() {
         let mut app = app();
+        assert_eq!(app.handle_key(KeyCode::Char('/')), UiAction::None);
+        assert!(app.filtering);
+        app.handle_key(KeyCode::Char('a'));
+        assert_eq!(app.filter, "a");
+        assert_eq!(app.handle_key(KeyCode::Enter), UiAction::None);
+        assert!(!app.filtering);
         assert_eq!(
             app.handle_key(KeyCode::Char('a')),
             UiAction::Command("attach", false)
@@ -254,15 +329,19 @@ mod tests {
         );
         assert_eq!(app.handle_key(KeyCode::Char('r')), UiAction::Reload);
         assert_eq!(app.handle_key(KeyCode::Char('q')), UiAction::Quit);
+        app.handle_key(KeyCode::Char('/'));
         app.handle_key(KeyCode::Char('z'));
         assert_eq!(app.filter, "z");
-        app.handle_key(KeyCode::Backspace);
+        app.handle_key(KeyCode::Esc);
         assert!(app.filter.is_empty());
         app.handle_key(KeyCode::Down);
         assert_eq!(app.selected, 0);
         app.handle_key(KeyCode::Up);
         assert_eq!(app.selected, 0);
         assert_eq!(app.handle_key(KeyCode::F(1)), UiAction::None);
+        assert_eq!(lane_style("running", false).fg, Some(Color::Green));
+        assert_eq!(lane_style("exited", false).fg, Some(Color::Red));
+        assert_eq!(lane_style("unknown", true).fg, Some(Color::Red));
     }
 
     #[test]
@@ -329,6 +408,7 @@ mod tests {
             lanes: vec![],
             selected: 0,
             filter: String::new(),
+            filtering: false,
             message: String::new(),
         };
         action(&mut empty, "start").unwrap();
