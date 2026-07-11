@@ -11,12 +11,12 @@ cargo build --release --target x86_64-unknown-linux-gnu
 sha256sum target/x86_64-unknown-linux-gnu/release/{worklane,lane}
 ```
 
-`Containerfile` is the headless Debian Trixie development image. Worklane v1 deliberately has no OCI registry: each host builds and retains its own Podman image.
+`Containerfile` is compiled into the `worklane` binary, so `worklane image build --context . --tag localhost/worklane:latest` needs no separate recipe file. Pass `--file PATH` only to override the embedded standard image recipe. Worklane v1 deliberately has no OCI registry: each host builds and retains its own Podman image.
 
 ## First lane
 
 ```sh
-podman build -f Containerfile -t worklane:latest .
+worklane image build --context . --tag localhost/worklane:latest
 worklane lane create my-project --project "$PWD"
 worklane lane attach my-project
 ```
@@ -31,7 +31,7 @@ persistent home so supported Codex sessions can be restored after a Herdr server
 To build for a managed host, the Containerfile and build context must already exist on that host:
 
 ```sh
-worklane image build --host lab --context /home/gerald/worklane --file Containerfile --tag worklane:latest
+worklane image build --host lab --context /home/gerald/worklane --tag localhost/worklane:latest
 worklane lane create my-project --host lab --project /home/gerald/projects/my-project \
   --image worklane:latest --build-context /home/gerald/worklane
 ```

@@ -5,6 +5,9 @@ use serde::Serialize;
 use std::{fs, path::PathBuf, process::Command};
 use worklane_core::*;
 
+/// The standard lane image recipe travels with every `worklane` binary.
+const EMBEDDED_CONTAINERFILE: &str = include_str!("../../Containerfile");
+
 #[derive(Parser)]
 #[command(name = "worklane", about = "Rootless Podman development lanes")]
 struct Cli {
@@ -54,8 +57,9 @@ enum ImageAction {
     Build {
         #[arg(long, default_value = "local")]
         host: String,
-        #[arg(long, default_value = "Containerfile")]
-        file: PathBuf,
+        /// Override the Containerfile embedded in this binary.
+        #[arg(long)]
+        file: Option<PathBuf>,
         #[arg(long, default_value = ".")]
         context: PathBuf,
         #[arg(long,default_value=DEFAULT_IMAGE)]
@@ -163,6 +167,30 @@ fn remote_host(store: &Store, name: &str, args: Vec<String>) -> Result<Option<St
     Ok(Some(
         SystemRunner.run("ssh", &ssh_command(&host.ssh_target, &args))?,
     ))
+}
+fn embedded_containerfile_path() -> Result<PathBuf> {
+    let path = data_dir()
+        .join("build")
+        .join(format!("Containerfile-{}", env!("CARGO_PKG_VERSION")));
+    fs::create_dir_all(path.parent().expect("embedded Containerfile has a parent"))?;
+    if fs::read_to_string(&path).ok().as_deref() != Some(EMBEDDED_CONTAINERFILE) {
+        fs::write(&path, EMBEDDED_CONTAINERFILE)?;
+    }
+    Ok(path)
+}
+fn image_build_args(file: Option<&PathBuf>, context: &PathBuf, tag: &str) -> Result<Vec<String>> {
+    let file = match file {
+        Some(path) => path.clone(),
+        None => embedded_containerfile_path()?,
+    };
+    Ok(vec![
+        "build".into(),
+        "-f".into(),
+        file.display().to_string(),
+        "-t".into(),
+        tag.into(),
+        context.display().to_string(),
+    ])
 }
 fn local_start(spec: &LaneSpec) -> Result<()> {
     let r = SystemRunner;
@@ -349,35 +377,26 @@ fn main() -> Result<()> {
                 context,
                 tag,
             } => {
-                let args = vec![
+                let mut args = vec![
                     "image".into(),
                     "build".into(),
                     "--host".into(),
                     "local".into(),
-                    "--file".into(),
-                    file.display().to_string(),
                     "--context".into(),
                     context.display().to_string(),
                     "--tag".into(),
                     tag.clone(),
                 ];
+                if let Some(file) = &file {
+                    args.extend(["--file".into(), file.display().to_string()]);
+                }
                 if let Some(out) = remote_host(&store, &host, args)? {
                     let mut value: serde_json::Value = serde_json::from_str(&out)?;
                     value["host"] = serde_json::Value::String(host);
                     emit(cli.json, &value)
                 } else {
                     let r = SystemRunner;
-                    podman(
-                        &r,
-                        vec![
-                            "build".into(),
-                            "-f".into(),
-                            file.display().to_string(),
-                            "-t".into(),
-                            tag.clone(),
-                            context.display().to_string(),
-                        ],
-                    )?;
+                    podman(&r, image_build_args(file.as_ref(), &context, &tag)?)?;
                     emit(
                         cli.json,
                         &serde_json::json!({"host":host,"image":tag,"id":image_identity(&r,&tag)?}),
@@ -648,5 +667,12 @@ mod tests {
             vec!["herdr", "session", "attach", "ops"]
         );
         assert_eq!(herdr_attach_args(&None, true), vec!["zsh", "-l"]);
+    }
+
+    #[test]
+    fn standard_containerfile_is_embedded() {
+        assert!(EMBEDDED_CONTAINERFILE.starts_with("FROM debian:trixie-slim"));
+        assert!(EMBEDDED_CONTAINERFILE.contains("@openai/codex"));
+        assert!(EMBEDDED_CONTAINERFILE.contains("HERDR_INSTALL_DIR=/usr/local/bin"));
     }
 }
