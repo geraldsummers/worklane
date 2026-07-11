@@ -120,7 +120,7 @@ fn inspect_detail(output: &[u8]) -> Result<String> {
     let value: serde_json::Value = serde_json::from_slice(output)?;
     let spec = &value["spec"];
     Ok(format!(
-        "Name: {}\nHost: {}\nState: {}{}\nProject: {}\nImage: {}\nHome: /home/{}",
+        "Name: {}\nHost: {}\nState: {}{}\nProject: {}\nImage: {}\nHome: /home/dev",
         spec["name"].as_str().unwrap_or("unknown"),
         spec["host"].as_str().unwrap_or("unknown"),
         value["state"].as_str().unwrap_or("unknown"),
@@ -131,7 +131,6 @@ fn inspect_detail(output: &[u8]) -> Result<String> {
         },
         spec["project_path"].as_str().unwrap_or("unknown"),
         spec["profile"]["image"].as_str().unwrap_or("unknown"),
-        spec["user"].as_str().unwrap_or("dev"),
     ))
 }
 fn action_with_args(app: &mut App, verb: &str, extra: &[&str]) -> Result<()> {
@@ -623,6 +622,6 @@ mod tests {
             br#"{"spec":{"name":"alpha","host":"lab","project_path":"/tmp","user":"gerald","profile":{"image":"test:latest"}},"state":"running","drift":false}"#,
         )
         .unwrap();
-        assert!(inspected.contains("Home: /home/gerald"));
+        assert!(inspected.contains("Home: /home/dev"));
     }
 }

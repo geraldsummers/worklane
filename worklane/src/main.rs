@@ -205,25 +205,6 @@ fn remote_host<R: Runner>(
         &executor_request(args)?,
     )?))
 }
-fn remote_username<R: Runner>(runner: &R, store: &Store, name: &str) -> Result<String> {
-    if name == "local" {
-        return Ok(current_identity(runner)?.0);
-    }
-    let host = store
-        .hosts()?
-        .into_iter()
-        .find(|h| h.name == name)
-        .with_context(|| format!("host '{name}' is not configured"))?;
-    runner.run(
-        "ssh",
-        &[
-            "-o".into(),
-            "StrictHostKeyChecking=yes".into(),
-            host.ssh_target,
-            "id -un".into(),
-        ],
-    )
-}
 fn embedded_containerfile_path() -> Result<PathBuf> {
     let path = data_dir()
         .join("build")
@@ -244,11 +225,11 @@ fn image_build_args<R: Runner>(
         Some(path) => path.clone(),
         None => embedded_containerfile_path()?,
     };
-    let (user, uid, gid) = current_identity(runner)?;
+    let (_, uid, gid) = current_identity(runner)?;
     Ok(vec![
         "build".into(),
         "--build-arg".into(),
-        format!("USERNAME={user}"),
+        format!("USERNAME={CONTAINER_USER}"),
         "--build-arg".into(),
         format!("USER_UID={uid}"),
         "--build-arg".into(),
@@ -594,12 +575,9 @@ fn main() -> Result<()> {
                 if let Some(id) = id {
                     spec.id = id;
                 }
-                if let Some(user) = user {
-                    spec.user = user;
-                }
-                if spec.host != "local" {
-                    spec.user = remote_username(&runner, &store, &spec.host)?;
-                }
+                // Accepted only for compatibility with older controller binaries.
+                // The image always provides /home/dev, irrespective of host login.
+                let _ = user;
                 validate_profile(
                     &spec.profile,
                     &spec.container_home(),
@@ -627,7 +605,7 @@ fn main() -> Result<()> {
                         "--id".into(),
                         spec.id.clone(),
                         "--user".into(),
-                        spec.user.clone(),
+                        CONTAINER_USER.into(),
                     ];
                     args.extend([
                         "--profile".into(),
@@ -942,7 +920,6 @@ mod tests {
             remote(&runner, &store, &lane, vec!["lane".into(), "list".into()]).unwrap(),
             Some(String::new())
         );
-        assert_eq!(remote_username(&runner, &store, "lab").unwrap(), "gerald");
         assert_eq!(
             remote(&runner, &store, &spec("local"), vec!["lane".into()]).unwrap(),
             None
@@ -951,7 +928,6 @@ mod tests {
             remote_host(&runner, &store, "local", vec!["lane".into()]).unwrap(),
             None
         );
-        assert_eq!(remote_username(&runner, &store, "local").unwrap(), "gerald");
         store
             .upsert_host(&Host {
                 name: "alias".into(),
@@ -987,7 +963,7 @@ mod tests {
             "localhost/test:latest",
         )
         .unwrap();
-        assert!(args.contains(&"USERNAME=gerald".into()));
+        assert!(args.contains(&"USERNAME=dev".into()));
         assert!(args.contains(&"USER_UID=1000".into()));
         assert!(args.contains(&"USER_GID=1000".into()));
     }

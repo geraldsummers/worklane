@@ -139,8 +139,9 @@ pub struct LaneSpec {
 fn default_profile_name() -> String {
     "default".into()
 }
+pub const CONTAINER_USER: &str = "dev";
 fn default_lane_user() -> String {
-    "dev".into()
+    CONTAINER_USER.into()
 }
 impl LaneSpec {
     pub fn new(
@@ -161,7 +162,7 @@ impl LaneSpec {
             id: Uuid::new_v4().to_string(),
             name,
             host,
-            user: std::env::var("USER").unwrap_or_else(|_| default_lane_user()),
+            user: default_lane_user(),
             project_path: project_path.canonicalize().unwrap_or(project_path),
             profile,
             profile_name: default_profile_name(),
@@ -179,7 +180,7 @@ impl LaneSpec {
         self.lane_dir().join("home")
     }
     pub fn container_home(&self) -> PathBuf {
-        PathBuf::from("/home").join(&self.user)
+        PathBuf::from("/home").join(CONTAINER_USER)
     }
 }
 
