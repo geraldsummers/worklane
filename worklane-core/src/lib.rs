@@ -59,12 +59,17 @@ pub struct LaneSpec {
     pub id: String,
     pub name: String,
     pub host: String,
+    #[serde(default = "default_lane_user")]
+    pub user: String,
     pub project_path: PathBuf,
     #[serde(default)]
     pub profile: Profile,
     pub created_at: DateTime<Utc>,
     #[serde(default)]
     pub image_digest: Option<String>,
+}
+fn default_lane_user() -> String {
+    "dev".into()
 }
 impl LaneSpec {
     pub fn new(
@@ -85,6 +90,7 @@ impl LaneSpec {
             id: Uuid::new_v4().to_string(),
             name,
             host,
+            user: std::env::var("USER").unwrap_or_else(|_| default_lane_user()),
             project_path: project_path.canonicalize().unwrap_or(project_path),
             profile,
             created_at: Utc::now(),
@@ -99,6 +105,9 @@ impl LaneSpec {
     }
     pub fn home_dir(&self) -> PathBuf {
         self.lane_dir().join("home")
+    }
+    pub fn container_home(&self) -> PathBuf {
+        PathBuf::from("/home").join(&self.user)
     }
 }
 
@@ -296,6 +305,12 @@ pub fn image_identity(r: &impl Runner, image: &str) -> Result<String> {
         bail!("image has no local ID: {image}")
     }
     Ok(out)
+}
+pub fn current_identity(r: &impl Runner) -> Result<(String, String, String)> {
+    let user = r.run("id", &["-un".into()])?;
+    let uid = r.run("id", &["-u".into()])?;
+    let gid = r.run("id", &["-g".into()])?;
+    Ok((user, uid, gid))
 }
 pub fn sha256_file(path: &Path) -> Result<String> {
     let b = fs::read(path)?;

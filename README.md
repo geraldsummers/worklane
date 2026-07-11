@@ -27,9 +27,9 @@ worklane lane attach my-project
 
 `lane attach` starts or reattaches the lane's default persistent Herdr session.
 Detach with `Ctrl-B q`; panes and agents keep running in the lane. Use
-`worklane lane attach my-project --shell` for a plain zsh login shell, or
-`--session NAME` to attach a deliberately separate named Herdr session. On the
-first Herdr attach, Worklane installs Herdr's Codex integration into the lane's
+`worklane lane attach my-project --shell` for a plain zsh login shell. Use
+Herdr's own session commands only after attaching when you deliberately need a
+separate Herdr server. On the first Herdr attach, Worklane installs Herdr's Codex integration into the lane's
 persistent home so supported Codex sessions can be restored after a Herdr server restart.
 
 To build for a managed host, the Containerfile and build context must already exist on that host:

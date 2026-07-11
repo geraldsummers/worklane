@@ -107,10 +107,8 @@ enum LaneAction {
     },
     Attach {
         lane: String,
-        #[arg(long)]
-        session: Option<String>,
         /// Bypass Herdr and open a plain login shell.
-        #[arg(long, conflicts_with = "session")]
+        #[arg(long)]
         shell: bool,
     },
     Upgrade {
@@ -286,17 +284,9 @@ fn refresh(store: &Store, spec: &LaneSpec) -> Result<LaneStatus> {
         cached_at: Utc::now(),
     })
 }
-fn herdr_attach_args(session: &Option<String>, shell: bool) -> Vec<String> {
+fn lane_attach_args(shell: bool) -> Vec<String> {
     if shell {
         return vec!["zsh".into(), "-l".into()];
-    }
-    if let Some(name) = session {
-        return vec![
-            "herdr".into(),
-            "session".into(),
-            "attach".into(),
-            name.clone(),
-        ];
     }
     vec!["herdr".into()]
 }
@@ -305,12 +295,15 @@ fn bootstrap_herdr(spec: &LaneSpec) -> Result<()> {
     let script = format!(
         "set -eu; marker={marker}; if [ ! -e \"$marker\" ]; then mkdir -p \"$HOME/.codex\" \"$(dirname \"$marker\")\"; herdr integration install codex; : > \"$marker\"; fi"
     );
-    let status = Command::new("podman")
+    let output = Command::new("podman")
         .args(["exec", &spec.container_name(), "zsh", "-lc", &script])
-        .status()
+        .output()
         .context("bootstrap Herdr Codex integration")?;
-    if !status.success() {
-        bail!("Herdr Codex integration bootstrap failed; lane was not attached")
+    if !output.status.success() {
+        bail!(
+            "Herdr Codex integration bootstrap failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
     }
     Ok(())
 }
@@ -574,11 +567,7 @@ fn main() -> Result<()> {
                 };
                 emit(cli.json, &refresh(&store, &s)?)
             }
-            LaneAction::Attach {
-                lane,
-                session,
-                shell,
-            } => {
+            LaneAction::Attach { lane, shell } => {
                 let s = store.lane(&lane)?;
                 if s.host != "local" {
                     let host = store
@@ -594,9 +583,6 @@ fn main() -> Result<()> {
                         "attach".into(),
                         s.id.clone(),
                     ];
-                    if let Some(session) = session {
-                        args.extend(["--session".into(), session]);
-                    }
                     if shell {
                         args.push("--shell".into());
                     }
@@ -610,7 +596,7 @@ fn main() -> Result<()> {
                 if !shell {
                     bootstrap_herdr(&s)?;
                 }
-                let command = herdr_attach_args(&session, shell);
+                let command = lane_attach_args(shell);
                 let status = Command::new("podman")
                     .args([
                         "exec",
@@ -728,13 +714,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn attach_defaults_to_herdr_and_uses_documented_sessions() {
-        assert_eq!(herdr_attach_args(&None, false), vec!["herdr"]);
-        assert_eq!(
-            herdr_attach_args(&Some("ops".into()), false),
-            vec!["herdr", "session", "attach", "ops"]
-        );
-        assert_eq!(herdr_attach_args(&None, true), vec!["zsh", "-l"]);
+    fn attach_defaults_to_herdr_or_explicit_shell() {
+        assert_eq!(lane_attach_args(false), vec!["herdr"]);
+        assert_eq!(lane_attach_args(true), vec!["zsh", "-l"]);
     }
 
     #[test]
