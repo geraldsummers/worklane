@@ -92,6 +92,8 @@ enum LaneAction {
         containerfile: PathBuf,
         #[arg(long, hide = true)]
         id: Option<String>,
+        #[arg(long, hide = true)]
+        user: Option<String>,
     },
     List,
     Inspect {
@@ -168,6 +170,25 @@ fn remote_host(store: &Store, name: &str, args: Vec<String>) -> Result<Option<St
         SystemRunner.run("ssh", &ssh_command(&host.ssh_target, &args))?,
     ))
 }
+fn remote_username(store: &Store, name: &str) -> Result<String> {
+    if name == "local" {
+        return Ok(current_identity(&SystemRunner)?.0);
+    }
+    let host = store
+        .hosts()?
+        .into_iter()
+        .find(|h| h.name == name)
+        .with_context(|| format!("host '{name}' is not configured"))?;
+    SystemRunner.run(
+        "ssh",
+        &[
+            "-o".into(),
+            "StrictHostKeyChecking=yes".into(),
+            host.ssh_target,
+            "id -un".into(),
+        ],
+    )
+}
 fn embedded_containerfile_path() -> Result<PathBuf> {
     let path = data_dir()
         .join("build")
@@ -183,8 +204,15 @@ fn image_build_args(file: Option<&PathBuf>, context: &PathBuf, tag: &str) -> Res
         Some(path) => path.clone(),
         None => embedded_containerfile_path()?,
     };
+    let (user, uid, gid) = current_identity(&SystemRunner)?;
     Ok(vec![
         "build".into(),
+        "--build-arg".into(),
+        format!("USERNAME={user}"),
+        "--build-arg".into(),
+        format!("USER_UID={uid}"),
+        "--build-arg".into(),
+        format!("USER_GID={gid}"),
         "-f".into(),
         file.display().to_string(),
         "-t".into(),
@@ -212,11 +240,16 @@ fn local_start(spec: &LaneSpec) -> Result<()> {
         "--label".into(),
         format!("io.worklane.id={}", spec.id),
         "--mount".into(),
-        format!("type=bind,src={},dst=/home/dev", spec.home_dir().display()),
+        format!(
+            "type=bind,src={},dst={}",
+            spec.home_dir().display(),
+            spec.container_home().display()
+        ),
         "--mount".into(),
         format!(
-            "type=bind,src={},dst=/home/dev/workspace",
-            spec.project_path.display()
+            "type=bind,src={},dst={}/workspace",
+            spec.project_path.display(),
+            spec.container_home().display()
         ),
     ];
     if spec.profile.network == "outbound" {
@@ -278,6 +311,25 @@ fn bootstrap_herdr(spec: &LaneSpec) -> Result<()> {
         .context("bootstrap Herdr Codex integration")?;
     if !status.success() {
         bail!("Herdr Codex integration bootstrap failed; lane was not attached")
+    }
+    Ok(())
+}
+fn bootstrap_shell(spec: &LaneSpec) -> Result<()> {
+    let script = r#"set -eu
+if [ ! -f "$HOME/.zshrc" ]; then
+  cat > "$HOME/.zshrc" <<'ZSHRC'
+export EDITOR="${EDITOR:-vim}"
+export PATH="$HOME/.local/bin:$PATH"
+cd "$HOME/workspace" 2>/dev/null || true
+PROMPT="%F{cyan}[worklane:${WORKLANE_NAME:-lane}]%f %F{green}%n@%m%f:%F{blue}%~%f %# "
+ZSHRC
+fi"#;
+    let status = Command::new("podman")
+        .args(["exec", &spec.container_name(), "zsh", "-lc", script])
+        .status()
+        .context("bootstrap lane zsh configuration")?;
+    if !status.success() {
+        bail!("lane zsh bootstrap failed")
     }
     Ok(())
 }
@@ -432,6 +484,7 @@ fn main() -> Result<()> {
                 build_context,
                 containerfile,
                 id,
+                user,
             } => {
                 let p = if host == "local" {
                     project
@@ -453,6 +506,12 @@ fn main() -> Result<()> {
                 )?;
                 if let Some(id) = id {
                     spec.id = id;
+                }
+                if let Some(user) = user {
+                    spec.user = user;
+                }
+                if spec.host != "local" {
+                    spec.user = remote_username(&store, &spec.host)?;
                 }
                 if spec.host == "local" {
                     write_lane_spec(&spec)?;
@@ -478,6 +537,8 @@ fn main() -> Result<()> {
                         spec.profile.containerfile.display().to_string(),
                         "--id".into(),
                         spec.id.clone(),
+                        "--user".into(),
+                        spec.user.clone(),
                     ];
                     if let Some(context) = &spec.profile.build_context {
                         args.extend(["--build-context".into(), context.display().to_string()]);
@@ -545,12 +606,19 @@ fn main() -> Result<()> {
                     }
                     return Ok(());
                 };
+                bootstrap_shell(&s)?;
                 if !shell {
                     bootstrap_herdr(&s)?;
                 }
                 let command = herdr_attach_args(&session, shell);
                 let status = Command::new("podman")
-                    .args(["exec", "-it", &s.container_name()])
+                    .args([
+                        "exec",
+                        "-it",
+                        "--env",
+                        &format!("WORKLANE_NAME={}", s.name),
+                        &s.container_name(),
+                    ])
                     .args(command)
                     .status()?;
                 if !status.success() {
