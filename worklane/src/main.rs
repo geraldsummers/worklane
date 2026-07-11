@@ -250,10 +250,28 @@ fn build_local_image<R: Runner>(r: &R, spec: &LaneSpec) -> Result<()> {
     podman_stream(r, image_build_args(r, file, context, &spec.profile.image)?)?;
     Ok(())
 }
+fn migrate_legacy_home<R: Runner>(r: &R, spec: &LaneSpec) -> Result<()> {
+    if spec.user == CONTAINER_USER || podman(r, ["inspect", &spec.container_name()]).is_err() {
+        return Ok(());
+    }
+    fs::create_dir_all(spec.home_dir())?;
+    eprintln!("worklane: preserving legacy /home/dev state before recreating the lane...");
+    podman(
+        r,
+        [
+            "cp".into(),
+            format!("{}:/home/dev/.", spec.container_name()),
+            spec.home_dir().display().to_string(),
+        ],
+    )
+    .context("could not preserve legacy /home/dev state")?;
+    Ok(())
+}
 fn local_start<R: Runner>(r: &R, spec: &LaneSpec) -> Result<()> {
     if !image_exists(r, &spec.profile.image)? {
         build_local_image(r, spec)?;
     }
+    migrate_legacy_home(r, spec)?;
     let _ = podman(r, ["rm", "-f", &spec.container_name()]);
     fs::create_dir_all(spec.home_dir())?;
     let mut a = vec![
@@ -766,6 +784,7 @@ fn main() -> Result<()> {
                         build_local_image(&r, &s)?;
                         s.image_digest = Some(image_identity(&r, &s.profile.image)?);
                         local_start(&runner, &s)?;
+                        s.user = CONTAINER_USER.into();
                         write_lane_spec(&s)?;
                         out.push(serde_json::to_value(refresh(&runner, &store, &s)?)?)
                     } else {
@@ -984,6 +1003,18 @@ mod tests {
             .iter()
             .any(|(_, a)| a.first() == Some(&"run".into())));
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn local_start_preserves_legacy_dev_home_before_recreating() {
+        let runner = MockRunner::new();
+        let mut lane = spec("local");
+        lane.user = "gerald".into();
+        local_start(&runner, &lane).unwrap();
+        assert!(runner.calls.lock().unwrap().iter().any(|(_, args)| {
+            args.first() == Some(&"cp".into())
+                && args.iter().any(|arg| arg.ends_with(":/home/dev/."))
+        }));
     }
 
     #[test]
