@@ -13,6 +13,10 @@ sha256sum target/x86_64-unknown-linux-gnu/release/{worklane,lane}
 
 `Containerfile` is compiled into the `worklane` binary, so `worklane image build --context . --tag localhost/worklane:latest` needs no separate recipe file. Pass `--file PATH` only to override the embedded standard image recipe. Worklane v1 deliberately has no OCI registry: each host builds and retains its own Podman image.
 
+The standard image includes Python (pip and venv), Node.js/npm, TypeScript,
+Prettier for JS/TS/HTML/CSS, Rust/Cargo, Java 21, Kotlin, zsh, and native
+build tooling, as well as Codex, Herdr, Git, and GitHub CLI.
+
 ## First lane
 
 ```sh
