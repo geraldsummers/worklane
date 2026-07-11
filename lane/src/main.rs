@@ -184,17 +184,35 @@ fn column(value: &str, width: usize) -> String {
     }
 }
 fn lane_style(state: &str, drift: bool) -> Style {
-    let color = if drift {
-        Color::Red
+    // Eight hues, each 45° apart around the HSL color wheel. Keeping this
+    // fixed makes a lane's lifecycle state recognizable at a glance.
+    let palette = [
+        Color::Rgb(230, 69, 69),  // red
+        Color::Rgb(230, 190, 69), // amber
+        Color::Rgb(149, 230, 69), // lime
+        Color::Rgb(69, 230, 109), // green
+        Color::Rgb(69, 230, 230), // cyan
+        Color::Rgb(69, 109, 230), // blue
+        Color::Rgb(149, 69, 230), // violet
+        Color::Rgb(230, 69, 190), // magenta
+    ];
+    let color = palette[match state {
+        "exited" => 0,
+        "stopped" => 1,
+        "other" => 2,
+        "running" => 3,
+        "starting" => 4,
+        "created" => 5,
+        "absent" => 6,
+        "unknown" => 7,
+        _ => 2,
+    }];
+    let style = Style::default().fg(color);
+    if drift {
+        style.add_modifier(Modifier::UNDERLINED | Modifier::BOLD)
     } else {
-        match state {
-            "running" => Color::Green,
-            "created" | "starting" => Color::Cyan,
-            "exited" | "stopped" | "absent" => Color::Red,
-            _ => Color::Yellow,
-        }
-    };
-    Style::default().fg(color)
+        style
+    }
 }
 fn draw(f: &mut ratatui::Frame, app: &App) {
     let areas = Layout::default()
@@ -339,9 +357,18 @@ mod tests {
         app.handle_key(KeyCode::Up);
         assert_eq!(app.selected, 0);
         assert_eq!(app.handle_key(KeyCode::F(1)), UiAction::None);
-        assert_eq!(lane_style("running", false).fg, Some(Color::Green));
-        assert_eq!(lane_style("exited", false).fg, Some(Color::Red));
-        assert_eq!(lane_style("unknown", true).fg, Some(Color::Red));
+        assert_eq!(
+            lane_style("running", false).fg,
+            Some(Color::Rgb(69, 230, 109))
+        );
+        assert_eq!(
+            lane_style("exited", false).fg,
+            Some(Color::Rgb(230, 69, 69))
+        );
+        assert_eq!(
+            lane_style("unknown", true).fg,
+            Some(Color::Rgb(230, 69, 190))
+        );
     }
 
     #[test]
