@@ -458,11 +458,15 @@ pub fn meaningful_drift_lines(diff: &str, container_home: &Path) -> Vec<String> 
     diff.lines()
         .map(str::trim)
         .filter(|line| {
+            let transient_tmp = line
+                .split_once(' ')
+                .is_some_and(|(_, path)| path == "/tmp" || path.starts_with("/tmp/"));
             !matches!(
                 *line,
                 "C /etc" | "C /etc/passwd" | "C /etc/group" | "C /home"
             ) && *line != runtime_home_add
                 && *line != runtime_home_change
+                && !transient_tmp
         })
         .map(str::to_owned)
         .collect()
@@ -656,7 +660,7 @@ mod tests {
             home
         ));
         assert_eq!(
-            meaningful_drift_lines("C /home\nA /home/gerald\n", home),
+            meaningful_drift_lines("C /home\nA /home/gerald\nC /tmp\nA /tmp/socket\n", home),
             Vec::<String>::new()
         );
     }
