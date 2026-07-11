@@ -126,7 +126,18 @@ fn action_with_args(app: &mut App, verb: &str, extra: &[&str]) -> Result<()> {
     } else {
         let output = command.output()?;
         if verb == "diff" {
-            app.detail = String::from_utf8_lossy(&output.stdout).trim().into();
+            let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+            let lines = value["diff"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>();
+            app.detail = if lines.is_empty() {
+                "No meaningful writable-root changes.".into()
+            } else {
+                lines.join("\n")
+            };
         } else {
             app.detail.clear();
         }
@@ -409,7 +420,11 @@ mod tests {
         let bin = root.join("bin");
         fs::create_dir_all(&bin).unwrap();
         let worklane = bin.join("worklane");
-        fs::write(&worklane, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::write(
+            &worklane,
+            "#!/bin/sh\ncase \"$*\" in *diff*) printf '{\"diff\":[]}\\n';; esac\nexit 0\n",
+        )
+        .unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -439,6 +454,8 @@ mod tests {
         assert_eq!(app.message, "start: ok");
         action_with_args(&mut app, "attach", &["--shell"]).unwrap();
         assert_eq!(app.message, "attach: ok");
+        action(&mut app, "diff").unwrap();
+        assert_eq!(app.detail, "No meaningful writable-root changes.");
         assert_eq!(App::load().unwrap().lanes.len(), 1);
         let mut keys = vec![
             None,

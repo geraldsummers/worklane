@@ -308,15 +308,22 @@ pub fn host_state(r: &impl Runner, spec: &LaneSpec) -> Result<(String, bool)> {
 /// Rootless `--userns=keep-id` updates these account files at container start.
 /// They are runtime plumbing, not user changes to the disposable root filesystem.
 pub fn has_meaningful_drift(diff: &str, container_home: &Path) -> bool {
+    !meaningful_drift_lines(diff, container_home).is_empty()
+}
+pub fn meaningful_drift_lines(diff: &str, container_home: &Path) -> Vec<String> {
     let runtime_home_add = format!("A {}", container_home.display());
     let runtime_home_change = format!("C {}", container_home.display());
-    diff.lines().map(str::trim).any(|line| {
-        !matches!(
-            line,
-            "C /etc" | "C /etc/passwd" | "C /etc/group" | "C /home"
-        ) && line != runtime_home_add
-            && line != runtime_home_change
-    })
+    diff.lines()
+        .map(str::trim)
+        .filter(|line| {
+            !matches!(
+                *line,
+                "C /etc" | "C /etc/passwd" | "C /etc/group" | "C /home"
+            ) && *line != runtime_home_add
+                && *line != runtime_home_change
+        })
+        .map(str::to_owned)
+        .collect()
 }
 pub fn write_lane_spec(spec: &LaneSpec) -> Result<()> {
     fs::create_dir_all(spec.home_dir())?;
@@ -470,6 +477,10 @@ mod tests {
             "C /etc\nA /home/gerald/notes.txt\n",
             home
         ));
+        assert_eq!(
+            meaningful_drift_lines("C /home\nA /home/gerald\n", home),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
