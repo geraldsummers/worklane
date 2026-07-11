@@ -574,6 +574,7 @@ name = "lane"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "crossterm",
  "ratatui",
  "worklane-core",

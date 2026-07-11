@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+chrono.workspace = true
 crossterm.workspace = true
 ratatui.workspace = true
 worklane-core = { path = "../worklane-core" }

@@ -20,6 +20,13 @@ struct App {
     filter: String,
     message: String,
 }
+#[derive(Debug, PartialEq, Eq)]
+enum UiAction {
+    None,
+    Quit,
+    Command(&'static str, bool),
+    Reload,
+}
 impl App {
     fn load() -> Result<Self> {
         Ok(Self {
@@ -35,6 +42,40 @@ impl App {
             .iter()
             .filter(|x| x.spec.name.contains(&self.filter) || x.spec.host.contains(&self.filter))
             .collect()
+    }
+    fn handle_key(&mut self, key: KeyCode) -> UiAction {
+        match key {
+            KeyCode::Char('q') => UiAction::Quit,
+            KeyCode::Char('j') | KeyCode::Down => {
+                let count = self.visible().len();
+                if count > 0 {
+                    self.selected = (self.selected + 1).min(count - 1);
+                }
+                UiAction::None
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.selected = self.selected.saturating_sub(1);
+                UiAction::None
+            }
+            KeyCode::Char('s') => UiAction::Command("start", false),
+            KeyCode::Char('x') => UiAction::Command("stop", false),
+            KeyCode::Char('u') => UiAction::Command("upgrade", false),
+            KeyCode::Char('a') => UiAction::Command("attach", false),
+            KeyCode::Char('S') => UiAction::Command("attach", true),
+            KeyCode::Char('i') => UiAction::Command("inspect", false),
+            KeyCode::Char('r') => UiAction::Reload,
+            KeyCode::Backspace => {
+                self.filter.pop();
+                self.selected = 0;
+                UiAction::None
+            }
+            KeyCode::Char(c) => {
+                self.filter.push(c);
+                self.selected = 0;
+                UiAction::None
+            }
+            _ => UiAction::None,
+        }
     }
 }
 fn action(app: &mut App, verb: &str) -> Result<()> {
@@ -115,36 +156,79 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
             continue;
         }
         if let Event::Key(k) = event::read()? {
-            match k.code {
-                KeyCode::Char('q') => break,
-                KeyCode::Char('j') | KeyCode::Down => {
-                    let n = app.visible().len();
-                    if n > 0 {
-                        app.selected = (app.selected + 1).min(n - 1)
-                    }
-                }
-                KeyCode::Char('k') | KeyCode::Up => app.selected = app.selected.saturating_sub(1),
-                KeyCode::Char('s') => action(&mut app, "start")?,
-                KeyCode::Char('x') => action(&mut app, "stop")?,
-                KeyCode::Char('u') => action(&mut app, "upgrade")?,
-                KeyCode::Char('a') => action(&mut app, "attach")?,
-                KeyCode::Char('S') => action_with_args(&mut app, "attach", &["--shell"])?,
-                KeyCode::Char('i') => action(&mut app, "inspect")?,
-                KeyCode::Char('r') => {
+            match app.handle_key(k.code) {
+                UiAction::Quit => break,
+                UiAction::Command(verb, true) => action_with_args(&mut app, verb, &["--shell"])?,
+                UiAction::Command(verb, false) => action(&mut app, verb)?,
+                UiAction::Reload => {
                     app.lanes = Store::open_default()?.lanes()?;
                     app.message = "reloaded cached status".into()
                 }
-                KeyCode::Backspace => {
-                    app.filter.pop();
-                    app.selected = 0
-                }
-                KeyCode::Char(c) => {
-                    app.filter.push(c);
-                    app.selected = 0
-                }
-                _ => {}
+                UiAction::None => {}
             }
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use std::path::PathBuf;
+    use worklane_core::{LaneSpec, Profile};
+    fn app() -> App {
+        let spec = LaneSpec::new(
+            "alpha".into(),
+            "lab".into(),
+            PathBuf::from("/tmp"),
+            Profile::default(),
+        )
+        .unwrap();
+        App {
+            lanes: vec![LaneStatus {
+                spec,
+                state: "running".into(),
+                drift: false,
+                cached_at: Utc::now(),
+            }],
+            selected: 0,
+            filter: String::new(),
+            message: String::new(),
+        }
+    }
+    #[test]
+    fn reducer_covers_navigation_filter_and_actions() {
+        let mut app = app();
+        assert_eq!(
+            app.handle_key(KeyCode::Char('a')),
+            UiAction::Command("attach", false)
+        );
+        assert_eq!(
+            app.handle_key(KeyCode::Char('S')),
+            UiAction::Command("attach", true)
+        );
+        assert_eq!(
+            app.handle_key(KeyCode::Char('s')),
+            UiAction::Command("start", false)
+        );
+        assert_eq!(
+            app.handle_key(KeyCode::Char('x')),
+            UiAction::Command("stop", false)
+        );
+        assert_eq!(
+            app.handle_key(KeyCode::Char('u')),
+            UiAction::Command("upgrade", false)
+        );
+        assert_eq!(
+            app.handle_key(KeyCode::Char('i')),
+            UiAction::Command("inspect", false)
+        );
+        assert_eq!(app.handle_key(KeyCode::Char('r')), UiAction::Reload);
+        assert_eq!(app.handle_key(KeyCode::Char('q')), UiAction::Quit);
+        app.handle_key(KeyCode::Char('z'));
+        assert_eq!(app.filter, "z");
+        app.handle_key(KeyCode::Backspace);
+        assert!(app.filter.is_empty());
+    }
 }
