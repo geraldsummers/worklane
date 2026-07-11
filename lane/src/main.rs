@@ -108,50 +108,7 @@ fn main() -> Result<()> {
 fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
     let mut app = App::load()?;
     loop {
-        terminal.draw(|f| {
-            let areas = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Min(2),
-                    Constraint::Length(3),
-                    Constraint::Length(3),
-                ])
-                .split(f.area());
-            let items = app
-                .visible()
-                .iter()
-                .enumerate()
-                .map(|(i, x)| {
-                    let flag = if x.drift { " drift" } else { "" };
-                    ListItem::new(format!(
-                        "{}  {:<10} {:<10} {}{}",
-                        x.spec.name, x.spec.host, x.state, x.spec.profile.image, flag
-                    ))
-                    .style(if i == app.selected {
-                        Style::default().fg(Color::Yellow)
-                    } else {
-                        Style::default()
-                    })
-                })
-                .collect::<Vec<_>>();
-            f.render_widget(
-                List::new(items).block(
-                    Block::default()
-                        .title(" Worklane lanes ")
-                        .borders(Borders::ALL),
-                ),
-                areas[0],
-            );
-            f.render_widget(
-                Paragraph::new(format!("Filter: {}", app.filter))
-                    .block(Block::default().borders(Borders::ALL)),
-                areas[1],
-            );
-            f.render_widget(
-                Paragraph::new(app.message.as_str()).block(Block::default().borders(Borders::ALL)),
-                areas[2],
-            );
-        })?;
+        terminal.draw(|f| draw(f, &app))?;
         if !event::poll(Duration::from_millis(250))? {
             continue;
         }
@@ -170,12 +127,60 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
     }
     Ok(())
 }
+fn draw(f: &mut ratatui::Frame, app: &App) {
+    let areas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(2),
+            Constraint::Length(3),
+            Constraint::Length(3),
+        ])
+        .split(f.area());
+    let items = app
+        .visible()
+        .iter()
+        .enumerate()
+        .map(|(i, x)| {
+            let flag = if x.drift { " drift" } else { "" };
+            ListItem::new(format!(
+                "{}  {:<10} {:<10} {}{}",
+                x.spec.name, x.spec.host, x.state, x.spec.profile.image, flag
+            ))
+            .style(if i == app.selected {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default()
+            })
+        })
+        .collect::<Vec<_>>();
+    f.render_widget(
+        List::new(items).block(
+            Block::default()
+                .title(" Worklane lanes ")
+                .borders(Borders::ALL),
+        ),
+        areas[0],
+    );
+    f.render_widget(
+        Paragraph::new(format!("Filter: {}", app.filter))
+            .block(Block::default().borders(Borders::ALL)),
+        areas[1],
+    );
+    f.render_widget(
+        Paragraph::new(app.message.as_str()).block(Block::default().borders(Borders::ALL)),
+        areas[2],
+    );
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::Utc;
-    use std::path::PathBuf;
+    use std::{
+        env, fs,
+        path::PathBuf,
+        sync::{Mutex, OnceLock},
+    };
     use worklane_core::{LaneSpec, Profile};
     fn app() -> App {
         let spec = LaneSpec::new(
@@ -196,6 +201,11 @@ mod tests {
             filter: String::new(),
             message: String::new(),
         }
+    }
+
+    fn environment_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
     }
     #[test]
     fn reducer_covers_navigation_filter_and_actions() {
@@ -230,5 +240,95 @@ mod tests {
         assert_eq!(app.filter, "z");
         app.handle_key(KeyCode::Backspace);
         assert!(app.filter.is_empty());
+        app.handle_key(KeyCode::Down);
+        assert_eq!(app.selected, 0);
+        app.handle_key(KeyCode::Up);
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.handle_key(KeyCode::F(1)), UiAction::None);
+    }
+
+    #[test]
+    fn actions_reload_the_cached_store_and_run_worklane() {
+        let _guard = environment_lock().lock().unwrap();
+        let root = env::temp_dir().join(format!("lane-ui-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let bin = root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let worklane = bin.join("worklane");
+        fs::write(&worklane, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&worklane, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let previous_data = env::var_os("XDG_DATA_HOME");
+        let previous_path = env::var_os("PATH");
+        env::set_var("XDG_DATA_HOME", root.join("data"));
+        env::set_var(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.display(),
+                previous_path.as_deref().unwrap().to_string_lossy()
+            ),
+        );
+        let mut app = app();
+        Store::open_default()
+            .unwrap()
+            .save_lane(&app.lanes[0].spec, "running", false)
+            .unwrap();
+        action(&mut app, "start").unwrap();
+        assert_eq!(app.message, "start: ok");
+        action_with_args(&mut app, "attach", &["--shell"]).unwrap();
+        assert_eq!(app.message, "attach: ok");
+        assert_eq!(App::load().unwrap().lanes.len(), 1);
+        let mut empty = App {
+            lanes: vec![],
+            selected: 0,
+            filter: String::new(),
+            message: String::new(),
+        };
+        action(&mut empty, "start").unwrap();
+        if let Some(value) = previous_data {
+            env::set_var("XDG_DATA_HOME", value);
+        } else {
+            env::remove_var("XDG_DATA_HOME");
+        }
+        if let Some(value) = previous_path {
+            env::set_var("PATH", value);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn renderer_draws_lane_status() {
+        let mut app = app();
+        app.lanes.push(LaneStatus {
+            spec: LaneSpec::new(
+                "beta".into(),
+                "other".into(),
+                PathBuf::from("/tmp"),
+                Profile::default(),
+            )
+            .unwrap(),
+            state: "stopped".into(),
+            drift: true,
+            cached_at: Utc::now(),
+        });
+        app.selected = 1;
+        let backend = ratatui::backend::TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("Worklane lanes"));
+        assert!(text.contains("alpha"));
+        assert!(text.contains("beta"));
+        assert!(text.contains("drift"));
     }
 }

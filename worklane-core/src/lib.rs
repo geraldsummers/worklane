@@ -320,6 +320,17 @@ pub fn sha256_file(path: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+    struct Mock {
+        output: String,
+        calls: Mutex<Vec<Vec<String>>>,
+    }
+    impl Runner for Mock {
+        fn run(&self, _: &str, args: &[String]) -> Result<String> {
+            self.calls.lock().unwrap().push(args.into());
+            Ok(self.output.clone())
+        }
+    }
     #[test]
     fn ssh_is_strict() {
         assert_eq!(
@@ -399,5 +410,54 @@ mod tests {
             "C /etc\nC /etc/passwd\nC /etc/group\nC /home\nA /home/dev\n"
         ));
         assert!(has_meaningful_drift("C /etc\nA /home/dev/notes.txt\n"));
+    }
+
+    #[test]
+    fn image_helpers_and_identity_use_runner_output() {
+        let runner = Mock {
+            output: "sha256:image".into(),
+            calls: Mutex::new(vec![]),
+        };
+        assert!(image_exists(&runner, "test:latest").unwrap());
+        assert_eq!(
+            image_digest(&runner, "test:latest").unwrap(),
+            "sha256:image"
+        );
+        assert_eq!(
+            image_identity(&runner, "test:latest").unwrap(),
+            "sha256:image"
+        );
+        let identity = Mock {
+            output: "1000".into(),
+            calls: Mutex::new(vec![]),
+        };
+        assert_eq!(
+            current_identity(&identity).unwrap(),
+            ("1000".into(), "1000".into(), "1000".into())
+        );
+    }
+
+    #[test]
+    fn remove_lane_and_hash_file_work() {
+        let path = std::env::temp_dir().join(format!("worklane-store-{}.db", Uuid::new_v4()));
+        let store = Store::open(&path).unwrap();
+        let spec = LaneSpec::new(
+            "remove-me".into(),
+            "local".into(),
+            PathBuf::from("/tmp"),
+            Profile::default(),
+        )
+        .unwrap();
+        store.save_lane(&spec, "created", false).unwrap();
+        store.remove_lane(&spec.id).unwrap();
+        assert!(store.lane(&spec.id).is_err());
+        let file = std::env::temp_dir().join(format!("worklane-hash-{}", Uuid::new_v4()));
+        std::fs::write(&file, b"abc").unwrap();
+        assert_eq!(
+            sha256_file(&file).unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        std::fs::remove_file(file).unwrap();
+        std::fs::remove_file(path).unwrap();
     }
 }
