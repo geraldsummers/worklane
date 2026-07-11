@@ -270,7 +270,7 @@ fn herdr_attach_args(session: &Option<String>, shell: bool) -> Vec<String> {
 fn bootstrap_herdr(spec: &LaneSpec) -> Result<()> {
     let marker = "$HOME/.local/share/worklane/herdr-codex-integration-v1";
     let script = format!(
-        "set -eu; marker={marker}; if [ ! -e \"$marker\" ]; then herdr integration install codex; mkdir -p \"$(dirname \"$marker\")\"; : > \"$marker\"; fi"
+        "set -eu; marker={marker}; if [ ! -e \"$marker\" ]; then mkdir -p \"$HOME/.codex\" \"$(dirname \"$marker\")\"; herdr integration install codex; : > \"$marker\"; fi"
     );
     let status = Command::new("podman")
         .args(["exec", &spec.container_name(), "zsh", "-lc", &script])
