@@ -335,9 +335,14 @@ if [ ! -f "$HOME/.zshrc" ]; then
 export EDITOR="${EDITOR:-vim}"
 export PATH="$HOME/.local/bin:$PATH"
 cd "$HOME/workspace" 2>/dev/null || true
-PROMPT="%F{cyan}[worklane:${WORKLANE_NAME:-lane}]%f %F{green}%n@%m%f:%F{blue}%~%f %# "
 ZSHRC
-fi"#;
+fi
+mkdir -p "$HOME/.config/worklane"
+cat > "$HOME/.config/worklane/prompt.zsh" <<'WORKLANE_PROMPT'
+PROMPT="%F{cyan}[worklane:${WORKLANE_NAME:-lane}]%f %F{green}%n%f:%F{blue}%~%f %# "
+WORKLANE_PROMPT
+grep -qxF 'source "$HOME/.config/worklane/prompt.zsh"' "$HOME/.zshrc" || \
+  printf '%s\n' 'source "$HOME/.config/worklane/prompt.zsh"' >> "$HOME/.zshrc""#;
     let status = Command::new("podman")
         .args(["exec", &spec.container_name(), "zsh", "-lc", script])
         .status()
