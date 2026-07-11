@@ -239,7 +239,8 @@ fn build_local_image<R: Runner>(r: &R, spec: &LaneSpec) -> Result<()> {
         "lane has no build context; recreate manually or create it with --build-context",
     )?;
     let file = (!spec.profile.embedded_containerfile).then_some(&spec.profile.containerfile);
-    podman(r, image_build_args(r, file, context, &spec.profile.image)?)?;
+    eprintln!("worklane: building image '{}'...", spec.profile.image);
+    podman_stream(r, image_build_args(r, file, context, &spec.profile.image)?)?;
     Ok(())
 }
 fn local_start<R: Runner>(r: &R, spec: &LaneSpec) -> Result<()> {
@@ -462,7 +463,8 @@ fn main() -> Result<()> {
                     emit(cli.json, &value)
                 } else {
                     let r = SystemRunner;
-                    podman(&r, image_build_args(&r, file.as_ref(), &context, &tag)?)?;
+                    eprintln!("worklane: building image '{tag}'...");
+                    podman_stream(&r, image_build_args(&r, file.as_ref(), &context, &tag)?)?;
                     emit(
                         cli.json,
                         &serde_json::json!({"host":host,"image":tag,"id":image_identity(&r,&tag)?}),

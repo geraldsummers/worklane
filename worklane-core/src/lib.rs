@@ -5,9 +5,9 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    fs,
+    fs, io,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
 };
 use uuid::Uuid;
 
@@ -223,14 +223,21 @@ impl Store {
 
 pub trait Runner {
     fn run(&self, program: &str, args: &[String]) -> Result<String>;
+    fn run_streaming(&self, program: &str, args: &[String]) -> Result<String> {
+        self.run(program, args)
+    }
 }
 pub struct SystemRunner;
 impl Runner for SystemRunner {
     fn run(&self, program: &str, args: &[String]) -> Result<String> {
-        let o = Command::new(program)
-            .args(args)
-            .output()
-            .with_context(|| format!("run {program}"))?;
+        let mut command = Command::new(program);
+        command.args(args);
+        // A remote executor sends live build progress to stderr. Preserve that
+        // stream while retaining stdout for its final JSON response.
+        if program == "ssh" {
+            command.stderr(Stdio::inherit());
+        }
+        let o = command.output().with_context(|| format!("run {program}"))?;
         if !o.status.success() {
             bail!(
                 "{program} failed: {}",
@@ -239,12 +246,39 @@ impl Runner for SystemRunner {
         };
         Ok(String::from_utf8_lossy(&o.stdout).trim().into())
     }
+    fn run_streaming(&self, program: &str, args: &[String]) -> Result<String> {
+        let mut child = Command::new(program)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .with_context(|| format!("run {program}"))?;
+        let mut stdout = child.stdout.take().expect("piped stdout is available");
+        let mut stderr = io::stderr();
+        io::copy(&mut stdout, &mut stderr).with_context(|| format!("stream {program}"))?;
+        let status = child
+            .wait()
+            .with_context(|| format!("wait for {program}"))?;
+        if !status.success() {
+            bail!("{program} failed")
+        }
+        Ok(String::new())
+    }
 }
 pub fn podman(
     r: &impl Runner,
     args: impl IntoIterator<Item = impl Into<String>>,
 ) -> Result<String> {
     r.run(
+        "podman",
+        &args.into_iter().map(Into::into).collect::<Vec<_>>(),
+    )
+}
+pub fn podman_stream(
+    r: &impl Runner,
+    args: impl IntoIterator<Item = impl Into<String>>,
+) -> Result<String> {
+    r.run_streaming(
         "podman",
         &args.into_iter().map(Into::into).collect::<Vec<_>>(),
     )
