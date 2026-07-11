@@ -27,6 +27,7 @@ enum UiAction {
     None,
     Quit,
     Command(&'static str, bool),
+    UpgradeAll,
     Reload,
 }
 impl App {
@@ -93,6 +94,7 @@ impl App {
             KeyCode::Char('s') => UiAction::Command("start", false),
             KeyCode::Char('x') => UiAction::Command("stop", false),
             KeyCode::Char('u') => UiAction::Command("upgrade", false),
+            KeyCode::Char('U') => UiAction::UpgradeAll,
             KeyCode::Char('a') => UiAction::Command("attach", false),
             KeyCode::Char('S') => UiAction::Command("attach", true),
             KeyCode::Char('d') => UiAction::Command("diff", false),
@@ -115,6 +117,35 @@ impl App {
 }
 fn action(app: &mut App, verb: &str) -> Result<()> {
     action_with_args(app, verb, &[])
+}
+fn upgrade_detail(output: &[u8]) -> Result<String> {
+    let values: Vec<serde_json::Value> = serde_json::from_slice(output)?;
+    if values.is_empty() {
+        return Ok("No lanes were selected for upgrade.".into());
+    }
+    Ok(values
+        .iter()
+        .map(|value| {
+            let lane = value["spec"]["name"]
+                .as_str()
+                .or_else(|| value["lane"].as_str())
+                .unwrap_or("unknown lane");
+            if let Some(outcome) = value["outcome"].as_str() {
+                format!("{lane}: {outcome}")
+            } else {
+                format!(
+                    "{lane}: {}{}",
+                    value["state"].as_str().unwrap_or("upgraded"),
+                    if value["drift"].as_bool().unwrap_or(false) {
+                        " (drift)"
+                    } else {
+                        ""
+                    }
+                )
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n"))
 }
 fn inspect_detail(output: &[u8]) -> Result<String> {
     let value: serde_json::Value = serde_json::from_slice(output)?;
@@ -164,6 +195,8 @@ fn action_with_args(app: &mut App, verb: &str, extra: &[&str]) -> Result<()> {
             };
         } else if verb == "inspect" {
             app.detail = inspect_detail(&output.stdout)?;
+        } else if verb == "upgrade" {
+            app.detail = upgrade_detail(&output.stdout)?;
         } else {
             app.detail.clear();
         }
@@ -171,6 +204,20 @@ fn action_with_args(app: &mut App, verb: &str, extra: &[&str]) -> Result<()> {
         app.lanes = Store::open_default()?.lanes()?;
     } else {
         app.message = format!("{verb}: failed");
+        app.detail = String::from_utf8_lossy(&output.stderr).trim().into();
+    }
+    Ok(())
+}
+fn upgrade_all(app: &mut App) -> Result<()> {
+    let output = Command::new("worklane")
+        .args(["lane", "upgrade", "--all"])
+        .output()?;
+    if output.status.success() {
+        app.detail = upgrade_detail(&output.stdout)?;
+        app.message = "upgrade all: completed".into();
+        app.lanes = Store::open_default()?.lanes()?;
+    } else {
+        app.message = "upgrade all: failed".into();
         app.detail = String::from_utf8_lossy(&output.stderr).trim().into();
     }
     Ok(())
@@ -252,6 +299,7 @@ fn run_app(
             UiAction::Reload => {
                 refresh_all(app)?;
             }
+            UiAction::UpgradeAll => upgrade_all(app)?,
             UiAction::None => {}
         }
     }
@@ -299,12 +347,12 @@ fn lane_style(state: &str, drift: bool) -> Style {
     }
 }
 fn draw(f: &mut ratatui::Frame, app: &App) {
-    let detail_height = if app.detail.is_empty() { 0 } else { 8 };
+    let detail_height = if app.detail.is_empty() { 0 } else { 6 };
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(2),
-            Constraint::Length(3),
+            Constraint::Length(5),
             Constraint::Length(detail_height),
             Constraint::Length(3),
         ])
@@ -368,9 +416,14 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     }
     f.render_widget(
         Paragraph::new(format!(
-            "{}{}",
-            if app.message.is_empty() { String::new() } else { format!("{} • ", app.message) },
-            "j/k move • / filter • Esc close • a Herdr • S shell • s start • x stop • d diff • i inspect • r refresh • q quit"
+            "Status: {}\n\
+             j/k move • / filter • Esc close • q quit • a Herdr • S shell\n\
+             s start • x stop • d diff • i inspect • u selected upgrade • U all upgrades • r refresh",
+            if app.message.is_empty() {
+                "ready"
+            } else {
+                &app.message
+            },
         ))
         .block(Block::default().title(" Controls ").borders(Borders::ALL)),
         areas[3],
@@ -443,6 +496,7 @@ mod tests {
             app.handle_key(KeyCode::Char('u')),
             UiAction::Command("upgrade", false)
         );
+        assert_eq!(app.handle_key(KeyCode::Char('U')), UiAction::UpgradeAll);
         assert_eq!(
             app.handle_key(KeyCode::Char('i')),
             UiAction::Command("inspect", false)
@@ -490,7 +544,7 @@ mod tests {
         let worklane = bin.join("worklane");
         fs::write(
             &worklane,
-            "#!/bin/sh\ncase \"$*\" in *diff*) printf '{\"diff\":[]}\\n';; *inspect*) printf '{\"spec\":{\"name\":\"alpha\",\"host\":\"lab\",\"project_path\":\"/tmp\",\"user\":\"gerald\",\"profile\":{\"image\":\"test:latest\"}},\"state\":\"running\",\"drift\":false}\\n';; esac\nexit 0\n",
+            "#!/bin/sh\ncase \"$*\" in *diff*) printf '{\"diff\":[]}\\n';; *inspect*) printf '{\"spec\":{\"name\":\"alpha\",\"host\":\"lab\",\"project_path\":\"/tmp\",\"user\":\"gerald\",\"profile\":{\"image\":\"test:latest\"}},\"state\":\"running\",\"drift\":false}\\n';; *upgrade*) printf '[{\"spec\":{\"name\":\"alpha\"},\"state\":\"running\",\"drift\":false}]\\n';; esac\nexit 0\n",
         )
         .unwrap();
         #[cfg(unix)]
@@ -526,6 +580,10 @@ mod tests {
         assert_eq!(app.detail, "No meaningful writable-root changes.");
         action(&mut app, "inspect").unwrap();
         assert!(app.detail.contains("State: running"));
+        action(&mut app, "upgrade").unwrap();
+        assert_eq!(app.detail, "alpha: running");
+        upgrade_all(&mut app).unwrap();
+        assert_eq!(app.message, "upgrade all: completed");
         assert_eq!(App::load().unwrap().lanes.len(), 1);
         let mut keys = vec![
             None,
