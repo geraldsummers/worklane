@@ -19,6 +19,7 @@ struct App {
     selected: usize,
     filter: String,
     filtering: bool,
+    detail: String,
     message: String,
 }
 #[derive(Debug, PartialEq, Eq)]
@@ -35,7 +36,8 @@ impl App {
             selected: 0,
             filter: String::new(),
             filtering: false,
-            message: "j/k move • / filter • a Herdr • S shell • s start • x stop • u upgrade • i inspect • r refresh • q quit"
+            detail: String::new(),
+            message: "j/k move • / filter • a Herdr • S shell • s start • x stop • d diff • i inspect • r refresh • q quit"
                 .into(),
         })
     }
@@ -89,6 +91,7 @@ impl App {
             KeyCode::Char('u') => UiAction::Command("upgrade", false),
             KeyCode::Char('a') => UiAction::Command("attach", false),
             KeyCode::Char('S') => UiAction::Command("attach", true),
+            KeyCode::Char('d') => UiAction::Command("diff", false),
             KeyCode::Char('i') => UiAction::Command("inspect", false),
             KeyCode::Char('r') => UiAction::Reload,
             KeyCode::Char('/') => {
@@ -121,7 +124,13 @@ fn action_with_args(app: &mut App, verb: &str, extra: &[&str]) -> Result<()> {
     let status = if verb == "attach" {
         command.status()?
     } else {
-        command.output()?.status
+        let output = command.output()?;
+        if verb == "diff" {
+            app.detail = String::from_utf8_lossy(&output.stdout).trim().into();
+        } else {
+            app.detail.clear();
+        }
+        output.status
     };
     app.message = format!("{verb}: {}", if status.success() { "ok" } else { "failed" });
     app.lanes = Store::open_default()?.lanes()?;
@@ -226,6 +235,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         .constraints([
             Constraint::Min(2),
             Constraint::Length(3),
+            Constraint::Length(5),
             Constraint::Length(3),
         ])
         .split(f.area());
@@ -277,8 +287,17 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         areas[1],
     );
     f.render_widget(
-        Paragraph::new(app.message.as_str()).block(Block::default().borders(Borders::ALL)),
+        Paragraph::new(if app.detail.is_empty() {
+            "Press d to show the selected lane's writable-root diff."
+        } else {
+            app.detail.as_str()
+        })
+        .block(Block::default().title(" Details ").borders(Borders::ALL)),
         areas[2],
+    );
+    f.render_widget(
+        Paragraph::new(app.message.as_str()).block(Block::default().borders(Borders::ALL)),
+        areas[3],
     );
 }
 
@@ -310,6 +329,7 @@ mod tests {
             selected: 0,
             filter: String::new(),
             filtering: false,
+            detail: String::new(),
             message: String::new(),
         }
     }
@@ -350,6 +370,10 @@ mod tests {
         assert_eq!(
             app.handle_key(KeyCode::Char('i')),
             UiAction::Command("inspect", false)
+        );
+        assert_eq!(
+            app.handle_key(KeyCode::Char('d')),
+            UiAction::Command("diff", false)
         );
         assert_eq!(app.handle_key(KeyCode::Char('r')), UiAction::Reload);
         assert_eq!(app.handle_key(KeyCode::Char('q')), UiAction::Quit);
@@ -442,6 +466,7 @@ mod tests {
             selected: 0,
             filter: String::new(),
             filtering: false,
+            detail: String::new(),
             message: String::new(),
         };
         action(&mut empty, "start").unwrap();
@@ -475,6 +500,7 @@ mod tests {
             cached_at: Utc::now(),
         });
         app.selected = 1;
+        app.detail = "C /etc/example".into();
         let backend = ratatui::backend::TestBackend::new(100, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw(frame, &app)).unwrap();
@@ -489,5 +515,6 @@ mod tests {
         assert!(text.contains("alpha"));
         assert!(text.contains("beta"));
         assert!(text.contains("drift"));
+        assert!(text.contains("C /etc/example"));
     }
 }

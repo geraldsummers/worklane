@@ -100,6 +100,10 @@ enum LaneAction {
     Inspect {
         lane: String,
     },
+    /// Show writable-root changes that would be lost on recreation.
+    Diff {
+        lane: String,
+    },
     Start {
         lane: String,
     },
@@ -582,6 +586,26 @@ fn main() -> Result<()> {
             LaneAction::Inspect { lane } => {
                 let s = store.lane(&lane)?;
                 emit(cli.json, &refresh(&runner, &store, &s)?)
+            }
+            LaneAction::Diff { lane } => {
+                let s = store.lane(&lane)?;
+                if s.host == "local" {
+                    let diff = podman(&SystemRunner, ["diff", &s.container_name()])?
+                        .lines()
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>();
+                    emit(cli.json, &serde_json::json!({"lane":s.id,"diff":diff}))
+                } else {
+                    let out = remote(
+                        &runner,
+                        &store,
+                        &s,
+                        vec!["lane".into(), "diff".into(), s.id.clone()],
+                    )?
+                    .context("remote host unexpectedly treated as local")?;
+                    let value: serde_json::Value = serde_json::from_str(&out)?;
+                    emit(cli.json, &value)
+                }
             }
             LaneAction::Start { lane } => {
                 let s = store.lane(&lane)?;

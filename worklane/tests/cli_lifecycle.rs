@@ -112,6 +112,13 @@ esac
     );
     assert!(default_lane.contains("\"build_context\":"));
     assert!(run(binary, &data, &bin_dir, &["--json", "lane", "list"]).contains("smoke"));
+    assert!(run(
+        binary,
+        &data,
+        &bin_dir,
+        &["--json", "lane", "diff", "smoke"]
+    )
+    .contains("diff"));
     assert!(
         run(
             binary,
@@ -346,6 +353,7 @@ fn remote_controller_relays_json_lifecycle() {
 case "$*" in
   *"id -un") echo gerald; exit 0;;
   *"lane upgrade"*) echo '[]'; exit 0;;
+  *"lane diff"*) echo '{"lane":"remote-id","diff":["C /etc/example"]}'; exit 0;;
 esac
 cat <<'JSON'
 {"spec":{"version":1,"id":"remote-id","name":"remote","host":"local","user":"gerald","project_path":"/tmp/project","profile":{"image":"localhost/test:latest","build_context":null,"containerfile":"Containerfile","network":"outbound","mounts":[]},"created_at":"2026-01-01T00:00:00Z","image_digest":null},"state":"running","drift":false,"cached_at":"2026-01-01T00:00:00Z"}
@@ -412,6 +420,13 @@ JSON
         ]
     )
     .contains("running"));
+    assert!(run(
+        binary,
+        &data,
+        &bin_dir,
+        &["--json", "lane", "diff", "remote"]
+    )
+    .contains("C /etc/example"));
     assert!(run(
         binary,
         &data,
