@@ -453,19 +453,22 @@ pub fn has_meaningful_drift(diff: &str, container_home: &Path) -> bool {
     !meaningful_drift_lines(diff, container_home).is_empty()
 }
 pub fn meaningful_drift_lines(diff: &str, container_home: &Path) -> Vec<String> {
-    let runtime_home_add = format!("A {}", container_home.display());
-    let runtime_home_change = format!("C {}", container_home.display());
+    let mounted_home = container_home.display().to_string();
+    let mounted_home_contents = format!("{mounted_home}/");
     diff.lines()
         .map(str::trim)
         .filter(|line| {
-            let transient_tmp = line
+            let path = line
                 .split_once(' ')
-                .is_some_and(|(_, path)| path == "/tmp" || path.starts_with("/tmp/"));
+                .map(|(_, path)| path)
+                .unwrap_or_default();
+            let transient_tmp = path == "/tmp" || path.starts_with("/tmp/");
+            let mounted_home_change =
+                path == mounted_home || path.starts_with(&mounted_home_contents);
             !matches!(
                 *line,
                 "C /etc" | "C /etc/passwd" | "C /etc/group" | "C /home"
-            ) && *line != runtime_home_add
-                && *line != runtime_home_change
+            ) && !mounted_home_change
                 && !transient_tmp
         })
         .map(str::to_owned)
@@ -655,12 +658,12 @@ mod tests {
             "C /etc\nC /etc/passwd\nC /etc/group\nC /home\nA /home/gerald\nC /home/gerald\n",
             home,
         ));
-        assert!(has_meaningful_drift(
-            "C /etc\nA /home/gerald/notes.txt\n",
-            home
-        ));
+        assert!(has_meaningful_drift("C /etc\nA /opt/notes.txt\n", home));
         assert_eq!(
-            meaningful_drift_lines("C /home\nA /home/gerald\nC /tmp\nA /tmp/socket\n", home),
+            meaningful_drift_lines(
+                "C /home\nA /home/gerald\nC /home/gerald/workspace\nA /home/gerald/.cache/tool\nC /tmp\nA /tmp/socket\n",
+                home,
+            ),
             Vec::<String>::new()
         );
     }

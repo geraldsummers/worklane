@@ -671,6 +671,10 @@ fn main() -> Result<()> {
             }
             LaneAction::Diff { lane, raw } => {
                 let s = store.lane(&lane)?;
+                // Keep the dashboard cache in sync with the same filtered diff
+                // that this command exposes.  Without this, a stale drift bit can
+                // survive after `lane diff` reports no meaningful changes.
+                refresh(&runner, &store, &s)?;
                 if s.host == "local" {
                     let output = podman(&SystemRunner, ["diff", &s.container_name()])?;
                     let diff = if raw {
