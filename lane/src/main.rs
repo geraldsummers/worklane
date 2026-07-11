@@ -212,8 +212,18 @@ fn run_app(
         };
         match app.handle_key(key) {
             UiAction::Quit => break,
-            UiAction::Command(verb, true) => action_with_args(app, verb, &["--shell"])?,
-            UiAction::Command(verb, false) => action(app, verb)?,
+            UiAction::Command(verb, true) => {
+                action_with_args(app, verb, &["--shell"])?;
+                if verb == "attach" {
+                    break;
+                }
+            }
+            UiAction::Command(verb, false) => {
+                action(app, verb)?;
+                if verb == "attach" {
+                    break;
+                }
+            }
             UiAction::Reload => {
                 app.lanes = Store::open_default()?.lanes()?;
                 app.message = "reloaded cached status".into()
@@ -497,7 +507,7 @@ mod tests {
             None,
             Some(KeyCode::Backspace),
             Some(KeyCode::Char('s')),
-            Some(KeyCode::Char('S')),
+            Some(KeyCode::Char('x')),
             Some(KeyCode::Char('r')),
             Some(KeyCode::Char('q')),
         ]
@@ -514,6 +524,18 @@ mod tests {
         .unwrap();
         assert_eq!(redraws, 6);
         assert_eq!(app.message, "reloaded cached status");
+        let mut attach_key = Some(KeyCode::Char('a'));
+        let mut attach_redraws = 0;
+        run_app(
+            &mut app,
+            |_| {
+                attach_redraws += 1;
+                Ok(())
+            },
+            || Ok(attach_key.take()),
+        )
+        .unwrap();
+        assert_eq!(attach_redraws, 1);
         let mut empty = App {
             lanes: vec![],
             selected: 0,
