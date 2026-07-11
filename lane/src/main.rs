@@ -37,8 +37,7 @@ impl App {
             filter: String::new(),
             filtering: false,
             detail: String::new(),
-            message: "j/k move • / filter • a Herdr • S shell • s start • x stop • d diff • i inspect • r refresh • q quit"
-                .into(),
+            message: String::new(),
         })
     }
     fn visible(&self) -> Vec<&LaneStatus> {
@@ -74,6 +73,11 @@ impl App {
             };
         }
         match key {
+            KeyCode::Esc if !self.detail.is_empty() => {
+                self.detail.clear();
+                self.message = "details closed".into();
+                UiAction::None
+            }
             KeyCode::Char('q') => UiAction::Quit,
             KeyCode::Char('j') | KeyCode::Down => {
                 let count = self.visible().len();
@@ -112,6 +116,24 @@ impl App {
 fn action(app: &mut App, verb: &str) -> Result<()> {
     action_with_args(app, verb, &[])
 }
+fn inspect_detail(output: &[u8]) -> Result<String> {
+    let value: serde_json::Value = serde_json::from_slice(output)?;
+    let spec = &value["spec"];
+    Ok(format!(
+        "Name: {}\nHost: {}\nState: {}{}\nProject: {}\nImage: {}\nHome: /home/{}",
+        spec["name"].as_str().unwrap_or("unknown"),
+        spec["host"].as_str().unwrap_or("unknown"),
+        value["state"].as_str().unwrap_or("unknown"),
+        if value["drift"].as_bool().unwrap_or(false) {
+            " (drift)"
+        } else {
+            ""
+        },
+        spec["project_path"].as_str().unwrap_or("unknown"),
+        spec["profile"]["image"].as_str().unwrap_or("unknown"),
+        spec["user"].as_str().unwrap_or("dev"),
+    ))
+}
 fn action_with_args(app: &mut App, verb: &str, extra: &[&str]) -> Result<()> {
     let visible = app.visible();
     let Some(item) = visible.get(app.selected) else {
@@ -138,6 +160,8 @@ fn action_with_args(app: &mut App, verb: &str, extra: &[&str]) -> Result<()> {
             } else {
                 lines.join("\n")
             };
+        } else if verb == "inspect" {
+            app.detail = inspect_detail(&output.stdout)?;
         } else {
             app.detail.clear();
         }
@@ -241,12 +265,13 @@ fn lane_style(state: &str, drift: bool) -> Style {
     }
 }
 fn draw(f: &mut ratatui::Frame, app: &App) {
+    let detail_height = if app.detail.is_empty() { 0 } else { 8 };
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(2),
             Constraint::Length(3),
-            Constraint::Length(5),
+            Constraint::Length(detail_height),
             Constraint::Length(3),
         ])
         .split(f.area());
@@ -297,17 +322,23 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         .block(Block::default().borders(Borders::ALL)),
         areas[1],
     );
+    if !app.detail.is_empty() {
+        f.render_widget(
+            Paragraph::new(app.detail.as_str()).block(
+                Block::default()
+                    .title(" Details — Esc closes ")
+                    .borders(Borders::ALL),
+            ),
+            areas[2],
+        );
+    }
     f.render_widget(
-        Paragraph::new(if app.detail.is_empty() {
-            "Press d to show the selected lane's writable-root diff."
-        } else {
-            app.detail.as_str()
-        })
-        .block(Block::default().title(" Details ").borders(Borders::ALL)),
-        areas[2],
-    );
-    f.render_widget(
-        Paragraph::new(app.message.as_str()).block(Block::default().borders(Borders::ALL)),
+        Paragraph::new(format!(
+            "{}{}",
+            if app.message.is_empty() { String::new() } else { format!("{} • ", app.message) },
+            "j/k move • / filter • Esc close • a Herdr • S shell • s start • x stop • d diff • i inspect • r refresh • q quit"
+        ))
+        .block(Block::default().title(" Controls ").borders(Borders::ALL)),
         areas[3],
     );
 }
@@ -386,6 +417,9 @@ mod tests {
             app.handle_key(KeyCode::Char('d')),
             UiAction::Command("diff", false)
         );
+        app.detail = "details".into();
+        assert_eq!(app.handle_key(KeyCode::Esc), UiAction::None);
+        assert!(app.detail.is_empty());
         assert_eq!(app.handle_key(KeyCode::Char('r')), UiAction::Reload);
         assert_eq!(app.handle_key(KeyCode::Char('q')), UiAction::Quit);
         app.handle_key(KeyCode::Char('/'));
@@ -422,7 +456,7 @@ mod tests {
         let worklane = bin.join("worklane");
         fs::write(
             &worklane,
-            "#!/bin/sh\ncase \"$*\" in *diff*) printf '{\"diff\":[]}\\n';; esac\nexit 0\n",
+            "#!/bin/sh\ncase \"$*\" in *diff*) printf '{\"diff\":[]}\\n';; *inspect*) printf '{\"spec\":{\"name\":\"alpha\",\"host\":\"lab\",\"project_path\":\"/tmp\",\"user\":\"gerald\",\"profile\":{\"image\":\"test:latest\"}},\"state\":\"running\",\"drift\":false}\\n';; esac\nexit 0\n",
         )
         .unwrap();
         #[cfg(unix)]
@@ -456,6 +490,8 @@ mod tests {
         assert_eq!(app.message, "attach: ok");
         action(&mut app, "diff").unwrap();
         assert_eq!(app.detail, "No meaningful writable-root changes.");
+        action(&mut app, "inspect").unwrap();
+        assert!(app.detail.contains("State: running"));
         assert_eq!(App::load().unwrap().lanes.len(), 1);
         let mut keys = vec![
             None,
@@ -533,5 +569,13 @@ mod tests {
         assert!(text.contains("beta"));
         assert!(text.contains("drift"));
         assert!(text.contains("C /etc/example"));
+        assert!(text.contains("Controls"));
+        assert!(text.contains("Esc close"));
+
+        let inspected = inspect_detail(
+            br#"{"spec":{"name":"alpha","host":"lab","project_path":"/tmp","user":"gerald","profile":{"image":"test:latest"}},"state":"running","drift":false}"#,
+        )
+        .unwrap();
+        assert!(inspected.contains("Home: /home/gerald"));
     }
 }
