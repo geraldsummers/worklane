@@ -308,12 +308,14 @@ pub fn host_state(r: &impl Runner, spec: &LaneSpec) -> Result<(String, bool)> {
 /// Rootless `--userns=keep-id` updates these account files at container start.
 /// They are runtime plumbing, not user changes to the disposable root filesystem.
 pub fn has_meaningful_drift(diff: &str, container_home: &Path) -> bool {
-    let runtime_home = format!("A {}", container_home.display());
+    let runtime_home_add = format!("A {}", container_home.display());
+    let runtime_home_change = format!("C {}", container_home.display());
     diff.lines().map(str::trim).any(|line| {
         !matches!(
             line,
             "C /etc" | "C /etc/passwd" | "C /etc/group" | "C /home"
-        ) && line != runtime_home
+        ) && line != runtime_home_add
+            && line != runtime_home_change
     })
 }
 pub fn write_lane_spec(spec: &LaneSpec) -> Result<()> {
@@ -461,7 +463,7 @@ mod tests {
     fn keep_id_account_changes_are_not_drift() {
         let home = Path::new("/home/gerald");
         assert!(!has_meaningful_drift(
-            "C /etc\nC /etc/passwd\nC /etc/group\nC /home\nA /home/gerald\n",
+            "C /etc\nC /etc/passwd\nC /etc/group\nC /home\nA /home/gerald\nC /home/gerald\n",
             home,
         ));
         assert!(has_meaningful_drift(

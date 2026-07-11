@@ -116,7 +116,13 @@ fn action_with_args(app: &mut App, verb: &str, extra: &[&str]) -> Result<()> {
     };
     let mut args = vec!["lane", verb, &item.spec.id];
     args.extend(extra.iter().copied());
-    let status = Command::new("worklane").args(args).status()?;
+    let mut command = Command::new("worklane");
+    command.args(args);
+    let status = if verb == "attach" {
+        command.status()?
+    } else {
+        command.output()?.status
+    };
     app.message = format!("{verb}: {}", if status.success() { "ok" } else { "failed" });
     app.lanes = Store::open_default()?.lanes()?;
     Ok(())
