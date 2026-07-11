@@ -463,7 +463,9 @@ pub fn meaningful_drift_lines(diff: &str, container_home: &Path) -> Vec<String> 
                 .split_once(' ')
                 .map(|(_, path)| path)
                 .unwrap_or_default();
-            let transient_tmp = path == "/tmp" || path.starts_with("/tmp/");
+            let transient_tmp = ["/tmp", "/var/tmp"]
+                .iter()
+                .any(|tmp| path == *tmp || path.starts_with(&format!("{tmp}/")));
             let mounted_home_change =
                 path == mounted_home || path.starts_with(&mounted_home_contents);
             !matches!(
@@ -662,7 +664,7 @@ mod tests {
         assert!(has_meaningful_drift("C /etc\nA /opt/notes.txt\n", home));
         assert_eq!(
             meaningful_drift_lines(
-                "C /home\nA /home/gerald\nC /home/gerald/workspace\nA /home/gerald/.cache/tool\nC /tmp\nA /tmp/socket\n",
+                "C /home\nA /home/gerald\nC /home/gerald/workspace\nA /home/gerald/.cache/tool\nC /tmp\nA /tmp/socket\nC /var/tmp\nA /var/tmp/build.lock\n",
                 home,
             ),
             Vec::<String>::new()
