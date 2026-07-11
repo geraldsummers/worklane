@@ -88,8 +88,9 @@ enum LaneAction {
         image: String,
         #[arg(long)]
         build_context: Option<PathBuf>,
-        #[arg(long, default_value = "Containerfile")]
-        containerfile: PathBuf,
+        /// Use this host-native Containerfile instead of Worklane's standard embedded recipe.
+        #[arg(long)]
+        containerfile: Option<PathBuf>,
         #[arg(long, hide = true)]
         id: Option<String>,
         #[arg(long, hide = true)]
@@ -233,13 +234,17 @@ fn image_build_args<R: Runner>(
         context.display().to_string(),
     ])
 }
+fn build_local_image<R: Runner>(r: &R, spec: &LaneSpec) -> Result<()> {
+    let context = spec.profile.build_context.as_ref().context(
+        "lane has no build context; recreate manually or create it with --build-context",
+    )?;
+    let file = (!spec.profile.embedded_containerfile).then_some(&spec.profile.containerfile);
+    podman(r, image_build_args(r, file, context, &spec.profile.image)?)?;
+    Ok(())
+}
 fn local_start<R: Runner>(r: &R, spec: &LaneSpec) -> Result<()> {
     if !image_exists(r, &spec.profile.image)? {
-        bail!(
-            "image '{}' is not available on this host; run `worklane image build --tag {}`",
-            spec.profile.image,
-            spec.profile.image
-        );
+        build_local_image(r, spec)?;
     }
     let _ = podman(r, ["rm", "-f", &spec.container_name()]);
     fs::create_dir_all(spec.home_dir())?;
@@ -502,13 +507,8 @@ fn main() -> Result<()> {
                 } else {
                     project
                 };
-                let build_context = build_context.or_else(|| {
-                    if host == "local" {
-                        Some(p.clone())
-                    } else {
-                        None
-                    }
-                });
+                let build_context = build_context.or_else(|| Some(p.clone()));
+                let embedded_containerfile = containerfile.is_none();
                 let mut spec = LaneSpec::new(
                     name,
                     host,
@@ -516,7 +516,9 @@ fn main() -> Result<()> {
                     Profile {
                         image,
                         build_context,
-                        containerfile,
+                        containerfile: containerfile
+                            .unwrap_or_else(|| PathBuf::from("Containerfile")),
+                        embedded_containerfile,
                         ..Profile::default()
                     },
                 )?;
@@ -549,13 +551,17 @@ fn main() -> Result<()> {
                         spec.project_path.display().to_string(),
                         "--image".into(),
                         spec.profile.image.clone(),
-                        "--containerfile".into(),
-                        spec.profile.containerfile.display().to_string(),
                         "--id".into(),
                         spec.id.clone(),
                         "--user".into(),
                         spec.user.clone(),
                     ];
+                    if !spec.profile.embedded_containerfile {
+                        args.extend([
+                            "--containerfile".into(),
+                            spec.profile.containerfile.display().to_string(),
+                        ]);
+                    }
                     if let Some(context) = &spec.profile.build_context {
                         args.extend(["--build-context".into(), context.display().to_string()]);
                     }
@@ -658,18 +664,7 @@ fn main() -> Result<()> {
                     }
                     if s.host == "local" {
                         let r = SystemRunner;
-                        let context = s.profile.build_context.as_ref().context("lane has no build context; recreate manually or create it with --build-context")?;
-                        podman(
-                            &r,
-                            vec![
-                                "build".into(),
-                                "-f".into(),
-                                s.profile.containerfile.display().to_string(),
-                                "-t".into(),
-                                s.profile.image.clone(),
-                                context.display().to_string(),
-                            ],
-                        )?;
+                        build_local_image(&r, &s)?;
                         s.image_digest = Some(image_identity(&r, &s.profile.image)?);
                         local_start(&runner, &s)?;
                         write_lane_spec(&s)?;
@@ -900,10 +895,43 @@ mod tests {
         assert!(local_start(&runner, &spec("local")).is_err());
     }
 
+    #[test]
+    fn local_start_builds_a_missing_image_from_the_lane_context() {
+        let runner = MissingImageRunner {
+            calls: Mutex::new(vec![]),
+        };
+        let mut lane = spec("local");
+        lane.profile.build_context = Some(PathBuf::from("/tmp"));
+        local_start(&runner, &lane).unwrap();
+        assert!(runner
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|args| args.first() == Some(&"build".into())));
+    }
+
     struct FailingRunner;
     impl Runner for FailingRunner {
         fn run(&self, _: &str, _: &[String]) -> Result<String> {
             bail!("podman unavailable")
+        }
+    }
+
+    struct MissingImageRunner {
+        calls: Mutex<Vec<Vec<String>>>,
+    }
+    impl Runner for MissingImageRunner {
+        fn run(&self, program: &str, args: &[String]) -> Result<String> {
+            self.calls.lock().unwrap().push(args.into());
+            if program == "podman" && args.first().is_some_and(|arg| arg == "image") {
+                bail!("image is missing")
+            }
+            Ok(match (program, args.first().map(String::as_str)) {
+                ("id", Some("-un")) => "gerald".into(),
+                ("id", Some("-u") | Some("-g")) => "1000".into(),
+                _ => String::new(),
+            })
         }
     }
 }

@@ -30,6 +30,9 @@ pub struct Profile {
     pub build_context: Option<PathBuf>,
     #[serde(default = "default_containerfile")]
     pub containerfile: PathBuf,
+    /// Use the standard Containerfile embedded in the Worklane binary.
+    #[serde(default = "default_embedded_containerfile")]
+    pub embedded_containerfile: bool,
     #[serde(default = "default_network")]
     pub network: String,
     #[serde(default)]
@@ -37,6 +40,9 @@ pub struct Profile {
 }
 fn default_containerfile() -> PathBuf {
     PathBuf::from("Containerfile")
+}
+fn default_embedded_containerfile() -> bool {
+    true
 }
 fn default_network() -> String {
     "outbound".into()
@@ -47,6 +53,7 @@ impl Default for Profile {
             image: DEFAULT_IMAGE.into(),
             build_context: None,
             containerfile: default_containerfile(),
+            embedded_containerfile: default_embedded_containerfile(),
             network: default_network(),
             mounts: vec![],
         }
@@ -408,6 +415,7 @@ mod tests {
         let profile: Profile = toml::from_str("image = 'test:latest'").unwrap();
         assert_eq!(profile.network, "outbound");
         assert_eq!(profile.containerfile, PathBuf::from("Containerfile"));
+        assert!(profile.embedded_containerfile);
         assert!(profile.build_context.is_none());
     }
 

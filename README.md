@@ -25,8 +25,10 @@ worklane lane create my-project
 worklane lane attach my-project
 ```
 
-For a local lane, `create` defaults both `--project` and `--build-context` to
-the current directory. `lane attach` starts or reattaches the lane's default persistent Herdr session.
+`create` defaults both `--project` and `--build-context` to the project path,
+and uses Worklane's standard embedded Containerfile unless `--containerfile`
+is supplied. If the declared image is missing, it is built automatically before
+the lane starts. `lane attach` starts or reattaches the lane's default persistent Herdr session.
 Detach with `Ctrl-B q`; panes and agents keep running in the lane. Use
 `worklane lane attach my-project --shell` for a plain zsh login shell. Use
 Herdr's own session commands only after attaching when you deliberately need a
@@ -38,7 +40,7 @@ To build for a managed host, the Containerfile and build context must already ex
 ```sh
 worklane image build --host lab --context /home/gerald/worklane --tag localhost/worklane:latest
 worklane lane create my-project --host lab --project /home/gerald/projects/my-project \
-  --image worklane:latest --build-context /home/gerald/worklane
+  --image worklane:latest
 ```
 
 The canonical controller registry is `~/.local/share/worklane/worklane.db`. Each local lane has a recoverable specification at `~/.local/share/worklane/lanes/<id>/lane.toml` and persistent home under the same directory. `destroy` archives that directory and never touches the project. `purge --yes` is explicitly destructive.
