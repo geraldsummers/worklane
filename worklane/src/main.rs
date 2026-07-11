@@ -502,6 +502,13 @@ fn main() -> Result<()> {
                 } else {
                     project
                 };
+                let build_context = build_context.or_else(|| {
+                    if host == "local" {
+                        Some(p.clone())
+                    } else {
+                        None
+                    }
+                });
                 let mut spec = LaneSpec::new(
                     name,
                     host,

@@ -90,6 +90,27 @@ esac
         ],
     );
     assert!(created.contains("\"state\":\"running\""));
+    assert!(run(
+        binary,
+        &data,
+        &bin_dir,
+        &[
+            "--json",
+            "lane",
+            "create",
+            "defaults",
+            "--image",
+            "test:latest"
+        ]
+    )
+    .contains("\"state\":\"running\""));
+    let default_lane = run(
+        binary,
+        &data,
+        &bin_dir,
+        &["--json", "lane", "inspect", "defaults"],
+    );
+    assert!(default_lane.contains("\"build_context\":"));
     assert!(run(binary, &data, &bin_dir, &["--json", "lane", "list"]).contains("smoke"));
     assert!(
         run(

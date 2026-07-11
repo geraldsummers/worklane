@@ -21,11 +21,12 @@ build tooling, as well as Codex, Herdr, Git, and GitHub CLI.
 
 ```sh
 worklane image build --context . --tag localhost/worklane:latest
-worklane lane create my-project --project "$PWD"
+worklane lane create my-project
 worklane lane attach my-project
 ```
 
-`lane attach` starts or reattaches the lane's default persistent Herdr session.
+For a local lane, `create` defaults both `--project` and `--build-context` to
+the current directory. `lane attach` starts or reattaches the lane's default persistent Herdr session.
 Detach with `Ctrl-B q`; panes and agents keep running in the lane. Use
 `worklane lane attach my-project --shell` for a plain zsh login shell. Use
 Herdr's own session commands only after attaching when you deliberately need a
