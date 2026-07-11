@@ -299,17 +299,21 @@ pub fn host_state(r: &impl Runner, spec: &LaneSpec) -> Result<(String, bool)> {
     let state = podman(r, ["inspect", "--format", "{{.State.Status}}", &name])
         .unwrap_or_else(|_| "absent".into());
     let drift = !matches!(state.as_str(), "absent")
-        && has_meaningful_drift(&podman(r, ["diff", &name]).unwrap_or_default());
+        && has_meaningful_drift(
+            &podman(r, ["diff", &name]).unwrap_or_default(),
+            &spec.container_home(),
+        );
     Ok((state, drift))
 }
 /// Rootless `--userns=keep-id` updates these account files at container start.
 /// They are runtime plumbing, not user changes to the disposable root filesystem.
-pub fn has_meaningful_drift(diff: &str) -> bool {
+pub fn has_meaningful_drift(diff: &str, container_home: &Path) -> bool {
+    let runtime_home = format!("A {}", container_home.display());
     diff.lines().map(str::trim).any(|line| {
         !matches!(
             line,
-            "C /etc" | "C /etc/passwd" | "C /etc/group" | "C /home" | "A /home/dev"
-        )
+            "C /etc" | "C /etc/passwd" | "C /etc/group" | "C /home"
+        ) && line != runtime_home
     })
 }
 pub fn write_lane_spec(spec: &LaneSpec) -> Result<()> {
@@ -455,10 +459,15 @@ mod tests {
 
     #[test]
     fn keep_id_account_changes_are_not_drift() {
+        let home = Path::new("/home/gerald");
         assert!(!has_meaningful_drift(
-            "C /etc\nC /etc/passwd\nC /etc/group\nC /home\nA /home/dev\n"
+            "C /etc\nC /etc/passwd\nC /etc/group\nC /home\nA /home/gerald\n",
+            home,
         ));
-        assert!(has_meaningful_drift("C /etc\nA /home/dev/notes.txt\n"));
+        assert!(has_meaningful_drift(
+            "C /etc\nA /home/gerald/notes.txt\n",
+            home
+        ));
     }
 
     #[test]
