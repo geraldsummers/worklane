@@ -137,7 +137,12 @@ fn emit<T: Serialize>(json: bool, value: &T) -> Result<()> {
     }
     Ok(())
 }
-fn remote(store: &Store, spec: &LaneSpec, args: Vec<String>) -> Result<Option<String>> {
+fn remote<R: Runner>(
+    runner: &R,
+    store: &Store,
+    spec: &LaneSpec,
+    args: Vec<String>,
+) -> Result<Option<String>> {
     if spec.host == "local" {
         return Ok(None);
     }
@@ -149,10 +154,15 @@ fn remote(store: &Store, spec: &LaneSpec, args: Vec<String>) -> Result<Option<St
     if host.local {
         return Ok(None);
     }
-    let out = SystemRunner.run("ssh", &ssh_command(&host.ssh_target, &args))?;
+    let out = runner.run("ssh", &ssh_command(&host.ssh_target, &args))?;
     Ok(Some(out))
 }
-fn remote_host(store: &Store, name: &str, args: Vec<String>) -> Result<Option<String>> {
+fn remote_host<R: Runner>(
+    runner: &R,
+    store: &Store,
+    name: &str,
+    args: Vec<String>,
+) -> Result<Option<String>> {
     if name == "local" {
         return Ok(None);
     }
@@ -165,19 +175,19 @@ fn remote_host(store: &Store, name: &str, args: Vec<String>) -> Result<Option<St
         return Ok(None);
     }
     Ok(Some(
-        SystemRunner.run("ssh", &ssh_command(&host.ssh_target, &args))?,
+        runner.run("ssh", &ssh_command(&host.ssh_target, &args))?,
     ))
 }
-fn remote_username(store: &Store, name: &str) -> Result<String> {
+fn remote_username<R: Runner>(runner: &R, store: &Store, name: &str) -> Result<String> {
     if name == "local" {
-        return Ok(current_identity(&SystemRunner)?.0);
+        return Ok(current_identity(runner)?.0);
     }
     let host = store
         .hosts()?
         .into_iter()
         .find(|h| h.name == name)
         .with_context(|| format!("host '{name}' is not configured"))?;
-    SystemRunner.run(
+    runner.run(
         "ssh",
         &[
             "-o".into(),
@@ -197,12 +207,17 @@ fn embedded_containerfile_path() -> Result<PathBuf> {
     }
     Ok(path)
 }
-fn image_build_args(file: Option<&PathBuf>, context: &PathBuf, tag: &str) -> Result<Vec<String>> {
+fn image_build_args<R: Runner>(
+    runner: &R,
+    file: Option<&PathBuf>,
+    context: &PathBuf,
+    tag: &str,
+) -> Result<Vec<String>> {
     let file = match file {
         Some(path) => path.clone(),
         None => embedded_containerfile_path()?,
     };
-    let (user, uid, gid) = current_identity(&SystemRunner)?;
+    let (user, uid, gid) = current_identity(runner)?;
     Ok(vec![
         "build".into(),
         "--build-arg".into(),
@@ -218,16 +233,15 @@ fn image_build_args(file: Option<&PathBuf>, context: &PathBuf, tag: &str) -> Res
         context.display().to_string(),
     ])
 }
-fn local_start(spec: &LaneSpec) -> Result<()> {
-    let r = SystemRunner;
-    if !image_exists(&r, &spec.profile.image)? {
+fn local_start<R: Runner>(r: &R, spec: &LaneSpec) -> Result<()> {
+    if !image_exists(r, &spec.profile.image)? {
         bail!(
             "image '{}' is not available on this host; run `worklane image build --tag {}`",
             spec.profile.image,
             spec.profile.image
         );
     }
-    let _ = podman(&r, ["rm", "-f", &spec.container_name()]);
+    let _ = podman(r, ["rm", "-f", &spec.container_name()]);
     fs::create_dir_all(spec.home_dir())?;
     let mut a = vec![
         "run".into(),
@@ -259,14 +273,15 @@ fn local_start(spec: &LaneSpec) -> Result<()> {
             .unwrap_or_else(|| spec.profile.image.clone()),
     );
     a.extend(["sleep".into(), "infinity".into()]);
-    podman(&r, a)?;
+    podman(r, a)?;
     Ok(())
 }
-fn refresh(store: &Store, spec: &LaneSpec) -> Result<LaneStatus> {
+fn refresh<R: Runner>(runner: &R, store: &Store, spec: &LaneSpec) -> Result<LaneStatus> {
     let (state, drift) = if spec.host == "local" {
-        host_state(&SystemRunner, spec)?
+        host_state(runner, spec)?
     } else {
         let out = remote(
+            runner,
             store,
             spec,
             vec!["lane".into(), "inspect".into(), spec.id.clone()],
@@ -329,6 +344,7 @@ fi"#;
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let store = Store::open_default()?;
+    let runner = SystemRunner;
     match cli.command {
         Top::Host(c) => match c.command {
             HostAction::Add { name, ssh } => {
@@ -435,13 +451,13 @@ fn main() -> Result<()> {
                 if let Some(file) = &file {
                     args.extend(["--file".into(), file.display().to_string()]);
                 }
-                if let Some(out) = remote_host(&store, &host, args)? {
+                if let Some(out) = remote_host(&runner, &store, &host, args)? {
                     let mut value: serde_json::Value = serde_json::from_str(&out)?;
                     value["host"] = serde_json::Value::String(host);
                     emit(cli.json, &value)
                 } else {
                     let r = SystemRunner;
-                    podman(&r, image_build_args(file.as_ref(), &context, &tag)?)?;
+                    podman(&r, image_build_args(&r, file.as_ref(), &context, &tag)?)?;
                     emit(
                         cli.json,
                         &serde_json::json!({"host":host,"image":tag,"id":image_identity(&r,&tag)?}),
@@ -456,7 +472,7 @@ fn main() -> Result<()> {
                     "local".into(),
                     image.clone(),
                 ];
-                if let Some(out) = remote_host(&store, &host, args)? {
+                if let Some(out) = remote_host(&runner, &store, &host, args)? {
                     let mut value: serde_json::Value = serde_json::from_str(&out)?;
                     value["host"] = serde_json::Value::String(host);
                     emit(cli.json, &value)
@@ -504,11 +520,11 @@ fn main() -> Result<()> {
                     spec.user = user;
                 }
                 if spec.host != "local" {
-                    spec.user = remote_username(&store, &spec.host)?;
+                    spec.user = remote_username(&runner, &store, &spec.host)?;
                 }
                 if spec.host == "local" {
                     write_lane_spec(&spec)?;
-                    local_start(&spec)?;
+                    local_start(&runner, &spec)?;
                     store.save_lane(&spec, "created", false)?;
                 } else {
                     let h = store
@@ -540,32 +556,40 @@ fn main() -> Result<()> {
                     let status: LaneStatus = serde_json::from_str(&out)?;
                     store.save_lane(&spec, &status.state, status.drift)?;
                 };
-                emit(cli.json, &refresh(&store, &spec)?)
+                emit(cli.json, &refresh(&runner, &store, &spec)?)
             }
             LaneAction::List => emit(cli.json, &store.lanes()?),
             LaneAction::Inspect { lane } => {
                 let s = store.lane(&lane)?;
-                emit(cli.json, &refresh(&store, &s)?)
+                emit(cli.json, &refresh(&runner, &store, &s)?)
             }
             LaneAction::Start { lane } => {
                 let s = store.lane(&lane)?;
                 if remote(
+                    &runner,
                     &store,
                     &s,
                     vec!["lane".into(), "start".into(), s.id.clone()],
                 )?
                 .is_none()
                 {
-                    local_start(&s)?
+                    local_start(&runner, &s)?
                 };
-                emit(cli.json, &refresh(&store, &s)?)
+                emit(cli.json, &refresh(&runner, &store, &s)?)
             }
             LaneAction::Stop { lane } => {
                 let s = store.lane(&lane)?;
-                if remote(&store, &s, vec!["lane".into(), "stop".into(), s.id.clone()])?.is_none() {
+                if remote(
+                    &runner,
+                    &store,
+                    &s,
+                    vec!["lane".into(), "stop".into(), s.id.clone()],
+                )?
+                .is_none()
+                {
                     podman(&SystemRunner, ["stop", &s.container_name()])?;
                 };
-                emit(cli.json, &refresh(&store, &s)?)
+                emit(cli.json, &refresh(&runner, &store, &s)?)
             }
             LaneAction::Attach { lane, shell } => {
                 let s = store.lane(&lane)?;
@@ -620,7 +644,7 @@ fn main() -> Result<()> {
                 };
                 let mut out = Vec::new();
                 for mut s in specs {
-                    let before = refresh(&store, &s)?;
+                    let before = refresh(&runner, &store, &s)?;
                     if before.drift && !force {
                         out.push(serde_json::json!({"lane":s.id,"outcome":"skipped-drift"}));
                         continue;
@@ -640,15 +664,15 @@ fn main() -> Result<()> {
                             ],
                         )?;
                         s.image_digest = Some(image_identity(&r, &s.profile.image)?);
-                        local_start(&s)?;
+                        local_start(&runner, &s)?;
                         write_lane_spec(&s)?;
-                        out.push(serde_json::to_value(refresh(&store, &s)?)?)
+                        out.push(serde_json::to_value(refresh(&runner, &store, &s)?)?)
                     } else {
                         let mut args = vec!["lane".into(), "upgrade".into(), s.id.clone()];
                         if force {
                             args.push("--force".into());
                         }
-                        let value = remote(&store, &s, args)?
+                        let value = remote(&runner, &store, &s, args)?
                             .context("remote host unexpectedly treated as local")?;
                         match serde_json::from_str::<serde_json::Value>(&value)? {
                             serde_json::Value::Array(values) => out.extend(values),
@@ -660,7 +684,7 @@ fn main() -> Result<()> {
             }
             LaneAction::Destroy { lane, force } => {
                 let s = store.lane(&lane)?;
-                let status = refresh(&store, &s)?;
+                let status = refresh(&runner, &store, &s)?;
                 if status.drift && !force {
                     bail!("container has writable-root drift; inspect it or rerun with --force")
                 };
@@ -668,6 +692,7 @@ fn main() -> Result<()> {
                     let _ = podman(&SystemRunner, ["rm", "-f", &s.container_name()]);
                 } else {
                     let out = remote(
+                        &runner,
                         &store,
                         &s,
                         vec![
@@ -712,6 +737,56 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    struct MockRunner {
+        calls: Mutex<Vec<(String, Vec<String>)>>,
+    }
+    impl MockRunner {
+        fn new() -> Self {
+            Self {
+                calls: Mutex::new(vec![]),
+            }
+        }
+    }
+    impl Runner for MockRunner {
+        fn run(&self, program: &str, args: &[String]) -> Result<String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((program.into(), args.into()));
+            Ok(
+                match (
+                    program,
+                    args.first().map(String::as_str),
+                    args.get(1).map(String::as_str),
+                ) {
+                    ("id", Some("-un"), _) => "gerald".into(),
+                    ("id", Some("-u"), _) => "1000".into(),
+                    ("id", Some("-g"), _) => "1000".into(),
+                    ("ssh", _, _) if args.last().is_some_and(|arg| arg == "id -un") => {
+                        "gerald".into()
+                    }
+                    ("podman", Some("inspect"), _) => "running".into(),
+                    _ => String::new(),
+                },
+            )
+        }
+    }
+    fn temp_store() -> (Store, PathBuf) {
+        let path =
+            std::env::temp_dir().join(format!("worklane-cli-test-{}.db", uuid::Uuid::new_v4()));
+        (Store::open(&path).unwrap(), path)
+    }
+    fn spec(host: &str) -> LaneSpec {
+        LaneSpec::new(
+            "test".into(),
+            host.into(),
+            PathBuf::from("/tmp"),
+            Profile::default(),
+        )
+        .unwrap()
+    }
 
     #[test]
     fn attach_defaults_to_herdr_or_explicit_shell() {
@@ -724,5 +799,65 @@ mod tests {
         assert!(EMBEDDED_CONTAINERFILE.starts_with("FROM debian:trixie-slim"));
         assert!(EMBEDDED_CONTAINERFILE.contains("@openai/codex"));
         assert!(EMBEDDED_CONTAINERFILE.contains("HERDR_INSTALL_DIR=/usr/local/bin"));
+    }
+
+    #[test]
+    fn remote_helpers_use_verified_ssh_and_host_identity() {
+        let (store, path) = temp_store();
+        store
+            .upsert_host(&Host {
+                name: "lab".into(),
+                ssh_target: "gerald@lab".into(),
+                local: false,
+                installed_version: None,
+                last_seen: None,
+            })
+            .unwrap();
+        let runner = MockRunner::new();
+        let lane = spec("lab");
+        assert_eq!(
+            remote(&runner, &store, &lane, vec!["lane".into(), "list".into()]).unwrap(),
+            Some(String::new())
+        );
+        assert_eq!(remote_username(&runner, &store, "lab").unwrap(), "gerald");
+        let calls = runner.calls.lock().unwrap();
+        assert!(calls
+            .iter()
+            .any(|(p, a)| p == "ssh" && a.contains(&"StrictHostKeyChecking=yes".into())));
+        drop(calls);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn image_build_inherits_calling_identity() {
+        let runner = MockRunner::new();
+        let args = image_build_args(
+            &runner,
+            Some(&PathBuf::from("/tmp/Containerfile")),
+            &PathBuf::from("/tmp/context"),
+            "localhost/test:latest",
+        )
+        .unwrap();
+        assert!(args.contains(&"USERNAME=gerald".into()));
+        assert!(args.contains(&"USER_UID=1000".into()));
+        assert!(args.contains(&"USER_GID=1000".into()));
+    }
+
+    #[test]
+    fn local_start_and_refresh_use_mock_podman() {
+        let runner = MockRunner::new();
+        let lane = spec("local");
+        local_start(&runner, &lane).unwrap();
+        let (store, path) = temp_store();
+        let status = refresh(&runner, &store, &lane).unwrap();
+        assert_eq!(status.state, "running");
+        assert!(!status.drift);
+        assert!(runner
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, a)| a.first() == Some(&"run".into())));
+        std::fs::remove_file(path).unwrap();
     }
 }
