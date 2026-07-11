@@ -1413,6 +1413,7 @@ dependencies = [
  "serde",
  "serde_json",
  "toml",
+ "uuid",
  "worklane-core",
 ]
 
