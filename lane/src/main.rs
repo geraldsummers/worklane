@@ -352,9 +352,9 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(2),
-            Constraint::Length(5),
-            Constraint::Length(detail_height),
             Constraint::Length(3),
+            Constraint::Length(detail_height),
+            Constraint::Length(5),
         ])
         .split(f.area());
     let mut items = vec![ListItem::new(format!(
@@ -675,6 +675,8 @@ mod tests {
         assert!(text.contains("C /etc/example"));
         assert!(text.contains("Controls"));
         assert!(text.contains("Esc close"));
+        assert!(text.contains("selected upgrade"));
+        assert!(text.contains("all upgrades"));
 
         let inspected = inspect_detail(
             br#"{"spec":{"name":"alpha","host":"lab","project_path":"/tmp","user":"gerald","profile":{"image":"test:latest"}},"state":"running","drift":false}"#,
