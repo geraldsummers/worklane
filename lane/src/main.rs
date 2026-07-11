@@ -11,7 +11,12 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Paragraph},
     Terminal,
 };
-use std::{io, process::Command, time::Duration};
+use std::{
+    io,
+    process::Command,
+    sync::mpsc::{self, Receiver, TryRecvError},
+    time::Duration,
+};
 use worklane_core::{LaneStatus, Store};
 
 struct App {
@@ -21,6 +26,11 @@ struct App {
     filtering: bool,
     detail: String,
     message: String,
+    upgrade: Option<Receiver<UpgradeResult>>,
+}
+struct UpgradeResult {
+    label: &'static str,
+    output: Result<std::process::Output, String>,
 }
 #[derive(Debug, PartialEq, Eq)]
 enum UiAction {
@@ -39,6 +49,7 @@ impl App {
             filtering: false,
             detail: String::new(),
             message: String::new(),
+            upgrade: None,
         })
     }
     fn visible(&self) -> Vec<&LaneStatus> {
@@ -208,17 +219,62 @@ fn action_with_args(app: &mut App, verb: &str, extra: &[&str]) -> Result<()> {
     }
     Ok(())
 }
-fn upgrade_all(app: &mut App) -> Result<()> {
-    let output = Command::new("worklane")
-        .args(["lane", "upgrade", "--all"])
-        .output()?;
-    if output.status.success() {
-        app.detail = upgrade_detail(&output.stdout)?;
-        app.message = "upgrade all: completed".into();
-        app.lanes = Store::open_default()?.lanes()?;
+fn start_upgrade(app: &mut App, all: bool) -> Result<()> {
+    if app.upgrade.is_some() {
+        app.message = "upgrade already running".into();
+        return Ok(());
+    }
+    let args = if all {
+        vec!["lane".into(), "upgrade".into(), "--all".into()]
     } else {
-        app.message = "upgrade all: failed".into();
-        app.detail = String::from_utf8_lossy(&output.stderr).trim().into();
+        let visible = app.visible();
+        let Some(item) = visible.get(app.selected) else {
+            return Ok(());
+        };
+        vec!["lane".into(), "upgrade".into(), item.spec.id.clone()]
+    };
+    let label = if all { "upgrade all" } else { "upgrade" };
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let output = Command::new("worklane")
+            .args(args)
+            .output()
+            .map_err(|error| error.to_string());
+        let _ = sender.send(UpgradeResult { label, output });
+    });
+    app.upgrade = Some(receiver);
+    app.message = format!("{label}: running in background");
+    app.detail.clear();
+    Ok(())
+}
+fn poll_upgrade(app: &mut App) -> Result<()> {
+    let Some(receiver) = app.upgrade.as_ref() else {
+        return Ok(());
+    };
+    let result = match receiver.try_recv() {
+        Ok(result) => result,
+        Err(TryRecvError::Empty) => return Ok(()),
+        Err(TryRecvError::Disconnected) => {
+            app.upgrade = None;
+            app.message = "upgrade worker stopped unexpectedly".into();
+            return Ok(());
+        }
+    };
+    app.upgrade = None;
+    match result.output {
+        Ok(output) if output.status.success() => {
+            app.detail = upgrade_detail(&output.stdout)?;
+            app.message = format!("{}: completed", result.label);
+            app.lanes = Store::open_default()?.lanes()?;
+        }
+        Ok(output) => {
+            app.message = format!("{}: failed", result.label);
+            app.detail = String::from_utf8_lossy(&output.stderr).trim().into();
+        }
+        Err(error) => {
+            app.message = format!("{}: failed", result.label);
+            app.detail = error;
+        }
     }
     Ok(())
 }
@@ -278,6 +334,7 @@ fn run_app(
     mut next_key: impl FnMut() -> Result<Option<KeyCode>>,
 ) -> Result<()> {
     loop {
+        poll_upgrade(app)?;
         redraw(app)?;
         let Some(key) = next_key()? else {
             continue;
@@ -290,6 +347,7 @@ fn run_app(
                     break;
                 }
             }
+            UiAction::Command("upgrade", false) => start_upgrade(app, false)?,
             UiAction::Command(verb, false) => {
                 action(app, verb)?;
                 if verb == "attach" {
@@ -299,7 +357,7 @@ fn run_app(
             UiAction::Reload => {
                 refresh_all(app)?;
             }
-            UiAction::UpgradeAll => upgrade_all(app)?,
+            UiAction::UpgradeAll => start_upgrade(app, true)?,
             UiAction::None => {}
         }
     }
@@ -460,6 +518,7 @@ mod tests {
             filtering: false,
             detail: String::new(),
             message: String::new(),
+            upgrade: None,
         }
     }
 
@@ -582,7 +641,14 @@ mod tests {
         assert!(app.detail.contains("State: running"));
         action(&mut app, "upgrade").unwrap();
         assert_eq!(app.detail, "alpha: running");
-        upgrade_all(&mut app).unwrap();
+        start_upgrade(&mut app, true).unwrap();
+        for _ in 0..100 {
+            poll_upgrade(&mut app).unwrap();
+            if app.upgrade.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
         assert_eq!(app.message, "upgrade all: completed");
         assert_eq!(App::load().unwrap().lanes.len(), 1);
         let mut keys = vec![
@@ -625,6 +691,7 @@ mod tests {
             filtering: false,
             detail: String::new(),
             message: String::new(),
+            upgrade: None,
         };
         action(&mut empty, "start").unwrap();
         if let Some(value) = previous_data {
