@@ -107,22 +107,40 @@ fn main() -> Result<()> {
 }
 fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
     let mut app = App::load()?;
-    loop {
-        terminal.draw(|f| draw(f, &app))?;
-        if !event::poll(Duration::from_millis(250))? {
-            continue;
-        }
-        if let Event::Key(k) = event::read()? {
-            match app.handle_key(k.code) {
-                UiAction::Quit => break,
-                UiAction::Command(verb, true) => action_with_args(&mut app, verb, &["--shell"])?,
-                UiAction::Command(verb, false) => action(&mut app, verb)?,
-                UiAction::Reload => {
-                    app.lanes = Store::open_default()?.lanes()?;
-                    app.message = "reloaded cached status".into()
-                }
-                UiAction::None => {}
+    run_app(
+        &mut app,
+        |app| Ok(terminal.draw(|frame| draw(frame, app)).map(|_| ())?),
+        || {
+            if !event::poll(Duration::from_millis(250))? {
+                return Ok(None);
             }
+            Ok(match event::read()? {
+                Event::Key(key) => Some(key.code),
+                _ => None,
+            })
+        },
+    )
+}
+
+fn run_app(
+    app: &mut App,
+    mut redraw: impl FnMut(&App) -> Result<()>,
+    mut next_key: impl FnMut() -> Result<Option<KeyCode>>,
+) -> Result<()> {
+    loop {
+        redraw(app)?;
+        let Some(key) = next_key()? else {
+            continue;
+        };
+        match app.handle_key(key) {
+            UiAction::Quit => break,
+            UiAction::Command(verb, true) => action_with_args(app, verb, &["--shell"])?,
+            UiAction::Command(verb, false) => action(app, verb)?,
+            UiAction::Reload => {
+                app.lanes = Store::open_default()?.lanes()?;
+                app.message = "reloaded cached status".into()
+            }
+            UiAction::None => {}
         }
     }
     Ok(())
@@ -261,6 +279,10 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&worklane, fs::Permissions::from_mode(0o755)).unwrap();
         }
+        let original_data = env::var_os("XDG_DATA_HOME");
+        if original_data.is_none() {
+            env::set_var("XDG_DATA_HOME", root.join("outer-data"));
+        }
         let previous_data = env::var_os("XDG_DATA_HOME");
         let previous_path = env::var_os("PATH");
         env::set_var("XDG_DATA_HOME", root.join("data"));
@@ -282,6 +304,27 @@ mod tests {
         action_with_args(&mut app, "attach", &["--shell"]).unwrap();
         assert_eq!(app.message, "attach: ok");
         assert_eq!(App::load().unwrap().lanes.len(), 1);
+        let mut keys = vec![
+            None,
+            Some(KeyCode::Backspace),
+            Some(KeyCode::Char('s')),
+            Some(KeyCode::Char('S')),
+            Some(KeyCode::Char('r')),
+            Some(KeyCode::Char('q')),
+        ]
+        .into_iter();
+        let mut redraws = 0;
+        run_app(
+            &mut app,
+            |_| {
+                redraws += 1;
+                Ok(())
+            },
+            || Ok(keys.next().expect("test has a key for every redraw")),
+        )
+        .unwrap();
+        assert_eq!(redraws, 6);
+        assert_eq!(app.message, "reloaded cached status");
         let mut empty = App {
             lanes: vec![],
             selected: 0,
@@ -296,6 +339,9 @@ mod tests {
         }
         if let Some(value) = previous_path {
             env::set_var("PATH", value);
+        }
+        if original_data.is_none() {
+            env::remove_var("XDG_DATA_HOME");
         }
         fs::remove_dir_all(root).unwrap();
     }

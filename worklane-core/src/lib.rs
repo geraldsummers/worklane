@@ -331,6 +331,13 @@ mod tests {
             Ok(self.output.clone())
         }
     }
+
+    struct FailingMock;
+    impl Runner for FailingMock {
+        fn run(&self, _: &str, _: &[String]) -> Result<String> {
+            bail!("mock command failed")
+        }
+    }
     #[test]
     fn ssh_is_strict() {
         assert_eq!(
@@ -435,6 +442,35 @@ mod tests {
             current_identity(&identity).unwrap(),
             ("1000".into(), "1000".into(), "1000".into())
         );
+    }
+
+    #[test]
+    fn process_and_image_failures_are_reported() {
+        assert!(!image_exists(&FailingMock, "missing:latest").unwrap());
+        let empty = Mock {
+            output: String::new(),
+            calls: Mutex::new(vec![]),
+        };
+        assert!(image_digest(&empty, "missing:latest").is_err());
+        assert!(image_identity(&empty, "missing:latest").is_err());
+        assert!(SystemRunner
+            .run("sh", &["-c".into(), "exit 7".into()])
+            .is_err());
+    }
+
+    #[test]
+    fn malformed_cached_lane_is_rejected() {
+        let path = std::env::temp_dir().join(format!("worklane-invalid-{}.db", Uuid::new_v4()));
+        let store = Store::open(&path).unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO lanes(id,name,host,spec_toml,state,drift,cached_at) VALUES('bad','bad','local','not = [valid','unknown',0,'now')",
+                [],
+            )
+            .unwrap();
+        assert!(store.lanes().is_err());
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

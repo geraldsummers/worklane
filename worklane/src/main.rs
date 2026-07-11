@@ -820,6 +820,32 @@ mod tests {
             Some(String::new())
         );
         assert_eq!(remote_username(&runner, &store, "lab").unwrap(), "gerald");
+        assert_eq!(
+            remote(&runner, &store, &spec("local"), vec!["lane".into()]).unwrap(),
+            None
+        );
+        assert_eq!(
+            remote_host(&runner, &store, "local", vec!["lane".into()]).unwrap(),
+            None
+        );
+        assert_eq!(remote_username(&runner, &store, "local").unwrap(), "gerald");
+        store
+            .upsert_host(&Host {
+                name: "alias".into(),
+                ssh_target: "unused".into(),
+                local: true,
+                installed_version: None,
+                last_seen: None,
+            })
+            .unwrap();
+        assert_eq!(
+            remote_host(&runner, &store, "alias", vec!["lane".into()]).unwrap(),
+            None
+        );
+        assert_eq!(
+            remote(&runner, &store, &spec("alias"), vec!["lane".into()]).unwrap(),
+            None
+        );
         let calls = runner.calls.lock().unwrap();
         assert!(calls
             .iter()
@@ -859,5 +885,18 @@ mod tests {
             .iter()
             .any(|(_, a)| a.first() == Some(&"run".into())));
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn local_start_explains_when_the_image_is_missing() {
+        let runner = FailingRunner;
+        assert!(local_start(&runner, &spec("local")).is_err());
+    }
+
+    struct FailingRunner;
+    impl Runner for FailingRunner {
+        fn run(&self, _: &str, _: &[String]) -> Result<String> {
+            bail!("podman unavailable")
+        }
     }
 }
