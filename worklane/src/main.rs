@@ -494,25 +494,15 @@ else
   herdr --session "$WORKLANE_NAME" workspace create --cwd "$HOME/$WORKLANE_NAME" --label "$WORKLANE_NAME" --focus
 fi
 watcher="$HOME/.local/share/worklane/bin/worklane-git-diff-pane"
-pane_file="$HOME/.local/share/worklane/git-diff-pane-id"
+manager="$HOME/.local/share/worklane/bin/worklane-git-diff-pane-manager"
+if pgrep -u "$(id -u)" -f "$manager" >/dev/null 2>&1; then
+  pkill -u "$(id -u)" -f "$manager" >/dev/null 2>&1 || true
+fi
 if pgrep -u "$(id -u)" -f "$watcher" >/dev/null 2>&1; then
   pkill -u "$(id -u)" -f "$watcher" >/dev/null 2>&1 || true
 fi
-if [ -s "$pane_file" ]; then
-  diff_pane="$(cat "$pane_file")"
-  if herdr --session "$WORKLANE_NAME" pane run "$diff_pane" "$watcher" >/dev/null 2>&1; then
-    exit 0
-  fi
-  rm -f "$pane_file"
-fi
-if ! pgrep -u "$(id -u)" -f "$watcher" >/dev/null 2>&1; then
-  split_output="$(herdr --session "$WORKLANE_NAME" pane split --direction right --ratio 0.7 --cwd "$HOME/$WORKLANE_NAME" --env "WORKLANE_NAME=$WORKLANE_NAME" --no-focus 2>/dev/null || true)"
-  diff_pane="$(printf '%s' "$split_output" | jq -r '.result.pane.pane_id // .result.pane_id // empty' 2>/dev/null | head -n 1)"
-  if [ -n "$diff_pane" ]; then
-    printf '%s\n' "$diff_pane" > "$pane_file"
-    herdr --session "$WORKLANE_NAME" pane rename "$diff_pane" "git diff" >/dev/null 2>&1 || true
-    herdr --session "$WORKLANE_NAME" pane run "$diff_pane" "$watcher" >/dev/null 2>&1 || true
-  fi
+if [ -x "$manager" ]; then
+  "$manager" >/dev/null 2>&1 &!
 fi"#;
     let output = Command::new("podman")
         .args([
@@ -726,6 +716,64 @@ while :; do
 done
 WORKLANE_GIT_DIFF_PANE
 chmod 755 "$HOME/.local/share/worklane/bin/worklane-git-diff-pane"
+cat > "$HOME/.local/share/worklane/bin/worklane-git-diff-pane-manager" <<'WORKLANE_GIT_DIFF_PANE_MANAGER'
+#!/bin/sh
+interval="${{WORKLANE_GIT_DIFF_MANAGER_INTERVAL:-2}}"
+session="${{WORKLANE_NAME:-}}"
+watcher="$HOME/.local/share/worklane/bin/worklane-git-diff-pane"
+[ -n "$session" ] || exit 0
+
+snapshot() {{
+  herdr --session "$session" api snapshot 2>/dev/null || true
+}}
+
+run_existing_diff_panes() {{
+  state="$1"
+  printf '%s\n' "$state" |
+    jq -r '.result.snapshot.panes[]? | select((.label // "") == "git diff") | .pane_id' 2>/dev/null |
+    while IFS= read -r pane; do
+      [ -n "$pane" ] || continue
+      herdr --session "$session" pane run "$pane" "$watcher" >/dev/null 2>&1 || true
+    done
+}}
+
+ensure_tab_diff_panes() {{
+  state="$1"
+  printf '%s\n' "$state" |
+    jq -r '.result.snapshot.tabs[]?.tab_id' 2>/dev/null |
+    while IFS= read -r tab; do
+      [ -n "$tab" ] || continue
+      if printf '%s\n' "$state" |
+        jq -e --arg tab "$tab" '.result.snapshot.panes[]? | select(.tab_id == $tab and (.label // "") == "git diff")' >/dev/null 2>&1; then
+        continue
+      fi
+      target="$(printf '%s\n' "$state" |
+        jq -r --arg tab "$tab" '.result.snapshot.panes[]? | select(.tab_id == $tab and (.label // "") != "git diff") | .pane_id' 2>/dev/null |
+        head -n 1)"
+      [ -n "$target" ] || continue
+      cwd="$(printf '%s\n' "$state" |
+        jq -r --arg pane "$target" '.result.snapshot.panes[]? | select(.pane_id == $pane) | (.foreground_cwd // .cwd // empty)' 2>/dev/null |
+        head -n 1)"
+      [ -n "$cwd" ] || cwd="$HOME/$session"
+      split_output="$(herdr --session "$session" pane split "$target" --direction right --ratio 0.7 --cwd "$cwd" --env "WORKLANE_NAME=$session" --no-focus 2>/dev/null || true)"
+      diff_pane="$(printf '%s\n' "$split_output" |
+        jq -r '.result.pane.pane_id // .result.pane_id // empty' 2>/dev/null |
+        head -n 1)"
+      [ -n "$diff_pane" ] || continue
+      herdr --session "$session" pane rename "$diff_pane" "git diff" >/dev/null 2>&1 || true
+      herdr --session "$session" pane run "$diff_pane" "$watcher" >/dev/null 2>&1 || true
+    done
+}}
+
+state="$(snapshot)"
+[ -n "$state" ] && run_existing_diff_panes "$state"
+while :; do
+  state="$(snapshot)"
+  [ -n "$state" ] && ensure_tab_diff_panes "$state"
+  sleep "$interval"
+done
+WORKLANE_GIT_DIFF_PANE_MANAGER
+chmod 755 "$HOME/.local/share/worklane/bin/worklane-git-diff-pane-manager"
 mkdir -p "$HOME/.local/bin"
 cat > "$HOME/.local/bin/codex" <<'WORKLANE_CODEX_WRAPPER'
 #!/bin/sh
@@ -1367,8 +1415,9 @@ mod tests {
         assert!(source.contains("--label \"$WORKLANE_NAME\""));
         assert!(source.contains("herdr --session \"$WORKLANE_NAME\" workspace create"));
         assert!(source.contains("herdr --session \"$WORKLANE_NAME\" workspace focus"));
-        assert!(source.contains("pane split --direction right --ratio 0.7"));
-        assert!(source.contains("pane run \"$diff_pane\" \"$watcher\""));
+        assert!(source.contains("worklane-git-diff-pane-manager"));
+        assert!(source.contains("pkill -u \"$(id -u)\" -f \"$manager\""));
+        assert!(source.contains("\"$manager\" >/dev/null 2>&1 &!"));
     }
 
     #[test]
@@ -1421,6 +1470,12 @@ mod tests {
         assert!(shell.contains("cat > \"$HOME/.codex/AGENTS.md\""));
         assert!(!shell.contains("$HOME/AGENTS.md"));
         assert!(shell.contains("$HOME/.local/share/worklane/bin/worklane-git-diff-pane"));
+        assert!(shell.contains("$HOME/.local/share/worklane/bin/worklane-git-diff-pane-manager"));
+        assert!(shell.contains("WORKLANE_GIT_DIFF_MANAGER_INTERVAL:-2"));
+        assert!(shell.contains("herdr --session \"$session\" api snapshot"));
+        assert!(shell.contains(".result.snapshot.tabs[]?.tab_id"));
+        assert!(shell.contains("pane split \"$target\" --direction right --ratio 0.7"));
+        assert!(shell.contains("pane run \"$diff_pane\" \"$watcher\""));
         assert!(shell.contains("WORKLANE_GIT_DIFF_INTERVAL:-1"));
         assert!(shell.contains("find \"$scan_root\" -maxdepth \"$max_depth\""));
         assert!(!shell.contains("rel=\".\""));
