@@ -22,3 +22,16 @@ language tooling. Prefer the installed tool before adding a new one.
 Herdr is the lane session manager. A normal `worklane lane attach` enters the lane through
 `herdr --session <lane-name>`, with the lane workspace focused at `/home/dev/<lane-name>`.
 Use Herdr-managed sessions unless the user explicitly asks for a plain shell.
+
+## Fresh dist builds
+
+When asked for a fresh dist, build the release binaries and refresh the ignored `dist/` directory:
+
+```sh
+cargo build --release --target x86_64-unknown-linux-gnu
+mkdir -p dist
+cp target/x86_64-unknown-linux-gnu/release/worklane target/x86_64-unknown-linux-gnu/release/lane dist/
+sha256sum dist/worklane dist/lane
+```
+
+Report the two SHA-256 hashes. Do not commit `dist/` artifacts; `dist/` and `target/` are ignored.
