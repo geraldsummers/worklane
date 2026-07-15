@@ -156,7 +156,7 @@ enum LaneAction {
     Delete {
         lane: String,
     },
-    /// Remove only an unknown-state lane from this controller registry.
+    /// Remove only this controller registry entry without touching Podman.
     Forget {
         lane: String,
     },
@@ -1105,13 +1105,6 @@ fn main() -> Result<()> {
             }
             LaneAction::Forget { lane } => {
                 let s = store.lane(&lane)?;
-                let status = cached_lane_status(&store, &s)?;
-                if status.state != "unknown" {
-                    bail!(
-                        "lane state is '{}'; only unknown lanes can be forgotten",
-                        status.state
-                    )
-                }
                 store.remove_lane(&s.id)?;
                 emit(cli.json, &serde_json::json!({"forgot":s.name}))
             }

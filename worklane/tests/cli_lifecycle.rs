@@ -151,10 +151,32 @@ esac
         &["--json", "lane", "upgrade", "smoke", "--force"]
     )
     .contains("running"));
-    assert!(
-        run_failure(binary, &data, &bin_dir, &["lane", "forget", "smoke"])
-            .contains("only unknown lanes can be forgotten")
-    );
+    assert!(run(
+        binary,
+        &data,
+        &bin_dir,
+        &[
+            "--json",
+            "lane",
+            "create",
+            "registry-only",
+            "--project",
+            &project_arg,
+            "--id",
+            "registry-only-fixed-id",
+            "--user",
+            "dev",
+        ],
+    )
+    .contains("\"state\":\"running\""));
+    assert!(run(
+        binary,
+        &data,
+        &bin_dir,
+        &["--json", "lane", "forget", "registry-only"]
+    )
+    .contains("forgot"));
+    assert!(!run(binary, &data, &bin_dir, &["--json", "lane", "list"]).contains("registry-only"));
     assert!(run(
         binary,
         &data,

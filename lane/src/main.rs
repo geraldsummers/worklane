@@ -27,6 +27,7 @@ struct App {
     detail: String,
     message: String,
     confirming_delete: bool,
+    confirming_forget: bool,
     upgrade: Option<Receiver<UpgradeEvent>>,
     state_poll: Option<Receiver<StatePollResult>>,
     state_poll_pending: usize,
@@ -70,6 +71,7 @@ impl App {
             detail: String::new(),
             message: String::new(),
             confirming_delete: false,
+            confirming_forget: false,
             upgrade: None,
             state_poll: None,
             state_poll_pending: 0,
@@ -123,6 +125,20 @@ impl App {
                 _ => UiAction::None,
             };
         }
+        if self.confirming_forget {
+            return match key {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.confirming_forget = false;
+                    UiAction::Command("forget", false)
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.confirming_forget = false;
+                    self.message = "forget cancelled".into();
+                    UiAction::None
+                }
+                _ => UiAction::None,
+            };
+        }
         match key {
             KeyCode::Esc if !self.detail.is_empty() => {
                 self.detail.clear();
@@ -152,6 +168,12 @@ impl App {
                 self.confirming_delete = true;
                 self.message =
                     "Delete selected lane and registry? Bind-mounted data is preserved. y/N".into();
+                UiAction::None
+            }
+            KeyCode::Char('F') if self.visible().get(self.selected).is_some() => {
+                self.confirming_forget = true;
+                self.message =
+                    "Forget selected lane from registry only? Podman is untouched. y/N".into();
                 UiAction::None
             }
             KeyCode::Char('i') => UiAction::Command("inspect", false),
@@ -743,7 +765,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     f.render_widget(
         Paragraph::new(format!(
             "{}\n\
-             j/k mv  / filt  Esc  q  a/S attach  s/x run  d diff  D del  i info  e edit  u/U up  r ref",
+             j/k mv  / filt  Esc  q  a/S attach  s/x run  d diff  D del  F forget  i info  e edit  u/U up  r ref",
             if app.message.is_empty() {
                 "ready"
             } else {
@@ -786,6 +808,7 @@ mod tests {
             detail: String::new(),
             message: String::new(),
             confirming_delete: false,
+            confirming_forget: false,
             upgrade: None,
             state_poll: None,
             state_poll_pending: 0,
@@ -843,6 +866,16 @@ mod tests {
         assert_eq!(
             app.handle_key(KeyCode::Char('y')),
             UiAction::Command("delete", false)
+        );
+        assert_eq!(app.handle_key(KeyCode::Char('F')), UiAction::None);
+        assert!(app.confirming_forget);
+        assert!(app.message.contains("Podman is untouched"));
+        assert_eq!(app.handle_key(KeyCode::Esc), UiAction::None);
+        assert!(!app.confirming_forget);
+        assert_eq!(app.handle_key(KeyCode::Char('F')), UiAction::None);
+        assert_eq!(
+            app.handle_key(KeyCode::Char('y')),
+            UiAction::Command("forget", false)
         );
         app.detail = "details".into();
         assert_eq!(app.handle_key(KeyCode::Esc), UiAction::None);
@@ -1111,6 +1144,7 @@ mod tests {
             detail: String::new(),
             message: String::new(),
             confirming_delete: false,
+            confirming_forget: false,
             upgrade: None,
             state_poll: None,
             state_poll_pending: 0,
@@ -1166,6 +1200,7 @@ mod tests {
         assert!(text.contains("Esc"));
         assert!(text.contains("a/S attach"));
         assert!(text.contains("D del"));
+        assert!(text.contains("F forget"));
         assert!(text.contains("u/U up"));
 
         let inspected = inspect_detail(
