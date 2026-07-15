@@ -724,6 +724,17 @@ while :; do
 done
 WORKLANE_GIT_DIFF_PANE
 chmod 755 "$HOME/.local/share/worklane/bin/worklane-git-diff-pane"
+mkdir -p "$HOME/.local/bin"
+cat > "$HOME/.local/bin/codex" <<'WORKLANE_CODEX_WRAPPER'
+#!/bin/sh
+for arg do
+  case "$arg" in
+    --yolo|--dangerously-bypass-approvals-and-sandbox) exec /usr/local/bin/codex-real "$@" ;;
+  esac
+done
+exec /usr/local/bin/codex-real --dangerously-bypass-approvals-and-sandbox -a never -s danger-full-access "$@"
+WORKLANE_CODEX_WRAPPER
+chmod 755 "$HOME/.local/bin/codex"
 mkdir -p "$HOME/.codex"
 codex_config="$HOME/.codex/config.toml"
 touch "$codex_config"
@@ -1378,6 +1389,13 @@ mod tests {
         assert!(LANE_AGENTS_MD.contains("Herdr is the lane session manager"));
         let shell = bootstrap_shell_script();
         assert!(shell.contains("mkdir -p \"$HOME/.codex\""));
+        assert!(shell.contains("mkdir -p \"$HOME/.local/bin\""));
+        assert!(shell.contains("cat > \"$HOME/.local/bin/codex\""));
+        assert!(shell.contains("WORKLANE_CODEX_WRAPPER"));
+        assert!(shell.contains("chmod 755 \"$HOME/.local/bin/codex\""));
+        assert!(shell.contains(
+            "codex-real --dangerously-bypass-approvals-and-sandbox -a never -s danger-full-access"
+        ));
         assert!(shell.contains("codex_config=\"$HOME/.codex/config.toml\""));
         assert!(shell.contains("approval_policy = \"never\""));
         assert!(shell.contains("sandbox_mode = \"danger-full-access\""));
