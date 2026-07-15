@@ -561,11 +561,16 @@ interval="${{WORKLANE_GIT_DIFF_INTERVAL:-3}}"
 scan_root="${{WORKLANE_GIT_DIFF_ROOT:-$PWD}}"
 max_depth="${{WORKLANE_GIT_DIFF_MAX_DEPTH:-4}}"
 tmp="${{TMPDIR:-/tmp}}/worklane-git-diff-pane.$$"
-trap 'printf "\033[?7h\033[?25h\033[?1049l\033[3J"; rm -f "$tmp" "$tmp.next"' EXIT INT TERM
+trap 'printf "\033[?7h\033[?25h\033[?1049l\033[3J"; rm -f "$tmp" "$tmp.next" "$tmp.full"' EXIT INT TERM
 pane_width() {{
   cols="$(tput cols 2>/dev/null || printf '80')"
   case "$cols" in *[!0-9]*|'') cols=80 ;; esac
   printf '%s\n' "$cols"
+}}
+pane_height() {{
+  lines="$(tput lines 2>/dev/null || printf '24')"
+  case "$lines" in *[!0-9]*|'') lines=24 ;; esac
+  printf '%s\n' "$lines"
 }}
 render_width() {{
   width="$(pane_width)"
@@ -587,7 +592,17 @@ repo_roots() {{
     git rev-parse --show-toplevel 2>/dev/null || true
     find "$scan_root" -maxdepth "$max_depth" -type d -name .git -prune 2>/dev/null |
       while IFS= read -r git_dir; do dirname "$git_dir"; done
-  }} | awk 'NF && !seen[$0]++'
+  }} |
+    awk 'NF && !seen[$0]++' |
+    while IFS= read -r repo; do
+      if git -C "$repo" status --porcelain=v1 2>/dev/null | grep -q .; then
+        printf '0\t%s\n' "$repo"
+      else
+        printf '1\t%s\n' "$repo"
+      fi
+    done |
+    sort -k1,1 -k2,2 |
+    cut -f2-
 }}
 print_repo() {{
   repo="$1"
@@ -645,9 +660,29 @@ render_frame() {{
     done
   fi
 }}
+fit_frame() {{
+  frame="$1"
+  height="$(pane_height)"
+  width="$(render_width)"
+  if [ "$height" -le 1 ]; then
+    sed -n '1p' "$frame" | clip "$width"
+    return
+  fi
+  total="$(wc -l < "$frame" | awk '{{ print $1+0 }}')"
+  if [ "$total" -le "$height" ]; then
+    cat "$frame"
+    return
+  fi
+  visible="$((height - 1))"
+  head -n "$visible" "$frame"
+  printf '... %s more lines (increase pane height or reduce WORKLANE_GIT_DIFF_ROOT/MAX_DEPTH)\n' "$((total - visible))" |
+    clip "$width"
+}}
 printf '\033[?1049h\033[?25l\033[?7l\033[H\033[2J\033[3J'
 while :; do
-  render_frame > "$tmp.next"
+  render_frame > "$tmp.full"
+  fit_frame "$tmp.full" > "$tmp.next"
+  rm -f "$tmp.full"
   if ! cmp -s "$tmp.next" "$tmp" 2>/dev/null; then
     mv "$tmp.next" "$tmp"
     printf '\033[H\033[2J'
@@ -1323,10 +1358,15 @@ mod tests {
         assert!(!shell.contains("$HOME/AGENTS.md"));
         assert!(shell.contains("$HOME/.local/share/worklane/bin/worklane-git-diff-pane"));
         assert!(shell.contains("find \"$scan_root\" -maxdepth \"$max_depth\""));
-        assert!(shell.contains("render_frame > \"$tmp.next\""));
+        assert!(shell.contains("sort -k1,1 -k2,2"));
+        assert!(shell.contains("render_frame > \"$tmp.full\""));
         assert!(shell.contains("cmp -s \"$tmp.next\" \"$tmp\""));
         assert!(shell.contains("pane_width()"));
+        assert!(shell.contains("pane_height()"));
         assert!(shell.contains("render_width()"));
+        assert!(shell.contains("fit_frame()"));
+        assert!(shell.contains("fit_frame \"$tmp.full\" > \"$tmp.next\""));
+        assert!(shell.contains("more lines (increase pane height"));
         assert!(shell.contains("clip()"));
         assert!(shell.contains("\\033[?7l"));
         assert!(shell.contains("\\033[?7h"));
