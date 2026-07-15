@@ -1,4 +1,5 @@
 FROM debian:trixie-slim
+# worklane-standard-containerfile
 ARG CODEX_VERSION=latest
 ARG USERNAME=dev
 ARG USER_UID=1000

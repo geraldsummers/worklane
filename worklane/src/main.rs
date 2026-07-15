@@ -12,6 +12,7 @@ use worklane_core::*;
 
 /// The standard lane image recipe travels with every `worklane` binary.
 const EMBEDDED_CONTAINERFILE: &str = include_str!("../../Containerfile");
+const STANDARD_CONTAINERFILE_MARKER: &str = "worklane-standard-containerfile";
 /// Guidance seeded into Codex's global instructions on first lane attach.
 const LANE_AGENTS_MD: &str = include_str!("../../AGENTS.md");
 
@@ -242,8 +243,20 @@ fn seed_containerfile(path: &std::path::Path) -> Result<()> {
     fs::create_dir_all(path.parent().expect("embedded Containerfile has a parent"))?;
     if !path.exists() {
         fs::write(&path, EMBEDDED_CONTAINERFILE)?;
+        return Ok(());
+    }
+    let existing = fs::read_to_string(path)?;
+    if existing != EMBEDDED_CONTAINERFILE && is_worklane_standard_containerfile(&existing) {
+        fs::write(&path, EMBEDDED_CONTAINERFILE)?;
     }
     Ok(())
+}
+fn is_worklane_standard_containerfile(content: &str) -> bool {
+    content.contains(STANDARD_CONTAINERFILE_MARKER)
+        || (content.starts_with("FROM debian:trixie-slim")
+            && content.contains("@openai/codex")
+            && content.contains("HERDR_INSTALL_DIR=/usr/local/bin")
+            && content.contains("CMD [\"sleep\", \"infinity\"]"))
 }
 fn image_build_args<R: Runner>(
     runner: &R,
@@ -258,6 +271,7 @@ fn image_build_args<R: Runner>(
     let (_, uid, gid) = current_identity(runner)?;
     Ok(vec![
         "build".into(),
+        "--no-cache".into(),
         "--build-arg".into(),
         format!("USERNAME={CONTAINER_USER}"),
         "--build-arg".into(),
@@ -1290,12 +1304,25 @@ mod tests {
     }
 
     #[test]
-    fn standard_containerfile_is_seeded_once_and_remains_user_owned() {
+    fn standard_containerfile_refreshes_managed_recipe_and_preserves_custom_edits() {
         let root = std::env::temp_dir().join(format!(
             "worklane-containerfile-test-{}",
             uuid::Uuid::new_v4()
         ));
         let path = root.join("Containerfile");
+        seed_containerfile(&path).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), EMBEDDED_CONTAINERFILE);
+        fs::write(
+            &path,
+            r#"FROM debian:trixie-slim
+ARG CODEX_VERSION=latest
+RUN npm install -g "@openai/codex@${CODEX_VERSION}" \
+ && curl -fsSL https://herdr.dev/install.sh -o /tmp/herdr-install.sh \
+ && HERDR_INSTALL_DIR=/usr/local/bin sh /tmp/herdr-install.sh
+CMD ["sleep", "infinity"]
+"#,
+        )
+        .unwrap();
         seed_containerfile(&path).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), EMBEDDED_CONTAINERFILE);
         fs::write(&path, "FROM user-edited\n").unwrap();
@@ -1365,6 +1392,7 @@ mod tests {
             "localhost/test:latest",
         )
         .unwrap();
+        assert!(args.contains(&"--no-cache".into()));
         assert!(args.contains(&"USERNAME=dev".into()));
         assert!(args.contains(&"USER_UID=1000".into()));
         assert!(args.contains(&"USER_GID=1000".into()));
@@ -1509,6 +1537,7 @@ mod tests {
             })
             .unwrap();
         let standard_containerfile = ensure_standard_containerfile().unwrap();
+        assert!(build.1.contains(&"--no-cache".into()));
         assert!(build
             .1
             .contains(&standard_containerfile.display().to_string()));
