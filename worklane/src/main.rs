@@ -561,7 +561,7 @@ interval="${{WORKLANE_GIT_DIFF_INTERVAL:-1}}"
 scan_root="${{WORKLANE_GIT_DIFF_ROOT:-$PWD}}"
 max_depth="${{WORKLANE_GIT_DIFF_MAX_DEPTH:-4}}"
 tmp="${{TMPDIR:-/tmp}}/worklane-git-diff-pane.$$"
-trap 'printf "\033[?7h\033[?25h\033[?1049l\033[3J"; rm -f "$tmp" "$tmp.next" "$tmp.full"' EXIT INT TERM
+trap 'printf "\033[?25h\033[?1049l\033[3J"; rm -f "$tmp" "$tmp.next" "$tmp.full"' EXIT INT TERM
 pane_width() {{
   cols="$(tput cols 2>/dev/null || printf '80')"
   case "$cols" in *[!0-9]*|'') cols=80 ;; esac
@@ -580,12 +580,7 @@ render_width() {{
   printf '%s\n' "$width"
 }}
 clip() {{
-  width="$1"
-  if [ "$width" -le 1 ]; then
-    cat
-    return
-  fi
-  awk -v width="$width" '{{ if (length($0) > width) print substr($0, 1, width - 1) "~"; else print }}'
+  cat
 }}
 repo_roots() {{
   {{
@@ -684,7 +679,7 @@ fit_frame() {{
   printf '... %s more lines (increase pane height or reduce WORKLANE_GIT_DIFF_ROOT/MAX_DEPTH)\n' "$((total - visible))" |
     clip "$width"
 }}
-printf '\033[?1049h\033[?25l\033[?7l\033[H\033[2J\033[3J'
+printf '\033[?1049h\033[?25l\033[H\033[2J\033[3J'
 while :; do
   render_frame > "$tmp.full"
   fit_frame "$tmp.full" > "$tmp.next"
@@ -1384,8 +1379,8 @@ mod tests {
         assert!(shell.contains("fit_frame \"$tmp.full\" > \"$tmp.next\""));
         assert!(shell.contains("more lines (increase pane height"));
         assert!(shell.contains("clip()"));
-        assert!(shell.contains("\\033[?7l"));
-        assert!(shell.contains("\\033[?7h"));
+        assert!(!shell.contains("\\033[?7l"));
+        assert!(!shell.contains("\\033[?7h"));
         assert!(shell.contains("\\033[H\\033[2J"));
         assert!(shell.contains("color.status=never"));
         assert!(shell.contains("\\033[?1049h"));
