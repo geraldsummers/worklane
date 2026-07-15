@@ -626,14 +626,16 @@ print_repo() {{
   staged="$(printf '%s\n' "$status" | awk 'substr($0,1,1) != " " && substr($0,1,1) != "?" && NF {{ n++ }} END {{ print n+0 }}')"
   unstaged="$(printf '%s\n' "$status" | awk 'substr($0,2,1) != " " && NF {{ n++ }} END {{ print n+0 }}')"
   untracked="$(printf '%s\n' "$status" | awk 'substr($0,1,2) == "??" {{ n++ }} END {{ print n+0 }}')"
-  heading="$rel"
+  printf '\033[1;36m%s\033[0m\n' "$(printf '%s\n' "$rel" | clip "$width")"
   if [ -n "$branch" ]; then
-    heading="$heading $branch"
+    branch="branch: $branch"
+  else
+    branch="branch: unknown"
   fi
   counts="S:$staged U:$unstaged ?:$untracked"
-  heading_width="$((width - ${{#counts}} - 2))"
-  [ "$heading_width" -lt 8 ] && heading_width=8
-  printf '\033[1;36m%s\033[0m  %s\n' "$(printf '%s\n' "$heading" | clip "$heading_width")" "$counts"
+  branch_width="$((width - ${{#counts}} - 4))"
+  [ "$branch_width" -lt 8 ] && branch_width=8
+  printf '  %s  %s\n' "$(printf '%s\n' "$branch" | clip "$branch_width")" "$counts"
   git -C "$repo" -c color.status=never status --short 2>/dev/null |
     sed -n '1,12p' |
     sed 's/^/  /' |
@@ -1367,6 +1369,7 @@ mod tests {
         assert!(shell.contains("git -C \"$repo\" status --porcelain=v1"));
         assert!(shell.contains("dirty_repo_roots()"));
         assert!(shell.contains("count_lines()"));
+        assert!(shell.contains("branch: $branch"));
         assert!(shell.contains("watched: %s  dirty: %s"));
         assert!(shell.contains("\\033[32mall clean\\033[0m"));
         assert!(shell.contains("render_frame > \"$tmp.full\""));
