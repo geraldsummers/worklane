@@ -557,7 +557,7 @@ grep -qxF 'source "$HOME/.config/worklane/prompt.zsh"' "$HOME/.zshrc" || \
 mkdir -p "$HOME/.local/share/worklane/bin"
 cat > "$HOME/.local/share/worklane/bin/worklane-git-diff-pane" <<'WORKLANE_GIT_DIFF_PANE'
 #!/bin/sh
-interval="${{WORKLANE_GIT_DIFF_INTERVAL:-3}}"
+interval="${{WORKLANE_GIT_DIFF_INTERVAL:-1}}"
 scan_root="${{WORKLANE_GIT_DIFF_ROOT:-$PWD}}"
 max_depth="${{WORKLANE_GIT_DIFF_MAX_DEPTH:-4}}"
 tmp="${{TMPDIR:-/tmp}}/worklane-git-diff-pane.$$"
@@ -615,7 +615,6 @@ print_repo() {{
   width="$2"
   rel="$repo"
   case "$repo" in
-    "$scan_root") rel="." ;;
     "$scan_root"/*) rel="${{repo#"$scan_root"/}}" ;;
   esac
   branch="$(git -C "$repo" branch --show-current 2>/dev/null || true)"
@@ -1365,7 +1364,9 @@ mod tests {
         assert!(shell.contains("cat > \"$HOME/.codex/AGENTS.md\""));
         assert!(!shell.contains("$HOME/AGENTS.md"));
         assert!(shell.contains("$HOME/.local/share/worklane/bin/worklane-git-diff-pane"));
+        assert!(shell.contains("WORKLANE_GIT_DIFF_INTERVAL:-1"));
         assert!(shell.contains("find \"$scan_root\" -maxdepth \"$max_depth\""));
+        assert!(!shell.contains("rel=\".\""));
         assert!(shell.contains("git -C \"$repo\" status --porcelain=v1"));
         assert!(shell.contains("dirty_repo_roots()"));
         assert!(shell.contains("count_lines()"));
