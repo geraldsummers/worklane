@@ -492,7 +492,7 @@ if [ -s "$pane_file" ]; then
   rm -f "$pane_file"
 fi
 if ! pgrep -u "$(id -u)" -f "$watcher" >/dev/null 2>&1; then
-  split_output="$(herdr --session "$WORKLANE_NAME" pane split --direction right --ratio 0.12 --cwd "$HOME/$WORKLANE_NAME" --env "WORKLANE_NAME=$WORKLANE_NAME" --no-focus 2>/dev/null || true)"
+  split_output="$(herdr --session "$WORKLANE_NAME" pane split --direction right --ratio 0.88 --cwd "$HOME/$WORKLANE_NAME" --env "WORKLANE_NAME=$WORKLANE_NAME" --no-focus 2>/dev/null || true)"
   diff_pane="$(printf '%s' "$split_output" | jq -r '.result.pane.pane_id // .result.pane_id // empty' 2>/dev/null | head -n 1)"
   if [ -n "$diff_pane" ]; then
     printf '%s\n' "$diff_pane" > "$pane_file"
@@ -1236,7 +1236,7 @@ mod tests {
         assert!(source.contains("--label \"$WORKLANE_NAME\""));
         assert!(source.contains("herdr --session \"$WORKLANE_NAME\" workspace create"));
         assert!(source.contains("herdr --session \"$WORKLANE_NAME\" workspace focus"));
-        assert!(source.contains("pane split --direction right --ratio 0.12"));
+        assert!(source.contains("pane split --direction right --ratio 0.88"));
         assert!(source.contains("pane run \"$diff_pane\" \"$watcher\""));
     }
 
