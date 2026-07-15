@@ -539,10 +539,12 @@ fn bootstrap_shell_script() -> String {
 if [ ! -f "$HOME/.zshrc" ]; then
   cat > "$HOME/.zshrc" <<'ZSHRC'
 export EDITOR="${EDITOR:-vim}"
-export PATH="$HOME/.local/bin:$PATH"
 cd "$HOME/${WORKLANE_NAME:-workspace}" 2>/dev/null || true
 ZSHRC
 fi
+touch "$HOME/.zshenv"
+grep -qxF 'case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac' "$HOME/.zshenv" || \
+  printf '%s\n' 'case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac' >> "$HOME/.zshenv"
 mkdir -p "$HOME/.config/worklane"
 cat > "$HOME/.config/worklane/prompt.zsh" <<'WORKLANE_PROMPT'
 PROMPT="%F{cyan}[${WORKLANE_NAME:-lane}]%f %F{green}%n%f:%F{blue}%~%f %# "
@@ -729,10 +731,18 @@ cat > "$HOME/.local/bin/codex" <<'WORKLANE_CODEX_WRAPPER'
 #!/bin/sh
 for arg do
   case "$arg" in
-    --yolo|--dangerously-bypass-approvals-and-sandbox) exec /usr/local/bin/codex-real "$@" ;;
+    --yolo|--dangerously-bypass-approvals-and-sandbox)
+      if [ -x /usr/local/bin/codex-real ]; then
+        exec /usr/local/bin/codex-real "$@"
+      fi
+      exec /usr/local/bin/codex "$@"
+      ;;
   esac
 done
-exec /usr/local/bin/codex-real --dangerously-bypass-approvals-and-sandbox -a never -s danger-full-access "$@"
+if [ -x /usr/local/bin/codex-real ]; then
+  exec /usr/local/bin/codex-real --dangerously-bypass-approvals-and-sandbox -a never -s danger-full-access "$@"
+fi
+exec /usr/local/bin/codex --dangerously-bypass-approvals-and-sandbox -a never -s danger-full-access "$@"
 WORKLANE_CODEX_WRAPPER
 chmod 755 "$HOME/.local/bin/codex"
 mkdir -p "$HOME/.codex"
@@ -1388,11 +1398,18 @@ mod tests {
         assert!(LANE_AGENTS_MD.contains("RAM-backed tmpfs mounts, limited to 1 GiB"));
         assert!(LANE_AGENTS_MD.contains("Herdr is the lane session manager"));
         let shell = bootstrap_shell_script();
+        assert!(shell.contains("touch \"$HOME/.zshenv\""));
+        assert!(shell.contains("export PATH=\"$HOME/.local/bin:$PATH\""));
         assert!(shell.contains("mkdir -p \"$HOME/.codex\""));
         assert!(shell.contains("mkdir -p \"$HOME/.local/bin\""));
         assert!(shell.contains("cat > \"$HOME/.local/bin/codex\""));
         assert!(shell.contains("WORKLANE_CODEX_WRAPPER"));
         assert!(shell.contains("chmod 755 \"$HOME/.local/bin/codex\""));
+        assert!(shell.contains("[ -x /usr/local/bin/codex-real ]"));
+        assert!(shell.contains("exec /usr/local/bin/codex \"$@\""));
+        assert!(shell.contains(
+            "exec /usr/local/bin/codex --dangerously-bypass-approvals-and-sandbox -a never -s danger-full-access"
+        ));
         assert!(shell.contains(
             "codex-real --dangerously-bypass-approvals-and-sandbox -a never -s danger-full-access"
         ));
