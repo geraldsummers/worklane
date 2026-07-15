@@ -622,6 +622,20 @@ done
 WORKLANE_GIT_DIFF_PANE
 chmod 755 "$HOME/.local/share/worklane/bin/worklane-git-diff-pane"
 mkdir -p "$HOME/.codex"
+codex_config="$HOME/.codex/config.toml"
+touch "$codex_config"
+codex_config_tmp="$codex_config.worklane.$$"
+awk '
+  /^\[/ {{ in_table = 1 }}
+  !in_table && $0 ~ /^(approval_policy|sandbox_mode)[[:space:]]*=/ {{ next }}
+  {{ print }}
+' "$codex_config" > "$codex_config_tmp"
+{{
+  printf '%s\n' 'approval_policy = "never"'
+  printf '%s\n' 'sandbox_mode = "danger-full-access"'
+  cat "$codex_config_tmp"
+}} > "$codex_config"
+rm -f "$codex_config_tmp"
 if [ ! -f "$HOME/.codex/AGENTS.md" ] && [ ! -f "$HOME/.codex/AGENTS.override.md" ]; then
   cat > "$HOME/.codex/AGENTS.md" <<'WORKLANE_AGENTS'
 {LANE_AGENTS_MD}
@@ -1247,6 +1261,9 @@ mod tests {
         assert!(EMBEDDED_CONTAINERFILE.starts_with("FROM debian:trixie-slim"));
         assert!(EMBEDDED_CONTAINERFILE.contains("@openai/codex"));
         assert!(EMBEDDED_CONTAINERFILE.contains("codex-real --yolo"));
+        assert!(EMBEDDED_CONTAINERFILE.contains("/etc/codex/config.toml"));
+        assert!(EMBEDDED_CONTAINERFILE.contains("approval_policy = \"never\""));
+        assert!(EMBEDDED_CONTAINERFILE.contains("sandbox_mode = \"danger-full-access\""));
         assert!(EMBEDDED_CONTAINERFILE.contains("HERDR_INSTALL_DIR=/usr/local/bin"));
         assert!(!EMBEDDED_CONTAINERFILE.contains("NOPASSWD:ALL"));
         assert!(EMBEDDED_CONTAINERFILE.contains("ripgrep"));
@@ -1256,6 +1273,9 @@ mod tests {
         assert!(LANE_AGENTS_MD.contains("Herdr is the lane session manager"));
         let shell = bootstrap_shell_script();
         assert!(shell.contains("mkdir -p \"$HOME/.codex\""));
+        assert!(shell.contains("codex_config=\"$HOME/.codex/config.toml\""));
+        assert!(shell.contains("approval_policy = \"never\""));
+        assert!(shell.contains("sandbox_mode = \"danger-full-access\""));
         assert!(shell.contains("[ ! -f \"$HOME/.codex/AGENTS.md\" ]"));
         assert!(shell.contains("[ ! -f \"$HOME/.codex/AGENTS.override.md\" ]"));
         assert!(shell.contains("cat > \"$HOME/.codex/AGENTS.md\""));

@@ -30,6 +30,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     'exec /usr/local/bin/codex-real --yolo "$@"' \
     > /usr/local/bin/codex \
  && chmod +x /usr/local/bin/codex \
+ && mkdir -p /etc/codex \
+ && printf '%s\n' 'approval_policy = "never"' 'sandbox_mode = "danger-full-access"' > /etc/codex/config.toml \
  && curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs -o /tmp/rustup-init.sh \
  && env CARGO_HOME=/usr/local/cargo RUSTUP_HOME=/usr/local/rustup sh /tmp/rustup-init.sh -y --profile minimal \
  && rm -f /tmp/rustup-init.sh \
