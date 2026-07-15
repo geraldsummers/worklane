@@ -594,12 +594,21 @@ repo_roots() {{
       while IFS= read -r git_dir; do dirname "$git_dir"; done
   }} |
     awk 'NF && !seen[$0]++' |
-    while IFS= read -r repo; do
-      if git -C "$repo" status --porcelain=v1 2>/dev/null | grep -q .; then
-        printf '%s\n' "$repo"
-      fi
-    done |
     sort
+}}
+dirty_repo_roots() {{
+  while IFS= read -r repo; do
+    if git -C "$repo" status --porcelain=v1 2>/dev/null | grep -q .; then
+      printf '%s\n' "$repo"
+    fi
+  done
+}}
+count_lines() {{
+  if [ -z "$1" ]; then
+    printf '0\n'
+  else
+    printf '%s\n' "$1" | awk 'NF {{ n++ }} END {{ print n+0 }}'
+  fi
 }}
 print_repo() {{
   repo="$1"
@@ -642,8 +651,12 @@ render_frame() {{
   fi
   date '+%Y-%m-%d %H:%M:%S %Z'
   printf 'scan: %s\n' "$scan_root" | clip "$width"
+  all_repos="$(repo_roots)"
+  repos="$(printf '%s\n' "$all_repos" | dirty_repo_roots)"
+  watched_count="$(count_lines "$all_repos")"
+  dirty_count="$(count_lines "$repos")"
+  printf 'watched: %s  dirty: %s\n' "$watched_count" "$dirty_count" | clip "$width"
   printf -- '%*s\n\n' "$width" '' | tr ' ' '-'
-  repos="$(repo_roots)"
   if [ -z "$repos" ]; then
     printf '\033[32mall clean\033[0m\n'
   else
@@ -1352,6 +1365,9 @@ mod tests {
         assert!(shell.contains("$HOME/.local/share/worklane/bin/worklane-git-diff-pane"));
         assert!(shell.contains("find \"$scan_root\" -maxdepth \"$max_depth\""));
         assert!(shell.contains("git -C \"$repo\" status --porcelain=v1"));
+        assert!(shell.contains("dirty_repo_roots()"));
+        assert!(shell.contains("count_lines()"));
+        assert!(shell.contains("watched: %s  dirty: %s"));
         assert!(shell.contains("\\033[32mall clean\\033[0m"));
         assert!(shell.contains("render_frame > \"$tmp.full\""));
         assert!(shell.contains("cmp -s \"$tmp.next\" \"$tmp\""));
