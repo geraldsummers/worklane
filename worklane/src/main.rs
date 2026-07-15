@@ -591,9 +591,36 @@ repo_roots() {{
     awk 'NF && !seen[$0]++' |
     sort
 }}
-dirty_repo_roots() {{
+sync_status() {{
+  repo="$1"
+  upstream="$(git -C "$repo" rev-parse --abbrev-ref --symbolic-full-name '@{{upstream}}' 2>/dev/null || true)"
+  if [ -z "$upstream" ]; then
+    printf 'no-upstream\n'
+    return
+  fi
+  counts="$(git -C "$repo" rev-list --left-right --count HEAD..."$upstream" 2>/dev/null || true)"
+  if [ -z "$counts" ]; then
+    printf 'upstream-missing\n'
+    return
+  fi
+  ahead="${{counts%%[[:space:]]*}}"
+  behind="${{counts##*[[:space:]]}}"
+  case "$ahead" in *[!0-9]*|'') ahead=0 ;; esac
+  case "$behind" in *[!0-9]*|'') behind=0 ;; esac
+  if [ "$ahead" -gt 0 ] && [ "$behind" -gt 0 ]; then
+    printf 'diverged +%s -%s\n' "$ahead" "$behind"
+  elif [ "$ahead" -gt 0 ]; then
+    printf 'ahead +%s\n' "$ahead"
+  elif [ "$behind" -gt 0 ]; then
+    printf 'behind -%s\n' "$behind"
+  else
+    printf 'synced\n'
+  fi
+}}
+shown_repo_roots() {{
   while IFS= read -r repo; do
-    if git -C "$repo" status --porcelain=v1 2>/dev/null | grep -q .; then
+    sync="$(sync_status "$repo")"
+    if git -C "$repo" status --porcelain=v1 2>/dev/null | grep -q . || [ "$sync" != "synced" ]; then
       printf '%s\n' "$repo"
     fi
   done
@@ -617,6 +644,7 @@ print_repo() {{
     branch="$(git -C "$repo" rev-parse --short HEAD 2>/dev/null || true)"
   fi
   status="$(git -C "$repo" status --porcelain=v1 2>/dev/null || true)"
+  sync="$(sync_status "$repo")"
   staged="$(printf '%s\n' "$status" | awk 'substr($0,1,1) != " " && substr($0,1,1) != "?" && NF {{ n++ }} END {{ print n+0 }}')"
   unstaged="$(printf '%s\n' "$status" | awk 'substr($0,2,1) != " " && NF {{ n++ }} END {{ print n+0 }}')"
   untracked="$(printf '%s\n' "$status" | awk 'substr($0,1,2) == "??" {{ n++ }} END {{ print n+0 }}')"
@@ -626,7 +654,7 @@ print_repo() {{
   else
     branch="branch: unknown"
   fi
-  counts="S:$staged U:$unstaged ?:$untracked"
+  counts="S:$staged U:$unstaged ?:$untracked  $sync"
   branch_width="$((width - ${{#counts}} - 4))"
   [ "$branch_width" -lt 8 ] && branch_width=8
   printf '  %s  %s\n' "$(printf '%s\n' "$branch" | clip "$branch_width")" "$counts"
@@ -647,13 +675,13 @@ render_frame() {{
   date '+%Y-%m-%d %H:%M:%S %Z'
   printf 'scan: %s\n' "$scan_root" | clip "$width"
   all_repos="$(repo_roots)"
-  repos="$(printf '%s\n' "$all_repos" | dirty_repo_roots)"
+  repos="$(printf '%s\n' "$all_repos" | shown_repo_roots)"
   watched_count="$(count_lines "$all_repos")"
-  dirty_count="$(count_lines "$repos")"
-  printf 'watched: %s  dirty: %s\n' "$watched_count" "$dirty_count" | clip "$width"
+  shown_count="$(count_lines "$repos")"
+  printf 'watched: %s  shown: %s\n' "$watched_count" "$shown_count" | clip "$width"
   awk -v width="$width" 'BEGIN {{ for (i = 0; i < width; i++) printf "─"; printf "\n\n" }}'
   if [ -z "$repos" ]; then
-    printf '\033[32mall clean\033[0m\n'
+    printf '\033[32mall clean and synced\033[0m\n'
   else
     printf '%s\n' "$repos" | while IFS= read -r repo; do
       print_repo "$repo" "$width"
@@ -1362,14 +1390,18 @@ mod tests {
         assert!(shell.contains("find \"$scan_root\" -maxdepth \"$max_depth\""));
         assert!(!shell.contains("rel=\".\""));
         assert!(shell.contains("git -C \"$repo\" status --porcelain=v1"));
-        assert!(shell.contains("dirty_repo_roots()"));
+        assert!(shell.contains("sync_status()"));
+        assert!(shell.contains("shown_repo_roots()"));
+        assert!(shell.contains("rev-parse --abbrev-ref --symbolic-full-name '@{upstream}'"));
+        assert!(shell.contains("rev-list --left-right --count HEAD...\"$upstream\""));
+        assert!(shell.contains("diverged +%s -%s"));
         assert!(shell.contains("count_lines()"));
         assert!(shell.contains("branch: $branch"));
         assert!(shell.contains("lane: %s"));
-        assert!(shell.contains("watched: %s  dirty: %s"));
+        assert!(shell.contains("watched: %s  shown: %s"));
         assert!(shell.contains("printf \"─\""));
         assert!(!shell.contains("Worklane git tree diff"));
-        assert!(shell.contains("\\033[32mall clean\\033[0m"));
+        assert!(shell.contains("\\033[32mall clean and synced\\033[0m"));
         assert!(shell.contains("render_frame > \"$tmp.full\""));
         assert!(shell.contains("cmp -s \"$tmp.next\" \"$tmp\""));
         assert!(shell.contains("pane_width()"));
@@ -1386,7 +1418,7 @@ mod tests {
         assert!(shell.contains("\\033[?1049h"));
         assert!(shell.contains("\\033[?1049l"));
         assert!(shell.contains("\\033[3J"));
-        assert!(shell.contains("counts=\"S:$staged U:$unstaged ?:$untracked\""));
+        assert!(shell.contains("counts=\"S:$staged U:$unstaged ?:$untracked  $sync\""));
         assert!(shell.contains("git -C \"$repo\" -c color.status=never status --short"));
         assert!(shell.contains(LANE_AGENTS_MD));
     }
