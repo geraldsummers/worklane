@@ -134,6 +134,17 @@ pub struct LaneSpec {
     pub profile_name: String,
     pub created_at: DateTime<Utc>,
     #[serde(default)]
+    pub last_attached: Option<DateTime<Utc>>,
+    /// Stable Podman name assigned when the lane is created. Missing on legacy lanes.
+    #[serde(default, rename = "container_name")]
+    pub container_name_override: Option<String>,
+    /// Project mount destination assigned when the lane is created. Missing on legacy lanes.
+    #[serde(default, rename = "workspace_path")]
+    pub container_workspace_override: Option<PathBuf>,
+    /// Lane-owned data directory name assigned when the lane is created. Missing on legacy lanes.
+    #[serde(default, rename = "lane_dir_name")]
+    pub lane_dir_name_override: Option<String>,
+    #[serde(default)]
     pub image_digest: Option<String>,
 }
 fn default_profile_name() -> String {
@@ -157,9 +168,15 @@ impl LaneSpec {
         {
             bail!("lane name must contain only letters, digits, '-' or '_'");
         }
+        let id = Uuid::new_v4().to_string();
         Ok(Self {
             version: 1,
-            id: Uuid::new_v4().to_string(),
+            id: id.clone(),
+            container_name_override: Some(name.clone()),
+            container_workspace_override: Some(
+                PathBuf::from("/home").join(CONTAINER_USER).join(&name),
+            ),
+            lane_dir_name_override: Some(name.clone()),
             name,
             host,
             user: default_lane_user(),
@@ -167,20 +184,33 @@ impl LaneSpec {
             profile,
             profile_name: default_profile_name(),
             created_at: Utc::now(),
+            last_attached: None,
             image_digest: None,
         })
     }
     pub fn container_name(&self) -> String {
-        format!("worklane-{}", &self.id[..8])
+        self.container_name_override
+            .clone()
+            .unwrap_or_else(|| format!("worklane-{}", &self.id[..8]))
     }
     pub fn lane_dir(&self) -> PathBuf {
-        data_dir().join("lanes").join(&self.id)
+        data_dir().join("lanes").join(self.lane_dir_name())
+    }
+    pub fn lane_dir_name(&self) -> String {
+        self.lane_dir_name_override
+            .clone()
+            .unwrap_or_else(|| self.id.clone())
     }
     pub fn home_dir(&self) -> PathBuf {
         self.lane_dir().join("home")
     }
     pub fn container_home(&self) -> PathBuf {
         PathBuf::from("/home").join(CONTAINER_USER)
+    }
+    pub fn container_workspace(&self) -> PathBuf {
+        self.container_workspace_override
+            .clone()
+            .unwrap_or_else(|| self.container_home().join("workspace"))
     }
 }
 
@@ -204,6 +234,9 @@ pub fn data_dir() -> PathBuf {
 }
 pub fn db_path() -> PathBuf {
     data_dir().join("worklane.db")
+}
+pub fn containerfile_path() -> PathBuf {
+    data_dir().join("Containerfile")
 }
 pub fn lane_toml_path(spec: &LaneSpec) -> PathBuf {
     spec.lane_dir().join("lane.toml")
@@ -439,14 +472,25 @@ pub fn executor_request(args: Vec<String>) -> Result<Vec<u8>> {
 }
 pub fn host_state(r: &impl Runner, spec: &LaneSpec) -> Result<(String, bool)> {
     let name = spec.container_name();
-    let state = podman(r, ["inspect", "--format", "{{.State.Status}}", &name])
-        .unwrap_or_else(|_| "absent".into());
+    let state = host_runtime_state(r, spec);
     let drift = !matches!(state.as_str(), "absent")
         && has_meaningful_drift(
             &podman(r, ["diff", &name]).unwrap_or_default(),
             &spec.container_home(),
         );
     Ok((state, drift))
+}
+pub fn host_runtime_state(r: &impl Runner, spec: &LaneSpec) -> String {
+    podman(
+        r,
+        [
+            "inspect",
+            "--format",
+            "{{.State.Status}}",
+            &spec.container_name(),
+        ],
+    )
+    .unwrap_or_else(|_| "absent".into())
 }
 /// Rootless `--userns=keep-id` updates these account files at container start.
 /// They are runtime plumbing, not user changes to the disposable root filesystem.
@@ -486,7 +530,7 @@ pub fn archive_lane(spec: &LaneSpec) -> Result<PathBuf> {
     let src = spec.lane_dir();
     let dst = data_dir().join("archives").join(format!(
         "{}-{}",
-        spec.id,
+        spec.lane_dir_name(),
         Utc::now().format("%Y%m%d%H%M%S")
     ));
     fs::create_dir_all(dst.parent().unwrap())?;
@@ -607,6 +651,33 @@ mod tests {
             Profile::default()
         )
         .is_err());
+    }
+
+    #[test]
+    fn new_lanes_use_lane_names_and_legacy_lanes_keep_their_container_name() {
+        let spec = LaneSpec::new(
+            "docs".into(),
+            "local".into(),
+            PathBuf::from("/tmp"),
+            Profile::default(),
+        )
+        .unwrap();
+        assert_eq!(spec.container_name(), "docs");
+        let mut legacy = spec.clone();
+        legacy.container_name_override = None;
+        legacy.container_workspace_override = None;
+        legacy.lane_dir_name_override = None;
+        assert_eq!(
+            legacy.container_name(),
+            format!("worklane-{}", &legacy.id[..8])
+        );
+        assert_eq!(spec.container_workspace(), PathBuf::from("/home/dev/docs"));
+        assert_eq!(spec.lane_dir_name(), "docs");
+        assert_eq!(
+            legacy.container_workspace(),
+            PathBuf::from("/home/dev/workspace")
+        );
+        assert_eq!(legacy.lane_dir_name(), legacy.id);
     }
 
     #[test]

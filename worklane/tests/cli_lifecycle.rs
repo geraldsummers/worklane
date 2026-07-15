@@ -56,10 +56,13 @@ fn local_lifecycle_uses_podman_and_preserves_project() {
         &podman,
         r#"#!/bin/sh
 case "$1:$2" in
-  image:exists|rm:-f|run:-d|stop:worklane-*|pull:*|build:-f) exit 0 ;;
+  image:exists|pull:*|build:-f) exit 0 ;;
+  stop:*) printf 'exited\n' > "$0.state"; exit 0 ;;
+  rm:-f) touch "$0.absent"; exit 0 ;;
+  run:-d) rm -f "$0.absent"; printf 'running\n' > "$0.state"; exit 0 ;;
   image:inspect) printf 'sha256:test-image\n'; exit 0 ;;
-  inspect:--format) printf 'running\n'; exit 0 ;;
-  diff:worklane-*) exit 0 ;;
+  inspect:--format) if test -e "$0.absent"; then exit 1; fi; cat "$0.state" 2>/dev/null || printf 'running\n'; exit 0 ;;
+  diff:*) exit 0 ;;
   *) exit 0 ;;
 esac
 "#,
@@ -112,16 +115,20 @@ esac
         &["--json", "lane", "diff", "smoke"]
     )
     .contains("diff"));
-    assert!(
-        run(
-            binary,
-            &data,
-            &bin_dir,
-            &["--json", "lane", "stop", "smoke"]
-        )
-        .contains("exited")
-            || true
-    );
+    assert!(run(
+        binary,
+        &data,
+        &bin_dir,
+        &["--json", "lane", "stop", "smoke"]
+    )
+    .contains("exited"));
+    assert!(run(
+        binary,
+        &data,
+        &bin_dir,
+        &["--json", "lane", "refresh", "--all"]
+    )
+    .contains("\"state\":\"exited\""));
     assert!(run(
         binary,
         &data,
@@ -144,11 +151,96 @@ esac
         &["--json", "lane", "upgrade", "smoke", "--force"]
     )
     .contains("running"));
+    assert!(
+        run_failure(binary, &data, &bin_dir, &["lane", "forget", "smoke"])
+            .contains("only unknown lanes can be forgotten")
+    );
+    assert!(run(
+        binary,
+        &data,
+        &bin_dir,
+        &[
+            "--json",
+            "lane",
+            "create",
+            "stale",
+            "--project",
+            &project_arg,
+            "--id",
+            "stale-fixed-id",
+            "--user",
+            "dev",
+        ],
+    )
+    .contains("\"state\":\"running\""));
+    assert!(run(
+        binary,
+        &data,
+        &bin_dir,
+        &["--json", "lane", "rename", "stale", "stale-renamed"]
+    )
+    .contains("stale-renamed"));
+    assert!(run(
+        binary,
+        &data,
+        &bin_dir,
+        &["--json", "lane", "delete", "stale-renamed"]
+    )
+    .contains("forgot"));
+    assert!(!run(binary, &data, &bin_dir, &["--json", "lane", "list"]).contains("stale-renamed"));
+    assert!(run(
+        binary,
+        &data,
+        &bin_dir,
+        &[
+            "--json",
+            "lane",
+            "create",
+            "stale-forget",
+            "--project",
+            &project_arg,
+            "--id",
+            "stale-forget-fixed-id",
+            "--user",
+            "dev",
+        ],
+    )
+    .contains("\"state\":\"running\""));
+    assert!(run(
+        binary,
+        &data,
+        &bin_dir,
+        &[
+            "--json",
+            "lane",
+            "rename",
+            "stale-forget",
+            "stale-forget-renamed"
+        ]
+    )
+    .contains("stale-forget-renamed"));
+    assert!(run(
+        binary,
+        &data,
+        &bin_dir,
+        &["--json", "lane", "forget", "stale-forget-renamed"]
+    )
+    .contains("forgot"));
+    assert!(run(
+        binary,
+        &data,
+        &bin_dir,
+        &["--json", "lane", "delete", "smoke"]
+    )
+    .contains("deleted"));
+    assert!(project.exists());
+    assert!(data.join("worklane/lanes/smoke/home").exists());
+    assert!(!run(binary, &data, &bin_dir, &["--json", "lane", "list"]).contains("smoke"));
     let destroyed = run(
         binary,
         &data,
         &bin_dir,
-        &["--json", "lane", "destroy", "smoke"],
+        &["--json", "lane", "destroy", "defaults"],
     );
     assert!(destroyed.contains("destroyed"));
     assert!(project.exists());
@@ -185,7 +277,7 @@ fn drift_protection_requires_an_explicit_override() {
 case "$1:$2" in
   image:exists|rm:-f|run:-d|build:-f) exit 0 ;;
   inspect:--format) printf 'running\n'; exit 0 ;;
-  diff:worklane-*) printf 'A /etc/worklane-test\n'; exit 0 ;;
+  diff:drift) printf 'A /etc/worklane-test\n'; exit 0 ;;
   *) exit 0 ;;
 esac
 "#,
@@ -220,6 +312,10 @@ esac
     .contains("skipped-drift"));
     assert!(
         run_failure(binary, &data, &bin_dir, &["lane", "destroy", "drift"])
+            .contains("writable-root drift")
+    );
+    assert!(
+        run_failure(binary, &data, &bin_dir, &["lane", "delete", "drift"])
             .contains("writable-root drift")
     );
     run(

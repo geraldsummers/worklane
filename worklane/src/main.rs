@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use serde::Serialize;
 use std::{
     fs,
@@ -12,6 +12,8 @@ use worklane_core::*;
 
 /// The standard lane image recipe travels with every `worklane` binary.
 const EMBEDDED_CONTAINERFILE: &str = include_str!("../../Containerfile");
+/// Guidance seeded into Codex's global instructions on first lane attach.
+const LANE_AGENTS_MD: &str = include_str!("../../AGENTS.md");
 
 #[derive(Parser)]
 #[command(name = "worklane", about = "Rootless Podman development lanes")]
@@ -26,6 +28,12 @@ enum Top {
     Host(HostCmd),
     Image(ImageCmd),
     Lane(LaneCmd),
+    /// Generate shell completion scripts.
+    #[command(alias = "completion")]
+    Completions {
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
     #[command(hide = true)]
     Executor,
 }
@@ -77,6 +85,8 @@ enum ImageAction {
         host: String,
         image: String,
     },
+    /// Open the controller's standard Containerfile in $VISUAL or $EDITOR.
+    Edit,
 }
 #[derive(Args)]
 struct LaneCmd {
@@ -103,6 +113,9 @@ enum LaneAction {
     List,
     Inspect {
         lane: String,
+        /// Skip writable-root drift detection; intended for fast dashboard polling.
+        #[arg(long, hide = true)]
+        fast: bool,
     },
     Rename {
         lane: String,
@@ -138,6 +151,14 @@ enum LaneAction {
         all: bool,
         #[arg(long)]
         force: bool,
+    },
+    /// Remove the disposable container and lane record, preserving bind-mounted data.
+    Delete {
+        lane: String,
+    },
+    /// Remove only an unknown-state lane from this controller registry.
+    Forget {
+        lane: String,
     },
     Destroy {
         lane: String,
@@ -205,15 +226,24 @@ fn remote_host<R: Runner>(
         &executor_request(args)?,
     )?))
 }
-fn embedded_containerfile_path() -> Result<PathBuf> {
-    let path = data_dir()
-        .join("build")
-        .join(format!("Containerfile-{}", env!("CARGO_PKG_VERSION")));
+fn ensure_standard_containerfile() -> Result<PathBuf> {
+    let path = containerfile_path();
+    seed_containerfile(&path)?;
+    Ok(path)
+}
+fn standard_build_context() -> Result<PathBuf> {
+    let path = ensure_standard_containerfile()?;
+    Ok(path
+        .parent()
+        .context("standard Containerfile has no parent directory")?
+        .to_path_buf())
+}
+fn seed_containerfile(path: &std::path::Path) -> Result<()> {
     fs::create_dir_all(path.parent().expect("embedded Containerfile has a parent"))?;
-    if fs::read_to_string(&path).ok().as_deref() != Some(EMBEDDED_CONTAINERFILE) {
+    if !path.exists() {
         fs::write(&path, EMBEDDED_CONTAINERFILE)?;
     }
-    Ok(path)
+    Ok(())
 }
 fn image_build_args<R: Runner>(
     runner: &R,
@@ -223,7 +253,7 @@ fn image_build_args<R: Runner>(
 ) -> Result<Vec<String>> {
     let file = match file {
         Some(path) => path.clone(),
-        None => embedded_containerfile_path()?,
+        None => ensure_standard_containerfile()?,
     };
     let (_, uid, gid) = current_identity(runner)?;
     Ok(vec![
@@ -242,12 +272,21 @@ fn image_build_args<R: Runner>(
     ])
 }
 fn build_local_image<R: Runner>(r: &R, spec: &LaneSpec) -> Result<()> {
-    let context = spec.profile.build_context.as_ref().context(
-        "lane has no build context; recreate manually or create it with --build-context",
-    )?;
-    let file = (!spec.profile.embedded_containerfile).then_some(&spec.profile.containerfile);
+    let (file, context) = if spec.profile.embedded_containerfile {
+        (None, standard_build_context()?)
+    } else {
+        (
+            Some(spec.profile.containerfile.clone()),
+            spec.profile.build_context.clone().context(
+                "lane has no build context; recreate manually or create it with --build-context",
+            )?,
+        )
+    };
     eprintln!("worklane: building image '{}'...", spec.profile.image);
-    podman_stream(r, image_build_args(r, file, context, &spec.profile.image)?)?;
+    podman_stream(
+        r,
+        image_build_args(r, file.as_ref(), &context, &spec.profile.image)?,
+    )?;
     Ok(())
 }
 fn migrate_legacy_home<R: Runner>(r: &R, spec: &LaneSpec) -> Result<()> {
@@ -280,6 +319,13 @@ fn local_start<R: Runner>(r: &R, spec: &LaneSpec) -> Result<()> {
         "--name".into(),
         spec.container_name(),
         "--userns=keep-id".into(),
+        "--read-only".into(),
+        "--tmpfs".into(),
+        "/tmp:rw,nosuid,nodev,size=1g".into(),
+        "--tmpfs".into(),
+        "/var/tmp:rw,nosuid,nodev,size=1g".into(),
+        "--tmpfs".into(),
+        "/run:rw,nosuid,nodev,size=64m".into(),
         "--label".into(),
         format!("io.worklane.id={}", spec.id),
         "--mount".into(),
@@ -290,9 +336,9 @@ fn local_start<R: Runner>(r: &R, spec: &LaneSpec) -> Result<()> {
         ),
         "--mount".into(),
         format!(
-            "type=bind,src={},dst={}/workspace",
+            "type=bind,src={},dst={}",
             spec.project_path.display(),
-            spec.container_home().display()
+            spec.container_workspace().display()
         ),
     ];
     for mount in &spec.profile.mounts {
@@ -324,6 +370,12 @@ fn local_start<R: Runner>(r: &R, spec: &LaneSpec) -> Result<()> {
     podman(r, a)?;
     Ok(())
 }
+fn ensure_local_started<R: Runner>(r: &R, spec: &LaneSpec) -> Result<()> {
+    if host_runtime_state(r, spec) != "running" {
+        local_start(r, spec)?;
+    }
+    Ok(())
+}
 fn refresh<R: Runner>(runner: &R, store: &Store, spec: &LaneSpec) -> Result<LaneStatus> {
     let (state, drift) = if spec.host == "local" {
         host_state(runner, spec)?
@@ -347,19 +399,117 @@ fn refresh<R: Runner>(runner: &R, store: &Store, spec: &LaneSpec) -> Result<Lane
         cached_at: Utc::now(),
     })
 }
-fn lane_attach_args(shell: bool) -> Vec<String> {
+fn refresh_state_only<R: Runner>(runner: &R, store: &Store, spec: &LaneSpec) -> Result<LaneStatus> {
+    let existing_drift = store
+        .lanes()?
+        .into_iter()
+        .find(|status| status.spec.id == spec.id)
+        .is_some_and(|status| status.drift);
+    let state = if spec.host == "local" {
+        host_runtime_state(runner, spec)
+    } else {
+        let out = remote(
+            runner,
+            store,
+            spec,
+            vec![
+                "lane".into(),
+                "inspect".into(),
+                spec.id.clone(),
+                "--fast".into(),
+            ],
+        )?
+        .context("remote host unexpectedly treated as local")?;
+        let remote_status: LaneStatus = serde_json::from_str(&out)
+            .context("remote worklane did not return a LaneStatus JSON document")?;
+        remote_status.state
+    };
+    store.save_lane(spec, &state, existing_drift)?;
+    Ok(LaneStatus {
+        spec: spec.clone(),
+        state,
+        drift: existing_drift,
+        cached_at: Utc::now(),
+    })
+}
+fn cached_lane_status(store: &Store, spec: &LaneSpec) -> Result<LaneStatus> {
+    store
+        .lanes()?
+        .into_iter()
+        .find(|status| status.spec.id == spec.id)
+        .context("lane disappeared while loading registry")
+}
+fn refresh_all<R: Runner>(runner: &R, store: &Store) -> Result<Vec<LaneStatus>> {
+    let specs = store
+        .lanes()?
+        .into_iter()
+        .map(|status| status.spec)
+        .collect::<Vec<_>>();
+    let mut statuses = Vec::with_capacity(specs.len());
+    for spec in specs {
+        statuses.push(refresh(runner, store, &spec)?);
+    }
+    Ok(statuses)
+}
+fn lane_attach_args(name: &str, shell: bool) -> Vec<String> {
     if shell {
         return vec!["zsh".into(), "-l".into()];
     }
-    vec!["herdr".into()]
+    vec!["herdr".into(), "--session".into(), name.into()]
 }
 fn bootstrap_herdr(spec: &LaneSpec) -> Result<()> {
-    let marker = "$HOME/.local/share/worklane/herdr-codex-integration-v1";
-    let script = format!(
-        "set -eu; marker={marker}; if [ ! -e \"$marker\" ]; then mkdir -p \"$HOME/.codex\" \"$(dirname \"$marker\")\"; herdr integration install codex; : > \"$marker\"; fi"
-    );
+    let script = r#"set -eu
+marker="$HOME/.local/share/worklane/herdr-codex-integration-v1"
+if [ ! -e "$marker" ]; then
+  mkdir -p "$HOME/.codex" "$(dirname "$marker")"
+  herdr integration install codex
+  : > "$marker"
+fi
+mkdir -p "$HOME/.config/herdr"
+if ! herdr --session "$WORKLANE_NAME" workspace list >/dev/null 2>&1; then
+  herdr --session "$WORKLANE_NAME" server >"$HOME/.config/herdr/server.log" 2>&1 &!
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    herdr --session "$WORKLANE_NAME" workspace list >/dev/null 2>&1 && break
+    sleep 1
+  done
+fi
+workspace_id="$(herdr --session "$WORKLANE_NAME" workspace list | jq -r --arg label "$WORKLANE_NAME" '.result.workspaces[] | select(.label == $label) | .workspace_id' | head -n 1)"
+if [ -n "$workspace_id" ]; then
+  herdr --session "$WORKLANE_NAME" workspace focus "$workspace_id"
+else
+  herdr --session "$WORKLANE_NAME" workspace create --cwd "$HOME/$WORKLANE_NAME" --label "$WORKLANE_NAME" --focus
+fi
+watcher="$HOME/.local/share/worklane/bin/worklane-git-diff-pane"
+pane_file="$HOME/.local/share/worklane/git-diff-pane-id"
+if pgrep -u "$(id -u)" -f "$watcher" >/dev/null 2>&1; then
+  pkill -u "$(id -u)" -f "$watcher" >/dev/null 2>&1 || true
+fi
+if [ -s "$pane_file" ]; then
+  diff_pane="$(cat "$pane_file")"
+  if herdr --session "$WORKLANE_NAME" pane run "$diff_pane" "$watcher" >/dev/null 2>&1; then
+    exit 0
+  fi
+  rm -f "$pane_file"
+fi
+if ! pgrep -u "$(id -u)" -f "$watcher" >/dev/null 2>&1; then
+  split_output="$(herdr --session "$WORKLANE_NAME" pane split --direction right --ratio 0.12 --cwd "$HOME/$WORKLANE_NAME" --env "WORKLANE_NAME=$WORKLANE_NAME" --no-focus 2>/dev/null || true)"
+  diff_pane="$(printf '%s' "$split_output" | jq -r '.result.pane.pane_id // .result.pane_id // empty' 2>/dev/null | head -n 1)"
+  if [ -n "$diff_pane" ]; then
+    printf '%s\n' "$diff_pane" > "$pane_file"
+    herdr --session "$WORKLANE_NAME" pane rename "$diff_pane" "git diff" >/dev/null 2>&1 || true
+    herdr --session "$WORKLANE_NAME" pane run "$diff_pane" "$watcher" >/dev/null 2>&1 || true
+  fi
+fi"#;
     let output = Command::new("podman")
-        .args(["exec", &spec.container_name(), "zsh", "-lc", &script])
+        .args([
+            "exec",
+            "--env",
+            &format!("WORKLANE_NAME={}", spec.name),
+            &spec.container_name(),
+            "zsh",
+            "-lc",
+            script,
+        ])
         .output()
         .context("bootstrap Herdr Codex integration")?;
     if !output.status.success() {
@@ -370,23 +520,120 @@ fn bootstrap_herdr(spec: &LaneSpec) -> Result<()> {
     }
     Ok(())
 }
-fn bootstrap_shell(spec: &LaneSpec) -> Result<()> {
+fn bootstrap_shell_script() -> String {
     let script = r#"set -eu
 if [ ! -f "$HOME/.zshrc" ]; then
   cat > "$HOME/.zshrc" <<'ZSHRC'
 export EDITOR="${EDITOR:-vim}"
 export PATH="$HOME/.local/bin:$PATH"
-cd "$HOME/workspace" 2>/dev/null || true
+cd "$HOME/${WORKLANE_NAME:-workspace}" 2>/dev/null || true
 ZSHRC
 fi
 mkdir -p "$HOME/.config/worklane"
 cat > "$HOME/.config/worklane/prompt.zsh" <<'WORKLANE_PROMPT'
-PROMPT="%F{cyan}[worklane:${WORKLANE_NAME:-lane}]%f %F{green}%n%f:%F{blue}%~%f %# "
+PROMPT="%F{cyan}[${WORKLANE_NAME:-lane}]%f %F{green}%n%f:%F{blue}%~%f %# "
+worklane_title() { print -Pn "\e]2;${WORKLANE_NAME:-lane}\a"; }
+autoload -Uz add-zsh-hook
+add-zsh-hook precmd worklane_title
 WORKLANE_PROMPT
 grep -qxF 'source "$HOME/.config/worklane/prompt.zsh"' "$HOME/.zshrc" || \
   printf '%s\n' 'source "$HOME/.config/worklane/prompt.zsh"' >> "$HOME/.zshrc""#;
+    let script = format!(
+        r#"{script}
+mkdir -p "$HOME/.local/share/worklane/bin"
+cat > "$HOME/.local/share/worklane/bin/worklane-git-diff-pane" <<'WORKLANE_GIT_DIFF_PANE'
+#!/bin/sh
+interval="${{WORKLANE_GIT_DIFF_INTERVAL:-3}}"
+scan_root="${{WORKLANE_GIT_DIFF_ROOT:-$PWD}}"
+max_depth="${{WORKLANE_GIT_DIFF_MAX_DEPTH:-4}}"
+tmp="${{TMPDIR:-/tmp}}/worklane-git-diff-pane.$$"
+trap 'printf "\033[?25h"; rm -f "$tmp" "$tmp.next"' EXIT INT TERM
+repo_roots() {{
+  {{
+    git rev-parse --show-toplevel 2>/dev/null || true
+    find "$scan_root" -maxdepth "$max_depth" -type d -name .git -prune 2>/dev/null |
+      while IFS= read -r git_dir; do dirname "$git_dir"; done
+  }} | awk 'NF && !seen[$0]++'
+}}
+print_repo() {{
+  repo="$1"
+  rel="$repo"
+  case "$repo" in
+    "$scan_root") rel="." ;;
+    "$scan_root"/*) rel="${{repo#"$scan_root"/}}" ;;
+  esac
+  branch="$(git -C "$repo" branch --show-current 2>/dev/null || true)"
+  if [ -z "$branch" ]; then
+    branch="$(git -C "$repo" rev-parse --short HEAD 2>/dev/null || true)"
+  fi
+  status="$(git -C "$repo" status --porcelain=v1 2>/dev/null || true)"
+  staged="$(printf '%s\n' "$status" | awk 'substr($0,1,1) != " " && substr($0,1,1) != "?" && NF {{ n++ }} END {{ print n+0 }}')"
+  unstaged="$(printf '%s\n' "$status" | awk 'substr($0,2,1) != " " && NF {{ n++ }} END {{ print n+0 }}')"
+  untracked="$(printf '%s\n' "$status" | awk 'substr($0,1,2) == "??" {{ n++ }} END {{ print n+0 }}')"
+  printf '\033[1;36m%s\033[0m' "$rel"
+  if [ -n "$branch" ]; then
+    printf ' \033[2m%s\033[0m' "$branch"
+  fi
+  printf '  S:%s U:%s ?:%s\n' "$staged" "$unstaged" "$untracked"
+  if [ -z "$status" ]; then
+    printf '  \033[32mclean\033[0m\n'
+    return
+  fi
+  git -C "$repo" -c color.status=always status --short 2>/dev/null |
+    sed -n '1,12p' |
+    sed 's/^/  /'
+  total="$(printf '%s\n' "$status" | awk 'NF {{ n++ }} END {{ print n+0 }}')"
+  if [ "$total" -gt 12 ]; then
+    printf '  ... %s more\n' "$((total - 12))"
+  fi
+}}
+render_frame() {{
+  printf 'Worklane git tree diff'
+  if [ -n "${{WORKLANE_NAME:-}}" ]; then
+    printf ' [%s]' "$WORKLANE_NAME"
+  fi
+  printf '\n'
+  date '+%Y-%m-%d %H:%M:%S %Z'
+  printf 'scan: %s\n' "$scan_root"
+  printf -- '------------------------\n\n'
+  repos="$(repo_roots)"
+  if [ -z "$repos" ]; then
+    printf 'No git repositories found under %s.\n' "$scan_root"
+  else
+    printf '%s\n' "$repos" | while IFS= read -r repo; do
+      print_repo "$repo"
+      printf '\n'
+    done
+  fi
+}}
+printf '\033[?25l'
+while :; do
+  render_frame > "$tmp.next"
+  if ! cmp -s "$tmp.next" "$tmp" 2>/dev/null; then
+    mv "$tmp.next" "$tmp"
+    printf '\033[H'
+    cat "$tmp"
+    printf '\033[J'
+  else
+    rm -f "$tmp.next"
+  fi
+  sleep "$interval"
+done
+WORKLANE_GIT_DIFF_PANE
+chmod 755 "$HOME/.local/share/worklane/bin/worklane-git-diff-pane"
+mkdir -p "$HOME/.codex"
+if [ ! -f "$HOME/.codex/AGENTS.md" ] && [ ! -f "$HOME/.codex/AGENTS.override.md" ]; then
+  cat > "$HOME/.codex/AGENTS.md" <<'WORKLANE_AGENTS'
+{LANE_AGENTS_MD}
+WORKLANE_AGENTS
+fi"#
+    );
+    script
+}
+fn bootstrap_shell(spec: &LaneSpec) -> Result<()> {
+    let script = bootstrap_shell_script();
     let status = Command::new("podman")
-        .args(["exec", &spec.container_name(), "zsh", "-lc", script])
+        .args(["exec", &spec.container_name(), "zsh", "-lc", &script])
         .status()
         .context("bootstrap lane zsh configuration")?;
     if !status.success() {
@@ -417,10 +664,17 @@ fn run_executor() -> Result<()> {
 }
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if let Top::Completions { shell } = &cli.command {
+        let mut command = Cli::command();
+        clap_complete::generate(*shell, &mut command, "worklane", &mut io::stdout());
+        return Ok(());
+    }
+    ensure_standard_containerfile()?;
     let store = Store::open_default()?;
     let runner = SystemRunner;
     match cli.command {
         Top::Executor => run_executor(),
+        Top::Completions { .. } => unreachable!("completions handled before store initialization"),
         Top::Host(c) => match c.command {
             HostAction::Add { name, ssh } => {
                 let h = Host {
@@ -561,6 +815,19 @@ fn main() -> Result<()> {
                     )
                 }
             }
+            ImageAction::Edit => {
+                let path = ensure_standard_containerfile()?;
+                let editor = std::env::var("VISUAL")
+                    .or_else(|_| std::env::var("EDITOR"))
+                    .unwrap_or_else(|_| "vi".into());
+                let mut parts = editor.split_whitespace();
+                let program = parts.next().context("VISUAL/EDITOR is empty")?;
+                let status = Command::new(program).args(parts).arg(&path).status()?;
+                if !status.success() {
+                    bail!("editor exited unsuccessfully")
+                }
+                emit(cli.json, &serde_json::json!({"containerfile":path}))
+            }
         },
         Top::Lane(c) => match c.command {
             LaneAction::Create {
@@ -599,7 +866,7 @@ fn main() -> Result<()> {
                 validate_profile(
                     &spec.profile,
                     &spec.container_home(),
-                    &spec.container_home().join("workspace"),
+                    &spec.container_workspace(),
                     spec.host == "local",
                 )?;
                 if spec.host == "local" {
@@ -642,27 +909,28 @@ fn main() -> Result<()> {
                 emit(cli.json, &refresh(&runner, &store, &spec)?)
             }
             LaneAction::List => emit(cli.json, &store.lanes()?),
-            LaneAction::Inspect { lane } => {
+            LaneAction::Inspect { lane, fast } => {
                 let s = store.lane(&lane)?;
-                emit(cli.json, &refresh(&runner, &store, &s)?)
+                let status = if fast {
+                    refresh_state_only(&runner, &store, &s)?
+                } else {
+                    refresh(&runner, &store, &s)?
+                };
+                emit(cli.json, &status)
             }
             LaneAction::Rename { lane, new_name } => {
                 emit(cli.json, &store.rename_lane(&lane, &new_name)?)
             }
             LaneAction::Refresh { lane, all } => {
-                let specs = if all {
-                    store
-                        .lanes()?
-                        .into_iter()
-                        .map(|status| status.spec)
-                        .collect()
+                let statuses = if all {
+                    refresh_all(&runner, &store)?
                 } else {
-                    vec![store.lane(&lane.context("provide a lane or --all")?)?]
+                    vec![refresh(
+                        &runner,
+                        &store,
+                        &store.lane(&lane.context("provide a lane or --all")?)?,
+                    )?]
                 };
-                let mut statuses = Vec::new();
-                for spec in specs {
-                    statuses.push(refresh(&runner, &store, &spec)?);
-                }
                 emit(cli.json, &statuses)
             }
             LaneAction::Diff { lane, raw } => {
@@ -722,7 +990,7 @@ fn main() -> Result<()> {
                 emit(cli.json, &refresh(&runner, &store, &s)?)
             }
             LaneAction::Attach { lane, shell } => {
-                let s = store.lane(&lane)?;
+                let mut s = store.lane(&lane)?;
                 if s.host != "local" {
                     let host = store
                         .hosts()?
@@ -744,13 +1012,16 @@ fn main() -> Result<()> {
                     if !status.success() {
                         bail!("remote attach failed")
                     }
+                    s.last_attached = Some(Utc::now());
+                    store.save_lane(&s, "unknown", false)?;
                     return Ok(());
                 };
+                ensure_local_started(&runner, &s)?;
                 bootstrap_shell(&s)?;
                 if !shell {
                     bootstrap_herdr(&s)?;
                 }
-                let command = lane_attach_args(shell);
+                let command = lane_attach_args(&s.name, shell);
                 let status = Command::new("podman")
                     .args([
                         "exec",
@@ -764,6 +1035,9 @@ fn main() -> Result<()> {
                 if !status.success() {
                     bail!("attach failed")
                 };
+                s.last_attached = Some(Utc::now());
+                write_lane_spec(&s)?;
+                refresh(&runner, &store, &s)?;
                 Ok(())
             }
             LaneAction::Upgrade { lane, all, force } => {
@@ -802,6 +1076,45 @@ fn main() -> Result<()> {
                 }
                 emit(cli.json, &out)
             }
+            LaneAction::Delete { lane } => {
+                let s = store.lane(&lane)?;
+                let cached = cached_lane_status(&store, &s)?;
+                if cached.state == "unknown" {
+                    store.remove_lane(&s.id)?;
+                    return emit(cli.json, &serde_json::json!({"forgot":s.name}));
+                }
+                let status = refresh(&runner, &store, &s)?;
+                if status.drift {
+                    bail!("container has writable-root drift; inspect it before deleting")
+                }
+                if s.host == "local" {
+                    if status.state != "absent" {
+                        podman(&SystemRunner, ["rm", "-f", &s.container_name()])?;
+                    }
+                } else {
+                    remote(
+                        &runner,
+                        &store,
+                        &s,
+                        vec!["lane".into(), "delete".into(), s.id.clone()],
+                    )?
+                    .context("remote host unexpectedly treated as local")?;
+                }
+                store.remove_lane(&s.id)?;
+                emit(cli.json, &serde_json::json!({"deleted":s.name}))
+            }
+            LaneAction::Forget { lane } => {
+                let s = store.lane(&lane)?;
+                let status = cached_lane_status(&store, &s)?;
+                if status.state != "unknown" {
+                    bail!(
+                        "lane state is '{}'; only unknown lanes can be forgotten",
+                        status.state
+                    )
+                }
+                store.remove_lane(&s.id)?;
+                emit(cli.json, &serde_json::json!({"forgot":s.name}))
+            }
             LaneAction::Destroy { lane, force } => {
                 let s = store.lane(&lane)?;
                 let status = refresh(&runner, &store, &s)?;
@@ -831,7 +1144,7 @@ fn main() -> Result<()> {
                 store.remove_lane(&s.id)?;
                 emit(
                     cli.json,
-                    &serde_json::json!({"destroyed":s.id,"archive":archive}),
+                    &serde_json::json!({"destroyed":s.name,"archive":archive}),
                 )
             }
             LaneAction::Purge { lane, yes } => {
@@ -910,15 +1223,72 @@ mod tests {
 
     #[test]
     fn attach_defaults_to_herdr_or_explicit_shell() {
-        assert_eq!(lane_attach_args(false), vec!["herdr"]);
-        assert_eq!(lane_attach_args(true), vec!["zsh", "-l"]);
+        assert_eq!(
+            lane_attach_args("alpha", false),
+            vec!["herdr", "--session", "alpha"]
+        );
+        assert_eq!(lane_attach_args("alpha", true), vec!["zsh", "-l"]);
+    }
+
+    #[test]
+    fn herdr_bootstrap_uses_the_lane_name_as_its_workspace_label() {
+        let source = include_str!("main.rs");
+        assert!(source.contains("--label \"$WORKLANE_NAME\""));
+        assert!(source.contains("herdr --session \"$WORKLANE_NAME\" workspace create"));
+        assert!(source.contains("herdr --session \"$WORKLANE_NAME\" workspace focus"));
+        assert!(source.contains("pane split --direction right --ratio 0.12"));
+        assert!(source.contains("pane run \"$diff_pane\" \"$watcher\""));
+    }
+
+    #[test]
+    fn lane_shell_bootstrap_is_valid_zsh() {
+        let status = Command::new("zsh")
+            .args(["-n", "-c", &bootstrap_shell_script()])
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 
     #[test]
     fn standard_containerfile_is_embedded() {
         assert!(EMBEDDED_CONTAINERFILE.starts_with("FROM debian:trixie-slim"));
         assert!(EMBEDDED_CONTAINERFILE.contains("@openai/codex"));
+        assert!(EMBEDDED_CONTAINERFILE.contains("codex-real --yolo"));
         assert!(EMBEDDED_CONTAINERFILE.contains("HERDR_INSTALL_DIR=/usr/local/bin"));
+        assert!(!EMBEDDED_CONTAINERFILE.contains("NOPASSWD:ALL"));
+        assert!(EMBEDDED_CONTAINERFILE.contains("ripgrep"));
+        assert!(EMBEDDED_CONTAINERFILE.contains("xvfb"));
+        assert!(LANE_AGENTS_MD.contains("immutable operating-system root filesystem"));
+        assert!(LANE_AGENTS_MD.contains("RAM-backed tmpfs mounts, limited to 1 GiB"));
+        assert!(LANE_AGENTS_MD.contains("Herdr is the lane session manager"));
+        let shell = bootstrap_shell_script();
+        assert!(shell.contains("mkdir -p \"$HOME/.codex\""));
+        assert!(shell.contains("[ ! -f \"$HOME/.codex/AGENTS.md\" ]"));
+        assert!(shell.contains("[ ! -f \"$HOME/.codex/AGENTS.override.md\" ]"));
+        assert!(shell.contains("cat > \"$HOME/.codex/AGENTS.md\""));
+        assert!(!shell.contains("$HOME/AGENTS.md"));
+        assert!(shell.contains("$HOME/.local/share/worklane/bin/worklane-git-diff-pane"));
+        assert!(shell.contains("find \"$scan_root\" -maxdepth \"$max_depth\""));
+        assert!(shell.contains("render_frame > \"$tmp.next\""));
+        assert!(shell.contains("cmp -s \"$tmp.next\" \"$tmp\""));
+        assert!(shell.contains("S:%s U:%s ?:%s"));
+        assert!(shell.contains("git -C \"$repo\" -c color.status=always status --short"));
+        assert!(shell.contains(LANE_AGENTS_MD));
+    }
+
+    #[test]
+    fn standard_containerfile_is_seeded_once_and_remains_user_owned() {
+        let root = std::env::temp_dir().join(format!(
+            "worklane-containerfile-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let path = root.join("Containerfile");
+        seed_containerfile(&path).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), EMBEDDED_CONTAINERFILE);
+        fs::write(&path, "FROM user-edited\n").unwrap();
+        seed_containerfile(&path).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "FROM user-edited\n");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -992,10 +1362,32 @@ mod tests {
         let runner = MockRunner::new();
         let lane = spec("local");
         local_start(&runner, &lane).unwrap();
+        let calls = runner.calls.lock().unwrap();
+        let run = calls
+            .iter()
+            .find(|(program, args)| {
+                program == "podman" && args.first().is_some_and(|arg| arg == "run")
+            })
+            .unwrap();
+        assert!(run.1.contains(&"--read-only".into()));
+        assert!(run.1.contains(&"/tmp:rw,nosuid,nodev,size=1g".into()));
+        drop(calls);
         let (store, path) = temp_store();
         let status = refresh(&runner, &store, &lane).unwrap();
         assert_eq!(status.state, "running");
         assert!(!status.drift);
+        let calls_after_refresh = runner.calls.lock().unwrap().len();
+        let fast = refresh_state_only(&runner, &store, &lane).unwrap();
+        assert_eq!(fast.state, "running");
+        assert!(!fast.drift);
+        let calls = runner.calls.lock().unwrap();
+        assert!(calls[calls_after_refresh..].iter().any(|(_, args)| {
+            args.first() == Some(&"inspect".into()) && args.last() == Some(&lane.container_name())
+        }));
+        assert!(!calls[calls_after_refresh..]
+            .iter()
+            .any(|(_, args)| args.first() == Some(&"diff".into())));
+        drop(calls);
         assert!(runner
             .calls
             .lock()
@@ -1003,6 +1395,57 @@ mod tests {
             .iter()
             .any(|(_, a)| a.first() == Some(&"run".into())));
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn ensure_local_started_skips_running_container() {
+        let runner = MockRunner::new();
+        let lane = spec("local");
+        ensure_local_started(&runner, &lane).unwrap();
+        let calls = runner.calls.lock().unwrap();
+        assert!(!calls.iter().any(|(_, args)| {
+            args.first() == Some(&"run".into()) || args.first() == Some(&"rm".into())
+        }));
+    }
+
+    #[test]
+    fn ensure_local_started_starts_stopped_container() {
+        struct StoppedRunner {
+            calls: Mutex<Vec<(String, Vec<String>)>>,
+        }
+        impl Runner for StoppedRunner {
+            fn run(&self, program: &str, args: &[String]) -> Result<String> {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push((program.into(), args.into()));
+                Ok(
+                    match (
+                        program,
+                        args.first().map(String::as_str),
+                        args.get(1).map(String::as_str),
+                    ) {
+                        ("podman", Some("inspect"), Some("--format"))
+                            if args.last().is_some_and(|arg| arg == "worklane:latest") =>
+                        {
+                            "sha256:image".into()
+                        }
+                        ("podman", Some("inspect"), _) => "exited".into(),
+                        _ => String::new(),
+                    },
+                )
+            }
+        }
+
+        let runner = StoppedRunner {
+            calls: Mutex::new(vec![]),
+        };
+        let lane = spec("local");
+        ensure_local_started(&runner, &lane).unwrap();
+        let calls = runner.calls.lock().unwrap();
+        assert!(calls
+            .iter()
+            .any(|(_, args)| args.first() == Some(&"run".into())));
     }
 
     #[test]
@@ -1037,6 +1480,33 @@ mod tests {
             .unwrap()
             .iter()
             .any(|args| args.first() == Some(&"build".into())));
+    }
+
+    #[test]
+    fn embedded_image_build_uses_current_standard_containerfile_context() {
+        let runner = MockRunner::new();
+        let mut lane = spec("local");
+        lane.profile.build_context = None;
+        build_local_image(&runner, &lane).unwrap();
+        let calls = runner.calls.lock().unwrap();
+        let build = calls
+            .iter()
+            .find(|(program, args)| {
+                program == "podman" && args.first().is_some_and(|arg| arg == "build")
+            })
+            .unwrap();
+        let standard_containerfile = ensure_standard_containerfile().unwrap();
+        assert!(build
+            .1
+            .contains(&standard_containerfile.display().to_string()));
+        assert_eq!(
+            build.1.last().unwrap(),
+            &standard_containerfile
+                .parent()
+                .unwrap()
+                .display()
+                .to_string()
+        );
     }
 
     struct FailingRunner;
