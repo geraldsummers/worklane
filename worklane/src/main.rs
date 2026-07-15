@@ -596,13 +596,10 @@ repo_roots() {{
     awk 'NF && !seen[$0]++' |
     while IFS= read -r repo; do
       if git -C "$repo" status --porcelain=v1 2>/dev/null | grep -q .; then
-        printf '0\t%s\n' "$repo"
-      else
-        printf '1\t%s\n' "$repo"
+        printf '%s\n' "$repo"
       fi
     done |
-    sort -k1,1 -k2,2 |
-    cut -f2-
+    sort
 }}
 print_repo() {{
   repo="$1"
@@ -628,10 +625,6 @@ print_repo() {{
   heading_width="$((width - ${{#counts}} - 2))"
   [ "$heading_width" -lt 8 ] && heading_width=8
   printf '\033[1;36m%s\033[0m  %s\n' "$(printf '%s\n' "$heading" | clip "$heading_width")" "$counts"
-  if [ -z "$status" ]; then
-    printf '  \033[32mclean\033[0m\n'
-    return
-  fi
   git -C "$repo" -c color.status=never status --short 2>/dev/null |
     sed -n '1,12p' |
     sed 's/^/  /' |
@@ -652,7 +645,7 @@ render_frame() {{
   printf -- '%*s\n\n' "$width" '' | tr ' ' '-'
   repos="$(repo_roots)"
   if [ -z "$repos" ]; then
-    printf 'No git repositories found under %s.\n' "$scan_root"
+    printf '\033[32mall clean\033[0m\n'
   else
     printf '%s\n' "$repos" | while IFS= read -r repo; do
       print_repo "$repo" "$width"
@@ -1358,7 +1351,8 @@ mod tests {
         assert!(!shell.contains("$HOME/AGENTS.md"));
         assert!(shell.contains("$HOME/.local/share/worklane/bin/worklane-git-diff-pane"));
         assert!(shell.contains("find \"$scan_root\" -maxdepth \"$max_depth\""));
-        assert!(shell.contains("sort -k1,1 -k2,2"));
+        assert!(shell.contains("git -C \"$repo\" status --porcelain=v1"));
+        assert!(shell.contains("\\033[32mall clean\\033[0m"));
         assert!(shell.contains("render_frame > \"$tmp.full\""));
         assert!(shell.contains("cmp -s \"$tmp.next\" \"$tmp\""));
         assert!(shell.contains("pane_width()"));
