@@ -646,9 +646,8 @@ print_repo() {{
 }}
 render_frame() {{
   width="$(render_width)"
-  printf '%s\n' "Worklane git tree diff" | clip "$width"
   if [ -n "${{WORKLANE_NAME:-}}" ]; then
-    printf '[%s]\n' "$WORKLANE_NAME" | clip "$width"
+    printf 'lane: %s\n' "$WORKLANE_NAME" | clip "$width"
   fi
   date '+%Y-%m-%d %H:%M:%S %Z'
   printf 'scan: %s\n' "$scan_root" | clip "$width"
@@ -657,7 +656,7 @@ render_frame() {{
   watched_count="$(count_lines "$all_repos")"
   dirty_count="$(count_lines "$repos")"
   printf 'watched: %s  dirty: %s\n' "$watched_count" "$dirty_count" | clip "$width"
-  printf -- '%*s\n\n' "$width" '' | tr ' ' '-'
+  awk -v width="$width" 'BEGIN {{ for (i = 0; i < width; i++) printf "─"; printf "\n\n" }}'
   if [ -z "$repos" ]; then
     printf '\033[32mall clean\033[0m\n'
   else
@@ -1371,7 +1370,10 @@ mod tests {
         assert!(shell.contains("dirty_repo_roots()"));
         assert!(shell.contains("count_lines()"));
         assert!(shell.contains("branch: $branch"));
+        assert!(shell.contains("lane: %s"));
         assert!(shell.contains("watched: %s  dirty: %s"));
+        assert!(shell.contains("printf \"─\""));
+        assert!(!shell.contains("Worklane git tree diff"));
         assert!(shell.contains("\\033[32mall clean\\033[0m"));
         assert!(shell.contains("render_frame > \"$tmp.full\""));
         assert!(shell.contains("cmp -s \"$tmp.next\" \"$tmp\""));
