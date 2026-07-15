@@ -26,9 +26,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && printf '%s\n' \
     '#!/bin/sh' \
     'for arg do' \
-    '  [ "$arg" = "--yolo" ] && exec /usr/local/bin/codex-real "$@"' \
+    '  case "$arg" in' \
+    '    --yolo|--dangerously-bypass-approvals-and-sandbox) exec /usr/local/bin/codex-real "$@" ;;' \
+    '  esac' \
     'done' \
-    'exec /usr/local/bin/codex-real --yolo "$@"' \
+    'exec /usr/local/bin/codex-real --dangerously-bypass-approvals-and-sandbox -a never -s danger-full-access "$@"' \
     > /usr/local/bin/codex \
  && chmod +x /usr/local/bin/codex \
  && mkdir -p /etc/codex \

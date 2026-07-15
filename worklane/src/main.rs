@@ -561,11 +561,18 @@ interval="${{WORKLANE_GIT_DIFF_INTERVAL:-3}}"
 scan_root="${{WORKLANE_GIT_DIFF_ROOT:-$PWD}}"
 max_depth="${{WORKLANE_GIT_DIFF_MAX_DEPTH:-4}}"
 tmp="${{TMPDIR:-/tmp}}/worklane-git-diff-pane.$$"
-trap 'printf "\033[?25h\033[?1049l\033[3J"; rm -f "$tmp" "$tmp.next"' EXIT INT TERM
+trap 'printf "\033[?7h\033[?25h\033[?1049l\033[3J"; rm -f "$tmp" "$tmp.next"' EXIT INT TERM
 pane_width() {{
   cols="$(tput cols 2>/dev/null || printf '80')"
   case "$cols" in *[!0-9]*|'') cols=80 ;; esac
   printf '%s\n' "$cols"
+}}
+render_width() {{
+  width="$(pane_width)"
+  if [ "$width" -gt 1 ]; then
+    width="$((width - 1))"
+  fi
+  printf '%s\n' "$width"
 }}
 clip() {{
   width="$1"
@@ -620,7 +627,7 @@ print_repo() {{
   fi
 }}
 render_frame() {{
-  width="$(pane_width)"
+  width="$(render_width)"
   printf '%s\n' "Worklane git tree diff" | clip "$width"
   if [ -n "${{WORKLANE_NAME:-}}" ]; then
     printf '[%s]\n' "$WORKLANE_NAME" | clip "$width"
@@ -638,12 +645,12 @@ render_frame() {{
     done
   fi
 }}
-printf '\033[?1049h\033[?25l\033[H\033[2J\033[3J'
+printf '\033[?1049h\033[?25l\033[?7l\033[H\033[2J\033[3J'
 while :; do
   render_frame > "$tmp.next"
   if ! cmp -s "$tmp.next" "$tmp" 2>/dev/null; then
     mv "$tmp.next" "$tmp"
-    printf '\033[H'
+    printf '\033[H\033[2J'
     cat "$tmp"
     printf '\033[J\033[3J'
   else
@@ -1292,7 +1299,9 @@ mod tests {
     fn standard_containerfile_is_embedded() {
         assert!(EMBEDDED_CONTAINERFILE.starts_with("FROM debian:trixie-slim"));
         assert!(EMBEDDED_CONTAINERFILE.contains("@openai/codex"));
-        assert!(EMBEDDED_CONTAINERFILE.contains("codex-real --yolo"));
+        assert!(EMBEDDED_CONTAINERFILE.contains(
+            "codex-real --dangerously-bypass-approvals-and-sandbox -a never -s danger-full-access"
+        ));
         assert!(EMBEDDED_CONTAINERFILE.contains("/etc/codex/config.toml"));
         assert!(EMBEDDED_CONTAINERFILE.contains("approval_policy = \"never\""));
         assert!(EMBEDDED_CONTAINERFILE.contains("sandbox_mode = \"danger-full-access\""));
@@ -1317,7 +1326,11 @@ mod tests {
         assert!(shell.contains("render_frame > \"$tmp.next\""));
         assert!(shell.contains("cmp -s \"$tmp.next\" \"$tmp\""));
         assert!(shell.contains("pane_width()"));
+        assert!(shell.contains("render_width()"));
         assert!(shell.contains("clip()"));
+        assert!(shell.contains("\\033[?7l"));
+        assert!(shell.contains("\\033[?7h"));
+        assert!(shell.contains("\\033[H\\033[2J"));
         assert!(shell.contains("color.status=never"));
         assert!(shell.contains("\\033[?1049h"));
         assert!(shell.contains("\\033[?1049l"));
