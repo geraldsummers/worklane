@@ -562,6 +562,19 @@ scan_root="${{WORKLANE_GIT_DIFF_ROOT:-$PWD}}"
 max_depth="${{WORKLANE_GIT_DIFF_MAX_DEPTH:-4}}"
 tmp="${{TMPDIR:-/tmp}}/worklane-git-diff-pane.$$"
 trap 'printf "\033[?25h\033[?1049l\033[3J"; rm -f "$tmp" "$tmp.next"' EXIT INT TERM
+pane_width() {{
+  cols="$(tput cols 2>/dev/null || printf '80')"
+  case "$cols" in *[!0-9]*|'') cols=80 ;; esac
+  printf '%s\n' "$cols"
+}}
+clip() {{
+  width="$1"
+  if [ "$width" -le 1 ]; then
+    cat
+    return
+  fi
+  awk -v width="$width" '{{ if (length($0) > width) print substr($0, 1, width - 1) "~"; else print }}'
+}}
 repo_roots() {{
   {{
     git rev-parse --show-toplevel 2>/dev/null || true
@@ -571,6 +584,7 @@ repo_roots() {{
 }}
 print_repo() {{
   repo="$1"
+  width="$2"
   rel="$repo"
   case "$repo" in
     "$scan_root") rel="." ;;
@@ -584,38 +598,42 @@ print_repo() {{
   staged="$(printf '%s\n' "$status" | awk 'substr($0,1,1) != " " && substr($0,1,1) != "?" && NF {{ n++ }} END {{ print n+0 }}')"
   unstaged="$(printf '%s\n' "$status" | awk 'substr($0,2,1) != " " && NF {{ n++ }} END {{ print n+0 }}')"
   untracked="$(printf '%s\n' "$status" | awk 'substr($0,1,2) == "??" {{ n++ }} END {{ print n+0 }}')"
-  printf '\033[1;36m%s\033[0m' "$rel"
+  heading="$rel"
   if [ -n "$branch" ]; then
-    printf ' \033[2m%s\033[0m' "$branch"
+    heading="$heading $branch"
   fi
-  printf '  S:%s U:%s ?:%s\n' "$staged" "$unstaged" "$untracked"
+  counts="S:$staged U:$unstaged ?:$untracked"
+  heading_width="$((width - ${{#counts}} - 2))"
+  [ "$heading_width" -lt 8 ] && heading_width=8
+  printf '\033[1;36m%s\033[0m  %s\n' "$(printf '%s\n' "$heading" | clip "$heading_width")" "$counts"
   if [ -z "$status" ]; then
     printf '  \033[32mclean\033[0m\n'
     return
   fi
-  git -C "$repo" -c color.status=always status --short 2>/dev/null |
+  git -C "$repo" -c color.status=never status --short 2>/dev/null |
     sed -n '1,12p' |
-    sed 's/^/  /'
+    sed 's/^/  /' |
+    clip "$width"
   total="$(printf '%s\n' "$status" | awk 'NF {{ n++ }} END {{ print n+0 }}')"
   if [ "$total" -gt 12 ]; then
     printf '  ... %s more\n' "$((total - 12))"
   fi
 }}
 render_frame() {{
-  printf 'Worklane git tree diff'
+  width="$(pane_width)"
+  printf '%s\n' "Worklane git tree diff" | clip "$width"
   if [ -n "${{WORKLANE_NAME:-}}" ]; then
-    printf ' [%s]' "$WORKLANE_NAME"
+    printf '[%s]\n' "$WORKLANE_NAME" | clip "$width"
   fi
-  printf '\n'
   date '+%Y-%m-%d %H:%M:%S %Z'
-  printf 'scan: %s\n' "$scan_root"
-  printf -- '------------------------\n\n'
+  printf 'scan: %s\n' "$scan_root" | clip "$width"
+  printf -- '%*s\n\n' "$width" '' | tr ' ' '-'
   repos="$(repo_roots)"
   if [ -z "$repos" ]; then
     printf 'No git repositories found under %s.\n' "$scan_root"
   else
     printf '%s\n' "$repos" | while IFS= read -r repo; do
-      print_repo "$repo"
+      print_repo "$repo" "$width"
       printf '\n'
     done
   fi
@@ -1298,11 +1316,14 @@ mod tests {
         assert!(shell.contains("find \"$scan_root\" -maxdepth \"$max_depth\""));
         assert!(shell.contains("render_frame > \"$tmp.next\""));
         assert!(shell.contains("cmp -s \"$tmp.next\" \"$tmp\""));
+        assert!(shell.contains("pane_width()"));
+        assert!(shell.contains("clip()"));
+        assert!(shell.contains("color.status=never"));
         assert!(shell.contains("\\033[?1049h"));
         assert!(shell.contains("\\033[?1049l"));
         assert!(shell.contains("\\033[3J"));
-        assert!(shell.contains("S:%s U:%s ?:%s"));
-        assert!(shell.contains("git -C \"$repo\" -c color.status=always status --short"));
+        assert!(shell.contains("counts=\"S:$staged U:$unstaged ?:$untracked\""));
+        assert!(shell.contains("git -C \"$repo\" -c color.status=never status --short"));
         assert!(shell.contains(LANE_AGENTS_MD));
     }
 
