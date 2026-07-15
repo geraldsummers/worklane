@@ -561,7 +561,7 @@ interval="${{WORKLANE_GIT_DIFF_INTERVAL:-3}}"
 scan_root="${{WORKLANE_GIT_DIFF_ROOT:-$PWD}}"
 max_depth="${{WORKLANE_GIT_DIFF_MAX_DEPTH:-4}}"
 tmp="${{TMPDIR:-/tmp}}/worklane-git-diff-pane.$$"
-trap 'printf "\033[?25h"; rm -f "$tmp" "$tmp.next"' EXIT INT TERM
+trap 'printf "\033[?25h\033[?1049l\033[3J"; rm -f "$tmp" "$tmp.next"' EXIT INT TERM
 repo_roots() {{
   {{
     git rev-parse --show-toplevel 2>/dev/null || true
@@ -620,14 +620,14 @@ render_frame() {{
     done
   fi
 }}
-printf '\033[?25l'
+printf '\033[?1049h\033[?25l\033[H\033[2J\033[3J'
 while :; do
   render_frame > "$tmp.next"
   if ! cmp -s "$tmp.next" "$tmp" 2>/dev/null; then
     mv "$tmp.next" "$tmp"
     printf '\033[H'
     cat "$tmp"
-    printf '\033[J'
+    printf '\033[J\033[3J'
   else
     rm -f "$tmp.next"
   fi
@@ -1298,6 +1298,9 @@ mod tests {
         assert!(shell.contains("find \"$scan_root\" -maxdepth \"$max_depth\""));
         assert!(shell.contains("render_frame > \"$tmp.next\""));
         assert!(shell.contains("cmp -s \"$tmp.next\" \"$tmp\""));
+        assert!(shell.contains("\\033[?1049h"));
+        assert!(shell.contains("\\033[?1049l"));
+        assert!(shell.contains("\\033[3J"));
         assert!(shell.contains("S:%s U:%s ?:%s"));
         assert!(shell.contains("git -C \"$repo\" -c color.status=always status --short"));
         assert!(shell.contains(LANE_AGENTS_MD));
