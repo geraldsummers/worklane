@@ -303,23 +303,6 @@ fn build_local_image<R: Runner>(r: &R, spec: &LaneSpec) -> Result<()> {
     )?;
     Ok(())
 }
-fn migrate_legacy_home<R: Runner>(r: &R, spec: &LaneSpec) -> Result<()> {
-    if spec.user == CONTAINER_USER || podman(r, ["inspect", &spec.container_name()]).is_err() {
-        return Ok(());
-    }
-    fs::create_dir_all(spec.home_dir())?;
-    eprintln!("worklane: preserving legacy /home/dev state before recreating the lane...");
-    podman(
-        r,
-        [
-            "cp".into(),
-            format!("{}:/home/dev/.", spec.container_name()),
-            spec.home_dir().display().to_string(),
-        ],
-    )
-    .context("could not preserve legacy /home/dev state")?;
-    Ok(())
-}
 fn timezone_from_localtime_link(link: &Path) -> Option<String> {
     let zoneinfo = Path::new("/usr/share/zoneinfo");
     link.strip_prefix(zoneinfo)
@@ -351,7 +334,6 @@ fn local_start<R: Runner>(r: &R, spec: &LaneSpec) -> Result<()> {
     if !image_exists(r, &spec.profile.image)? {
         build_local_image(r, spec)?;
     }
-    migrate_legacy_home(r, spec)?;
     let _ = podman(r, ["rm", "-f", &spec.container_name()]);
     fs::create_dir_all(spec.home_dir())?;
     let mut a = vec![
@@ -1743,18 +1725,6 @@ CMD ["sleep", "infinity"]
         assert!(calls
             .iter()
             .any(|(_, args)| args.first() == Some(&"run".into())));
-    }
-
-    #[test]
-    fn local_start_preserves_legacy_dev_home_before_recreating() {
-        let runner = MockRunner::new();
-        let mut lane = spec("local");
-        lane.user = "gerald".into();
-        local_start(&runner, &lane).unwrap();
-        assert!(runner.calls.lock().unwrap().iter().any(|(_, args)| {
-            args.first() == Some(&"cp".into())
-                && args.iter().any(|arg| arg.ends_with(":/home/dev/."))
-        }));
     }
 
     #[test]
