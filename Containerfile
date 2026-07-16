@@ -17,7 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     netcat-openbsd ninja-build nodejs npm openjdk-21-jdk openssh-client patch \
     pkg-config procps psmisc python-is-python3 python3 python3-pip python3-venv \
     pipx ripgrep rsync shellcheck socat sqlite3 strace tar tree unzip \
-    valgrind vim wget xvfb xauth xz-utils yq zip zsh chromium kotlin \
+    tzdata valgrind vim wget xvfb xauth xz-utils yq zip zsh chromium kotlin \
  && rm -rf /var/lib/apt/lists/* \
  && ln -s /usr/bin/batcat /usr/local/bin/bat \
  && ln -s /usr/bin/fdfind /usr/local/bin/fd \

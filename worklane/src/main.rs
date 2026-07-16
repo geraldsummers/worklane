@@ -5,7 +5,7 @@ use serde::Serialize;
 use std::{
     fs,
     io::{self, Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
 };
 use worklane_core::*;
@@ -320,6 +320,33 @@ fn migrate_legacy_home<R: Runner>(r: &R, spec: &LaneSpec) -> Result<()> {
     .context("could not preserve legacy /home/dev state")?;
     Ok(())
 }
+fn timezone_from_localtime_link(link: &Path) -> Option<String> {
+    let zoneinfo = Path::new("/usr/share/zoneinfo");
+    link.strip_prefix(zoneinfo)
+        .ok()
+        .and_then(|path| path.to_str())
+        .map(|value| value.trim_start_matches('/').to_string())
+        .filter(|value| {
+            !value.is_empty() && !value.starts_with("posix/") && !value.starts_with("right/")
+        })
+}
+fn host_timezone() -> Option<String> {
+    if let Ok(value) = std::env::var("TZ") {
+        let value = value.trim();
+        if !value.is_empty() {
+            return Some(value.to_string());
+        }
+    }
+    if let Ok(value) = fs::read_to_string("/etc/timezone") {
+        let value = value.trim();
+        if !value.is_empty() {
+            return Some(value.to_string());
+        }
+    }
+    fs::read_link("/etc/localtime")
+        .ok()
+        .and_then(|link| timezone_from_localtime_link(&link))
+}
 fn local_start<R: Runner>(r: &R, spec: &LaneSpec) -> Result<()> {
     if !image_exists(r, &spec.profile.image)? {
         build_local_image(r, spec)?;
@@ -355,6 +382,9 @@ fn local_start<R: Runner>(r: &R, spec: &LaneSpec) -> Result<()> {
             spec.container_workspace().display()
         ),
     ];
+    if let Some(timezone) = host_timezone() {
+        a.extend(["--env".into(), format!("TZ={timezone}")]);
+    }
     for mount in &spec.profile.mounts {
         a.extend([
             "--mount".into(),
@@ -1442,6 +1472,7 @@ mod tests {
         assert!(EMBEDDED_CONTAINERFILE.contains("HERDR_INSTALL_DIR=/usr/local/bin"));
         assert!(!EMBEDDED_CONTAINERFILE.contains("NOPASSWD:ALL"));
         assert!(EMBEDDED_CONTAINERFILE.contains("ripgrep"));
+        assert!(EMBEDDED_CONTAINERFILE.contains("tzdata"));
         assert!(EMBEDDED_CONTAINERFILE.contains("xvfb"));
         assert!(LANE_AGENTS_MD.contains("immutable operating-system root filesystem"));
         assert!(LANE_AGENTS_MD.contains("RAM-backed tmpfs mounts, limited to 1 GiB"));
@@ -1511,6 +1542,21 @@ mod tests {
         assert!(shell.contains("counts=\"S:$staged U:$unstaged ?:$untracked  $sync\""));
         assert!(shell.contains("git -C \"$repo\" -c color.status=never status --short"));
         assert!(shell.contains(LANE_AGENTS_MD));
+    }
+
+    #[test]
+    fn timezone_from_localtime_link_uses_zoneinfo_path() {
+        assert_eq!(
+            timezone_from_localtime_link(Path::new("/usr/share/zoneinfo/America/New_York"))
+                .as_deref(),
+            Some("America/New_York")
+        );
+        assert_eq!(
+            timezone_from_localtime_link(Path::new("/usr/share/zoneinfo/Etc/UTC")).as_deref(),
+            Some("Etc/UTC")
+        );
+        assert!(timezone_from_localtime_link(Path::new("/tmp/localtime")).is_none());
+        assert!(timezone_from_localtime_link(Path::new("/usr/share/zoneinfo/posix/UTC")).is_none());
     }
 
     #[test]
