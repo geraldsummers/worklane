@@ -6,7 +6,7 @@ resolver = "2"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-repository = "https://example.invalid/worklane"
+repository = "https://github.com/geraldsummers/worklane"
 
 [workspace.dependencies]
 anyhow = "1.0"
