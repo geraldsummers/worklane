@@ -55,6 +55,7 @@ fn local_lifecycle_uses_podman_and_preserves_project() {
     fs::write(
         &podman,
         r#"#!/bin/sh
+printf '%s\n' "$*" >> "$0.log"
 case "$1:$2" in
   image:exists|pull:*|build:-f) exit 0 ;;
   stop:*) printf 'exited\n' > "$0.state"; exit 0 ;;
@@ -136,6 +137,17 @@ esac
         &["--json", "lane", "start", "smoke"]
     )
     .contains("running"));
+    fs::write(podman.with_extension("log"), "").unwrap();
+    assert!(run(
+        binary,
+        &data,
+        &bin_dir,
+        &["--json", "lane", "start", "smoke"]
+    )
+    .contains("running"));
+    let start_log = fs::read_to_string(podman.with_extension("log")).unwrap();
+    assert!(!start_log.lines().any(|line| line.starts_with("rm -f")));
+    assert!(!start_log.lines().any(|line| line.starts_with("run -d")));
     assert!(run(binary, &data, &bin_dir, &["lane", "attach", "smoke"]).is_empty());
     assert!(run(
         binary,
@@ -202,6 +214,11 @@ esac
         &["--json", "lane", "rename", "stale", "stale-renamed"]
     )
     .contains("stale-renamed"));
+    assert!(
+        fs::read_to_string(data.join("worklane/lanes/stale/lane.toml"))
+            .unwrap()
+            .contains("name = \"stale-renamed\"")
+    );
     assert!(run(
         binary,
         &data,

@@ -1,6 +1,12 @@
 FROM debian:trixie-slim
 # worklane-standard-containerfile
-ARG CODEX_VERSION=latest
+ARG CODEX_VERSION=0.144.5
+ARG TYPESCRIPT_VERSION=7.0.2
+ARG PRETTIER_VERSION=3.9.5
+ARG RUST_VERSION=1.85.1
+ARG RUSTUP_INIT_SHA256=6c30b75a75b28a96fd913a037c8581b580080b6ee9b8169a3c0feb1af7fe8caf
+ARG HERDR_VERSION=0.7.4
+ARG HERDR_SHA256=bc0fc02d4ba500f9cac2353a43e67fe036785ecca6eb55378e050fac3c103059
 ARG USERNAME=dev
 ARG USER_UID=1000
 ARG USER_GID=1000
@@ -21,7 +27,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && rm -rf /var/lib/apt/lists/* \
  && ln -s /usr/bin/batcat /usr/local/bin/bat \
  && ln -s /usr/bin/fdfind /usr/local/bin/fd \
- && env NPM_CONFIG_PREFIX=/usr/local npm install -g "@openai/codex@${CODEX_VERSION}" typescript prettier \
+ && env NPM_CONFIG_PREFIX=/usr/local npm install -g "@openai/codex@${CODEX_VERSION}" "typescript@${TYPESCRIPT_VERSION}" "prettier@${PRETTIER_VERSION}" \
  && mv /usr/local/bin/codex /usr/local/bin/codex-real \
  && printf '%s\n' \
     '#!/bin/sh' \
@@ -36,19 +42,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && mkdir -p /etc/codex \
  && printf '%s\n' 'approval_policy = "never"' 'sandbox_mode = "danger-full-access"' > /etc/codex/config.toml \
  && curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs -o /tmp/rustup-init.sh \
+ && echo "${RUSTUP_INIT_SHA256}  /tmp/rustup-init.sh" | sha256sum -c - \
  && env CARGO_HOME=/usr/local/cargo RUSTUP_HOME=/usr/local/rustup sh /tmp/rustup-init.sh -y --profile minimal \
  && rm -f /tmp/rustup-init.sh \
- && env CARGO_HOME=/usr/local/cargo RUSTUP_HOME=/usr/local/rustup rustup toolchain install stable \
- && env CARGO_HOME=/usr/local/cargo RUSTUP_HOME=/usr/local/rustup rustup component add rustfmt \
- && env CARGO_HOME=/usr/local/cargo RUSTUP_HOME=/usr/local/rustup rustup default stable \
+ && env CARGO_HOME=/usr/local/cargo RUSTUP_HOME=/usr/local/rustup rustup toolchain install "${RUST_VERSION}" \
+ && env CARGO_HOME=/usr/local/cargo RUSTUP_HOME=/usr/local/rustup rustup component add rustfmt --toolchain "${RUST_VERSION}" \
+ && env CARGO_HOME=/usr/local/cargo RUSTUP_HOME=/usr/local/rustup rustup default "${RUST_VERSION}" \
  && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
  && echo "deb [signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list \
  && apt-get update && apt-get install -y --no-install-recommends gh && rm -rf /var/lib/apt/lists/* \
- && curl -fsSL https://herdr.dev/install.sh -o /tmp/herdr-install.sh \
- && HERDR_INSTALL_DIR=/usr/local/bin sh /tmp/herdr-install.sh \
+ && curl -fsSL "https://github.com/ogulcancelik/herdr/releases/download/v${HERDR_VERSION}/herdr-linux-x86_64" -o /tmp/herdr \
+ && echo "${HERDR_SHA256}  /tmp/herdr" | sha256sum -c - \
+ && install -m 755 /tmp/herdr /usr/local/bin/herdr \
  && command -v herdr \
  && herdr --version \
- && rm -f /tmp/herdr-install.sh \
+ && rm -f /tmp/herdr \
  && python3 --version && pip3 --version && node --version && npm --version \
  && tsc --version && prettier --version && rustc --version && cargo --version && rustfmt --version \
  && java --version && kotlinc -version

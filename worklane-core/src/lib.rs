@@ -106,6 +106,8 @@ pub fn validate_profile(
             || mount.target == workspace
             || mount.target.starts_with(home)
             || mount.target.starts_with(workspace)
+            || home.starts_with(&mount.target)
+            || workspace.starts_with(&mount.target)
         {
             bail!("profile mount target conflicts with Worklane-managed home or workspace")
         }
@@ -474,10 +476,7 @@ pub fn host_state(r: &impl Runner, spec: &LaneSpec) -> Result<(String, bool)> {
     let name = spec.container_name();
     let state = host_runtime_state(r, spec);
     let drift = !matches!(state.as_str(), "absent")
-        && has_meaningful_drift(
-            &podman(r, ["diff", &name]).unwrap_or_default(),
-            &spec.container_home(),
-        );
+        && has_meaningful_drift(&podman(r, ["diff", &name])?, &spec.container_home());
     Ok((state, drift))
 }
 pub fn host_runtime_state(r: &impl Runner, spec: &LaneSpec) -> String {
@@ -586,6 +585,16 @@ mod tests {
     impl Runner for FailingMock {
         fn run(&self, _: &str, _: &[String]) -> Result<String> {
             bail!("mock command failed")
+        }
+    }
+
+    struct DiffFailingMock;
+    impl Runner for DiffFailingMock {
+        fn run(&self, _: &str, args: &[String]) -> Result<String> {
+            if args.first().is_some_and(|arg| arg == "diff") {
+                bail!("podman diff failed")
+            }
+            Ok("running".into())
         }
     }
     #[test]
@@ -715,6 +724,27 @@ mod tests {
             false
         )
         .is_err());
+        profile.mounts.clear();
+        profile.mounts.push(MountSpec {
+            source: PathBuf::from("/tmp"),
+            target: PathBuf::from("/home"),
+            read_only: true,
+        });
+        assert!(validate_profile(
+            &profile,
+            Path::new("/home/gerald"),
+            Path::new("/home/gerald/workspace"),
+            false
+        )
+        .is_err());
+        profile.mounts[0].target = PathBuf::from("/");
+        assert!(validate_profile(
+            &profile,
+            Path::new("/home/gerald"),
+            Path::new("/home/gerald/workspace"),
+            false
+        )
+        .is_err());
     }
 
     #[test]
@@ -740,6 +770,18 @@ mod tests {
             ),
             Vec::<String>::new()
         );
+    }
+
+    #[test]
+    fn drift_detection_fails_closed_when_podman_diff_fails() {
+        let spec = LaneSpec::new(
+            "alpha".into(),
+            "local".into(),
+            PathBuf::from("/tmp"),
+            Profile::default(),
+        )
+        .unwrap();
+        assert!(host_state(&DiffFailingMock, &spec).is_err());
     }
 
     #[test]

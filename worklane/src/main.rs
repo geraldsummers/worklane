@@ -477,13 +477,14 @@ fn refresh_all<R: Runner>(runner: &R, store: &Store) -> Result<Vec<LaneStatus>> 
     }
     Ok(statuses)
 }
-fn lane_attach_args(name: &str, shell: bool) -> Vec<String> {
+fn lane_attach_args(session: &str, shell: bool) -> Vec<String> {
     if shell {
         return vec!["zsh".into(), "-l".into()];
     }
-    vec!["herdr".into(), "--session".into(), name.into()]
+    vec!["herdr".into(), "--session".into(), session.into()]
 }
 fn bootstrap_herdr(spec: &LaneSpec) -> Result<()> {
+    let session = spec.lane_dir_name();
     let script = r#"set -eu
 marker="$HOME/.local/share/worklane/herdr-codex-integration-v1"
 if [ ! -e "$marker" ]; then
@@ -492,18 +493,18 @@ if [ ! -e "$marker" ]; then
   : > "$marker"
 fi
 mkdir -p "$HOME/.config/herdr"
-if ! herdr --session "$WORKLANE_NAME" workspace list >/dev/null 2>&1; then
-  herdr --session "$WORKLANE_NAME" server >"$HOME/.config/herdr/server.log" 2>&1 &!
+if ! herdr --session "$WORKLANE_SESSION" workspace list >/dev/null 2>&1; then
+  herdr --session "$WORKLANE_SESSION" server >"$HOME/.config/herdr/server.log" 2>&1 &!
   for _ in 1 2 3 4 5 6 7 8 9 10; do
-    herdr --session "$WORKLANE_NAME" workspace list >/dev/null 2>&1 && break
+    herdr --session "$WORKLANE_SESSION" workspace list >/dev/null 2>&1 && break
     sleep 1
   done
 fi
-workspace_id="$(herdr --session "$WORKLANE_NAME" workspace list | jq -r --arg label "$WORKLANE_NAME" '.result.workspaces[] | select(.label == $label) | .workspace_id' | head -n 1)"
+workspace_id="$(herdr --session "$WORKLANE_SESSION" workspace list | jq -r --arg label "$WORKLANE_SESSION" '.result.workspaces[] | select(.label == $label) | .workspace_id' | head -n 1)"
 if [ -n "$workspace_id" ]; then
-  herdr --session "$WORKLANE_NAME" workspace focus "$workspace_id"
+  herdr --session "$WORKLANE_SESSION" workspace focus "$workspace_id"
 else
-  herdr --session "$WORKLANE_NAME" workspace create --cwd "$HOME/$WORKLANE_NAME" --label "$WORKLANE_NAME" --focus
+  herdr --session "$WORKLANE_SESSION" workspace create --cwd "$WORKLANE_WORKSPACE" --label "$WORKLANE_SESSION" --focus
 fi
 watcher="$HOME/.local/share/worklane/bin/worklane-git-diff-pane"
 manager="$HOME/.local/share/worklane/bin/worklane-git-diff-pane-manager"
@@ -521,6 +522,13 @@ fi"#;
             "exec",
             "--env",
             &format!("WORKLANE_NAME={}", spec.name),
+            "--env",
+            &format!("WORKLANE_SESSION={session}"),
+            "--env",
+            &format!(
+                "WORKLANE_WORKSPACE={}",
+                spec.container_workspace().display()
+            ),
             &spec.container_name(),
             "zsh",
             "-lc",
@@ -541,7 +549,7 @@ fn bootstrap_shell_script() -> String {
 if [ ! -f "$HOME/.zshrc" ]; then
   cat > "$HOME/.zshrc" <<'ZSHRC'
 export EDITOR="${EDITOR:-vim}"
-cd "$HOME/${WORKLANE_NAME:-workspace}" 2>/dev/null || true
+cd "${WORKLANE_WORKSPACE:-$HOME/${WORKLANE_NAME:-workspace}}" 2>/dev/null || true
 ZSHRC
 fi
 touch "$HOME/.zshenv"
@@ -766,7 +774,7 @@ ensure_tab_diff_panes() {{
       cwd="$(printf '%s\n' "$state" |
         jq -r --arg pane "$target" '.result.snapshot.panes[]? | select(.pane_id == $pane) | (.foreground_cwd // .cwd // empty)' 2>/dev/null |
         head -n 1)"
-      [ -n "$cwd" ] || cwd="$HOME/$session"
+      [ -n "$cwd" ] || cwd="${{WORKLANE_WORKSPACE:-$HOME/$session}}"
       split_output="$(herdr --session "$session" pane split "$target" --direction right --ratio 0.7 --cwd "$cwd" --env "WORKLANE_NAME=$session" --no-focus 2>/dev/null || true)"
       diff_pane="$(printf '%s\n' "$split_output" |
         jq -r '.result.pane.pane_id // .result.pane_id // empty' 2>/dev/null |
@@ -830,8 +838,24 @@ fi"#
 }
 fn bootstrap_shell(spec: &LaneSpec) -> Result<()> {
     let script = bootstrap_shell_script();
+    let session = spec.lane_dir_name();
     let status = Command::new("podman")
-        .args(["exec", &spec.container_name(), "zsh", "-lc", &script])
+        .args([
+            "exec",
+            "--env",
+            &format!("WORKLANE_NAME={}", spec.name),
+            "--env",
+            &format!("WORKLANE_SESSION={session}"),
+            "--env",
+            &format!(
+                "WORKLANE_WORKSPACE={}",
+                spec.container_workspace().display()
+            ),
+            &spec.container_name(),
+            "zsh",
+            "-lc",
+            &script,
+        ])
         .status()
         .context("bootstrap lane zsh configuration")?;
     if !status.success() {
@@ -859,6 +883,19 @@ fn run_executor() -> Result<()> {
         bail!("executor command failed")
     }
     Ok(())
+}
+fn strict_ssh_args(target: &str, command: String) -> Vec<String> {
+    vec![
+        "-o".into(),
+        "StrictHostKeyChecking=yes".into(),
+        target.into(),
+        command,
+    ]
+}
+fn deployment_script(version: &str, checksum: &str) -> String {
+    format!(
+        "set -eu; dir=\"$HOME/.local/share/worklane/bin\"; tmp=\"$dir/worklane-{version}.tmp\"; dst=\"$dir/worklane-{version}\"; test \"$(sha256sum \"$tmp\" | cut -d' ' -f1)\" = '{checksum}'; chmod 755 \"$tmp\"; mv -f \"$tmp\" \"$dst\"; ln -sfn \"$dst\" \"$HOME/.local/bin/worklane.new\"; mv -Tf \"$HOME/.local/bin/worklane.new\" \"$HOME/.local/bin/worklane\""
+    )
 }
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -915,10 +952,10 @@ fn main() -> Result<()> {
                     .context("unknown host")?;
                 SystemRunner.run(
                     "ssh",
-                    &[
-                        h.ssh_target,
-                        "mkdir -p ~/.local/share/worklane/{bin,lanes,archives}".into(),
-                    ],
+                    &strict_ssh_args(
+                        &h.ssh_target,
+                        "mkdir -p ~/.local/bin ~/.local/share/worklane/bin ~/.local/share/worklane/lanes ~/.local/share/worklane/archives".into(),
+                    ),
                 )?;
                 emit(
                     cli.json,
@@ -942,16 +979,27 @@ fn main() -> Result<()> {
                     }
                 };
                 let version = env!("CARGO_PKG_VERSION");
-                let remote_path = format!("~/.local/share/worklane/bin/worklane-{version}");
+                let remote_path = format!("~/.local/share/worklane/bin/worklane-{version}.tmp");
+                SystemRunner.run(
+                    "ssh",
+                    &strict_ssh_args(
+                        &h.ssh_target,
+                        "mkdir -p ~/.local/bin ~/.local/share/worklane/bin".into(),
+                    ),
+                )?;
                 SystemRunner.run(
                     "scp",
                     &[
+                        "-o".into(),
+                        "StrictHostKeyChecking=yes".into(),
                         binary.display().to_string(),
                         format!("{}:{}", h.ssh_target, remote_path),
                     ],
                 )?;
-                let script=format!("set -eu; test \"$(sha256sum {remote_path} | cut -d' ' -f1)\" = '{sum}'; chmod 755 {remote_path}; ln -sfn {remote_path} ~/.local/bin/worklane");
-                SystemRunner.run("ssh", &[h.ssh_target.clone(), script])?;
+                SystemRunner.run(
+                    "ssh",
+                    &strict_ssh_args(&h.ssh_target, deployment_script(version, &sum)),
+                )?;
                 h.installed_version = Some(version.into());
                 store.upsert_host(&h)?;
                 emit(
@@ -1117,7 +1165,29 @@ fn main() -> Result<()> {
                 emit(cli.json, &status)
             }
             LaneAction::Rename { lane, new_name } => {
-                emit(cli.json, &store.rename_lane(&lane, &new_name)?)
+                let s = store.lane(&lane)?;
+                if remote(
+                    &runner,
+                    &store,
+                    &s,
+                    vec![
+                        "lane".into(),
+                        "rename".into(),
+                        s.id.clone(),
+                        new_name.clone(),
+                    ],
+                )?
+                .is_some()
+                {
+                    let mut renamed = s;
+                    renamed.name = new_name;
+                    store.save_lane(&renamed, "unknown", false)?;
+                    emit(cli.json, &renamed)
+                } else {
+                    let renamed = store.rename_lane(&lane, &new_name)?;
+                    write_lane_spec(&renamed)?;
+                    emit(cli.json, &renamed)
+                }
             }
             LaneAction::Refresh { lane, all } => {
                 let statuses = if all {
@@ -1169,7 +1239,7 @@ fn main() -> Result<()> {
                 )?
                 .is_none()
                 {
-                    local_start(&runner, &s)?
+                    ensure_local_started(&runner, &s)?
                 };
                 emit(cli.json, &refresh(&runner, &store, &s)?)
             }
@@ -1219,13 +1289,18 @@ fn main() -> Result<()> {
                 if !shell {
                     bootstrap_herdr(&s)?;
                 }
-                let command = lane_attach_args(&s.name, shell);
+                let session = s.lane_dir_name();
+                let command = lane_attach_args(&session, shell);
                 let status = Command::new("podman")
                     .args([
                         "exec",
                         "-it",
                         "--env",
                         &format!("WORKLANE_NAME={}", s.name),
+                        "--env",
+                        &format!("WORKLANE_SESSION={session}"),
+                        "--env",
+                        &format!("WORKLANE_WORKSPACE={}", s.container_workspace().display()),
                         &s.container_name(),
                     ])
                     .args(command)
@@ -1422,14 +1497,35 @@ mod tests {
     }
 
     #[test]
-    fn herdr_bootstrap_uses_the_lane_name_as_its_workspace_label() {
+    fn herdr_bootstrap_uses_stable_session_and_workspace_paths() {
         let source = include_str!("main.rs");
-        assert!(source.contains("--label \"$WORKLANE_NAME\""));
-        assert!(source.contains("herdr --session \"$WORKLANE_NAME\" workspace create"));
-        assert!(source.contains("herdr --session \"$WORKLANE_NAME\" workspace focus"));
+        assert!(source.contains("--label \"$WORKLANE_SESSION\""));
+        assert!(source.contains("herdr --session \"$WORKLANE_SESSION\" workspace create"));
+        assert!(source.contains("herdr --session \"$WORKLANE_SESSION\" workspace focus"));
+        assert!(source.contains("--cwd \"$WORKLANE_WORKSPACE\""));
+        assert!(source.contains("WORKLANE_SESSION={session}"));
+        assert!(source.contains("WORKLANE_WORKSPACE={}"));
         assert!(source.contains("worklane-git-diff-pane-manager"));
         assert!(source.contains("pkill -u \"$(id -u)\" -f \"$manager\""));
         assert!(source.contains("\"$manager\" >/dev/null 2>&1 &!"));
+    }
+
+    #[test]
+    fn deployment_uses_strict_host_keys_and_atomic_symlink_replacement() {
+        assert_eq!(
+            strict_ssh_args("dev@example.test", "true".into()),
+            vec![
+                "-o",
+                "StrictHostKeyChecking=yes",
+                "dev@example.test",
+                "true"
+            ]
+        );
+        let script = deployment_script("1.2.3", "abc123");
+        assert!(script.contains("worklane-1.2.3.tmp"));
+        assert!(script.contains("mv -f \"$tmp\" \"$dst\""));
+        assert!(script
+            .contains("mv -Tf \"$HOME/.local/bin/worklane.new\" \"$HOME/.local/bin/worklane\""));
     }
 
     #[test]
@@ -1445,13 +1541,17 @@ mod tests {
     fn standard_containerfile_is_embedded() {
         assert!(EMBEDDED_CONTAINERFILE.starts_with("FROM debian:trixie-slim"));
         assert!(EMBEDDED_CONTAINERFILE.contains("@openai/codex"));
+        assert!(!EMBEDDED_CONTAINERFILE.contains("CODEX_VERSION=latest"));
+        assert!(EMBEDDED_CONTAINERFILE.contains("HERDR_SHA256="));
+        assert!(EMBEDDED_CONTAINERFILE.contains("RUSTUP_INIT_SHA256="));
+        assert!(EMBEDDED_CONTAINERFILE.contains("sha256sum -c -"));
         assert!(EMBEDDED_CONTAINERFILE.contains(
             "codex-real --dangerously-bypass-approvals-and-sandbox -a never -s danger-full-access"
         ));
         assert!(EMBEDDED_CONTAINERFILE.contains("/etc/codex/config.toml"));
         assert!(EMBEDDED_CONTAINERFILE.contains("approval_policy = \"never\""));
         assert!(EMBEDDED_CONTAINERFILE.contains("sandbox_mode = \"danger-full-access\""));
-        assert!(EMBEDDED_CONTAINERFILE.contains("HERDR_INSTALL_DIR=/usr/local/bin"));
+        assert!(EMBEDDED_CONTAINERFILE.contains("install -m 755 /tmp/herdr /usr/local/bin/herdr"));
         assert!(!EMBEDDED_CONTAINERFILE.contains("NOPASSWD:ALL"));
         assert!(EMBEDDED_CONTAINERFILE.contains("ripgrep"));
         assert!(EMBEDDED_CONTAINERFILE.contains("tzdata"));
