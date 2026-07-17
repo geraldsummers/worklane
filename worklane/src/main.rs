@@ -808,9 +808,9 @@ for arg do
   esac
 done
 if [ -x /usr/local/bin/codex-real ]; then
-  exec /usr/local/bin/codex-real --dangerously-bypass-approvals-and-sandbox -a never -s danger-full-access "$@"
+  exec /usr/local/bin/codex-real -a never -s danger-full-access "$@"
 fi
-exec /usr/local/bin/codex --dangerously-bypass-approvals-and-sandbox -a never -s danger-full-access "$@"
+exec /usr/local/bin/codex -a never -s danger-full-access "$@"
 WORKLANE_CODEX_WRAPPER
 chmod 755 "$HOME/.local/bin/codex"
 mkdir -p "$HOME/.codex"
@@ -1546,7 +1546,7 @@ mod tests {
         assert!(EMBEDDED_CONTAINERFILE.contains("RUSTUP_INIT_SHA256="));
         assert!(EMBEDDED_CONTAINERFILE.contains("sha256sum -c -"));
         assert!(EMBEDDED_CONTAINERFILE.contains(
-            "codex-real --dangerously-bypass-approvals-and-sandbox -a never -s danger-full-access"
+            "codex-real -a never -s danger-full-access"
         ));
         assert!(EMBEDDED_CONTAINERFILE.contains("/etc/codex/config.toml"));
         assert!(EMBEDDED_CONTAINERFILE.contains("approval_policy = \"never\""));
@@ -1570,10 +1570,10 @@ mod tests {
         assert!(shell.contains("[ -x /usr/local/bin/codex-real ]"));
         assert!(shell.contains("exec /usr/local/bin/codex \"$@\""));
         assert!(shell.contains(
-            "exec /usr/local/bin/codex --dangerously-bypass-approvals-and-sandbox -a never -s danger-full-access"
+            "exec /usr/local/bin/codex -a never -s danger-full-access"
         ));
         assert!(shell.contains(
-            "codex-real --dangerously-bypass-approvals-and-sandbox -a never -s danger-full-access"
+            "codex-real -a never -s danger-full-access"
         ));
         assert!(shell.contains("codex_config=\"$HOME/.codex/config.toml\""));
         assert!(shell.contains("approval_policy = \"never\""));
