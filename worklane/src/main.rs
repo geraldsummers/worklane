@@ -483,8 +483,14 @@ fn lane_attach_args(session: &str, shell: bool) -> Vec<String> {
     }
     vec!["herdr".into(), "--session".into(), session.into()]
 }
+
+/// Herdr session and workspace labels are user-facing, unlike legacy storage names.
+fn herdr_session_name(spec: &LaneSpec) -> &str {
+    &spec.name
+}
+
 fn bootstrap_herdr(spec: &LaneSpec) -> Result<()> {
-    let session = spec.lane_dir_name();
+    let session = herdr_session_name(spec);
     let script = r#"set -eu
 marker="$HOME/.local/share/worklane/herdr-codex-integration-v1"
 if [ ! -e "$marker" ]; then
@@ -838,7 +844,7 @@ fi"#
 }
 fn bootstrap_shell(spec: &LaneSpec) -> Result<()> {
     let script = bootstrap_shell_script();
-    let session = spec.lane_dir_name();
+    let session = herdr_session_name(spec);
     let status = Command::new("podman")
         .args([
             "exec",
@@ -1289,7 +1295,7 @@ fn main() -> Result<()> {
                 if !shell {
                     bootstrap_herdr(&s)?;
                 }
-                let session = s.lane_dir_name();
+                let session = herdr_session_name(&s);
                 let command = lane_attach_args(&session, shell);
                 let status = Command::new("podman")
                     .args([
@@ -1494,6 +1500,17 @@ mod tests {
             vec!["herdr", "--session", "alpha"]
         );
         assert_eq!(lane_attach_args("alpha", true), vec!["zsh", "-l"]);
+    }
+
+    #[test]
+    fn herdr_sessions_always_use_the_lane_name() {
+        let mut legacy = spec("local");
+        legacy.container_name_override = None;
+        legacy.container_workspace_override = None;
+        legacy.lane_dir_name_override = None;
+
+        assert_ne!(legacy.lane_dir_name(), legacy.name);
+        assert_eq!(herdr_session_name(&legacy), legacy.name);
     }
 
     #[test]
