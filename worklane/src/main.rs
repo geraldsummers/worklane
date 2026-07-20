@@ -242,12 +242,12 @@ fn standard_build_context() -> Result<PathBuf> {
 fn seed_containerfile(path: &std::path::Path) -> Result<()> {
     fs::create_dir_all(path.parent().expect("embedded Containerfile has a parent"))?;
     if !path.exists() {
-        fs::write(&path, EMBEDDED_CONTAINERFILE)?;
+        fs::write(path, EMBEDDED_CONTAINERFILE)?;
         return Ok(());
     }
     let existing = fs::read_to_string(path)?;
     if existing != EMBEDDED_CONTAINERFILE && is_worklane_standard_containerfile(&existing) {
-        fs::write(&path, EMBEDDED_CONTAINERFILE)?;
+        fs::write(path, EMBEDDED_CONTAINERFILE)?;
     }
     Ok(())
 }
@@ -1296,7 +1296,7 @@ fn main() -> Result<()> {
                     bootstrap_herdr(&s)?;
                 }
                 let session = herdr_session_name(&s);
-                let command = lane_attach_args(&session, shell);
+                let command = lane_attach_args(session, shell);
                 let status = Command::new("podman")
                     .args([
                         "exec",
@@ -1562,9 +1562,7 @@ mod tests {
         assert!(EMBEDDED_CONTAINERFILE.contains("HERDR_SHA256="));
         assert!(EMBEDDED_CONTAINERFILE.contains("RUSTUP_INIT_SHA256="));
         assert!(EMBEDDED_CONTAINERFILE.contains("sha256sum -c -"));
-        assert!(EMBEDDED_CONTAINERFILE.contains(
-            "codex-real -a never -s danger-full-access"
-        ));
+        assert!(EMBEDDED_CONTAINERFILE.contains("codex-real -a never -s danger-full-access"));
         assert!(EMBEDDED_CONTAINERFILE.contains("/etc/codex/config.toml"));
         assert!(EMBEDDED_CONTAINERFILE.contains("approval_policy = \"never\""));
         assert!(EMBEDDED_CONTAINERFILE.contains("sandbox_mode = \"danger-full-access\""));
@@ -1586,12 +1584,8 @@ mod tests {
         assert!(shell.contains("chmod 755 \"$HOME/.local/bin/codex\""));
         assert!(shell.contains("[ -x /usr/local/bin/codex-real ]"));
         assert!(shell.contains("exec /usr/local/bin/codex \"$@\""));
-        assert!(shell.contains(
-            "exec /usr/local/bin/codex -a never -s danger-full-access"
-        ));
-        assert!(shell.contains(
-            "codex-real -a never -s danger-full-access"
-        ));
+        assert!(shell.contains("exec /usr/local/bin/codex -a never -s danger-full-access"));
+        assert!(shell.contains("codex-real -a never -s danger-full-access"));
         assert!(shell.contains("codex_config=\"$HOME/.codex/config.toml\""));
         assert!(shell.contains("approval_policy = \"never\""));
         assert!(shell.contains("sandbox_mode = \"danger-full-access\""));
