@@ -10,7 +10,7 @@
   <a href="https://github.com/geraldsummers/worklane/actions/workflows/ci.yml"><img src="https://github.com/geraldsummers/worklane/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/Rust-2021-e05d44?style=flat" alt="Rust 2021">
   <img src="https://img.shields.io/badge/runtime-rootless%20Podman-892ca0?style=flat" alt="Rootless Podman">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-2f81f7?style=flat" alt="MIT license"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0--or--later-2f81f7?style=flat" alt="AGPL-3.0-or-later license"></a>
 </p>
 
 Worklane is a Linux-first CLI and terminal dashboard for running AI coding work in disposable, rootless Podman environments. Each **lane** gets a replaceable container root while its project, `/home/dev`, and supported agent-session state live on deliberate host mounts.
@@ -216,4 +216,4 @@ Rootless Podman limits host privilege, while Worklane's drift checks and archive
 
 Worklane is a personal engineering project in active v0.1 development. The core local and remote lifecycle, persistent Herdr attach flow, dashboard, drift protection, profile model, JSON interface, and CI quality gates are implemented. Prebuilt releases and backward-compatibility guarantees are not yet provided.
 
-Licensed under [MIT](LICENSE).
+Licensed under [AGPL-3.0-or-later](LICENSE-NOTICE.md).
