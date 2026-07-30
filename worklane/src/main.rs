@@ -536,6 +536,13 @@ fn migrate_local_lane<R: Runner>(runner: &R, store: &Store, spec: &LaneSpec) -> 
     finish_lane_migration(spec, &mut migrated)?;
     write_lane_spec(&migrated)?;
     store.save_lane(&migrated, "unknown", false)?;
+    let quarantine = migration_quarantine_dir(&migrated);
+    if quarantine.exists() {
+        eprintln!(
+            "migration completed with recoverable entries quarantined at {}",
+            quarantine.display()
+        );
+    }
     Ok(migrated)
 }
 fn ensure_lane_layout<R: Runner>(runner: &R, store: &Store, spec: &LaneSpec) -> Result<LaneSpec> {

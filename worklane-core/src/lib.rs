@@ -7,6 +7,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::{
     fs, io,
+    io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -558,7 +559,27 @@ pub fn write_lane_spec(spec: &LaneSpec) -> Result<()> {
     Ok(())
 }
 
-fn copy_verified(src: &Path, dst: &Path) -> Result<()> {
+fn copy_for_migration(spec: &LaneSpec, src: &Path, dst: &Path, relative: &Path) -> Result<()> {
+    if let Err(error) = copy_for_migration_inner(spec, src, dst, relative) {
+        if dst.exists() {
+            let _ = remove_path(dst);
+        }
+        quarantine_path(
+            spec,
+            src,
+            relative,
+            &format!("could not copy and verify legacy entry: {error:#}"),
+        )?;
+    }
+    Ok(())
+}
+
+fn copy_for_migration_inner(
+    spec: &LaneSpec,
+    src: &Path,
+    dst: &Path,
+    relative: &Path,
+) -> Result<()> {
     let metadata = fs::symlink_metadata(src)?;
     if metadata.file_type().is_symlink() {
         #[cfg(unix)]
@@ -567,9 +588,14 @@ fn copy_verified(src: &Path, dst: &Path) -> Result<()> {
         bail!("lane migration cannot preserve symlinks on this platform");
     } else if metadata.is_dir() {
         fs::create_dir(dst)?;
-        for entry in fs::read_dir(src)? {
-            let entry = entry?;
-            copy_verified(&entry.path(), &dst.join(entry.file_name()))?;
+        let entries = fs::read_dir(src)?.collect::<Result<Vec<_>, _>>()?;
+        for entry in entries {
+            copy_for_migration(
+                spec,
+                &entry.path(),
+                &dst.join(entry.file_name()),
+                &relative.join(entry.file_name()),
+            )?;
         }
         fs::set_permissions(dst, metadata.permissions())?;
     } else if metadata.is_file() {
@@ -615,6 +641,59 @@ fn paths_equal(left: &Path, right: &Path) -> Result<bool> {
     Ok(true)
 }
 
+pub fn migration_quarantine_dir(spec: &LaneSpec) -> PathBuf {
+    data_dir().join("quarantine").join(&spec.id)
+}
+
+fn remove_path(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        fs::remove_dir_all(path)?;
+    } else {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+fn quarantine_path(spec: &LaneSpec, path: &Path, relative: &Path, reason: &str) -> Result<PathBuf> {
+    let root = migration_quarantine_dir(spec);
+    let items = root.join("items");
+    let mut destination = items.join(relative);
+    let parent = destination
+        .parent()
+        .context("migration quarantine path has no parent")?;
+    fs::create_dir_all(parent)?;
+    if destination.exists() {
+        let name = destination
+            .file_name()
+            .context("migration quarantine path has no file name")?;
+        destination =
+            destination.with_file_name(format!("{}.{}", name.to_string_lossy(), Uuid::new_v4()));
+    }
+    fs::rename(path, &destination).with_context(|| {
+        format!(
+            "failed to quarantine migration entry {} at {}",
+            path.display(),
+            destination.display()
+        )
+    })?;
+    let clean_reason = reason.replace(['\n', '\r', '\t'], " ");
+    let mut report = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(root.join("migration.log"))?;
+    writeln!(
+        report,
+        "{}\t{}\t{}\t{}",
+        Utc::now().to_rfc3339(),
+        path.display(),
+        destination.display(),
+        clean_reason
+    )?;
+    report.sync_all()?;
+    Ok(destination)
+}
+
 /// Copy a legacy hidden home into the user-selected directory without removing
 /// the source. Repeated calls resume an interrupted, verified migration.
 pub fn prepare_lane_migration(spec: &LaneSpec) -> Result<LaneSpec> {
@@ -638,33 +717,67 @@ pub fn prepare_lane_migration(spec: &LaneSpec) -> Result<LaneSpec> {
         )
     }
     let entries = if source.exists() {
-        fs::read_dir(&source)?.collect::<Result<Vec<_>, _>>()?
+        match fs::read_dir(&source).and_then(|entries| entries.collect::<Result<Vec<_>, _>>()) {
+            Ok(entries) => entries,
+            Err(error) => {
+                quarantine_path(
+                    spec,
+                    &source,
+                    Path::new("legacy-home"),
+                    &format!("could not enumerate legacy home: {error}"),
+                )?;
+                Vec::new()
+            }
+        }
     } else {
         Vec::new()
     };
-    for entry in &entries {
-        if entry.file_name() == ".worklane" {
-            bail!("legacy home contains reserved path '.worklane'")
-        }
-        let target = spec.project_path.join(entry.file_name());
-        if target.exists() && (!resuming || !paths_equal(&entry.path(), &target)?) {
-            bail!("migration path collision: {}", target.display())
-        }
-    }
     fs::create_dir_all(&control)?;
     fs::write(&marker, format!("{}\n", spec.id))?;
     let staging = control.join("migration-staging");
     fs::create_dir_all(&staging)?;
     for entry in entries {
+        let source_entry = entry.path();
+        if entry.file_name() == ".worklane" {
+            quarantine_path(
+                spec,
+                &source_entry,
+                Path::new(".worklane"),
+                "reserved legacy path '.worklane'",
+            )?;
+            continue;
+        }
         let target = spec.project_path.join(entry.file_name());
         if target.exists() {
+            match paths_equal(&source_entry, &target) {
+                Ok(true) => {}
+                Ok(false) => {
+                    quarantine_path(
+                        spec,
+                        &source_entry,
+                        Path::new(&entry.file_name()),
+                        &format!("migration target already exists: {}", target.display()),
+                    )?;
+                }
+                Err(error) => {
+                    quarantine_path(
+                        spec,
+                        &source_entry,
+                        Path::new(&entry.file_name()),
+                        &format!(
+                            "could not compare with existing migration target {}: {error}",
+                            target.display()
+                        ),
+                    )?;
+                }
+            }
             continue;
         }
         let staged = staging.join(entry.file_name());
         if staged.exists() {
-            fs::remove_dir_all(&staged).or_else(|_| fs::remove_file(&staged))?;
+            remove_path(&staged)?;
         }
-        copy_verified(&entry.path(), &staged)?;
+        copy_for_migration(spec, &source_entry, &staged, Path::new(&entry.file_name()))?;
         fs::rename(&staged, &target)?;
     }
     let mut migrated = spec.clone();
@@ -682,7 +795,14 @@ pub fn finish_lane_migration(old_spec: &LaneSpec, migrated: &mut LaneSpec) -> Re
     }
     let legacy = old_spec.lane_dir();
     if legacy.exists() {
-        fs::remove_dir_all(&legacy)?;
+        if let Err(error) = fs::remove_dir_all(&legacy) {
+            quarantine_path(
+                old_spec,
+                &legacy,
+                Path::new(&old_spec.lane_dir_name()),
+                &format!("could not remove legacy lane remainder: {error}"),
+            )?;
+        }
     }
     let control = migrated.project_path.join(".worklane");
     let staging = control.join("migration-staging");
@@ -968,7 +1088,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_home_migration_rejects_collisions_before_copying() {
+    fn legacy_home_migration_quarantines_collisions_without_blocking() {
         let token = Uuid::new_v4().to_string();
         let project = std::env::temp_dir().join(format!("worklane-collision-project-{token}"));
         fs::create_dir_all(&project).unwrap();
@@ -986,11 +1106,122 @@ mod tests {
         fs::create_dir_all(&source).unwrap();
         fs::write(source.join(".zshrc"), b"legacy shell").unwrap();
 
-        let error = prepare_lane_migration(&legacy).unwrap_err().to_string();
-        assert!(error.contains("migration path collision"));
-        assert!(!project.join(".worklane").exists());
+        let mut migrated = prepare_lane_migration(&legacy).unwrap();
         assert_eq!(fs::read(project.join(".zshrc")).unwrap(), b"project shell");
+        let quarantine = migration_quarantine_dir(&legacy);
+        assert_eq!(
+            fs::read(quarantine.join("items/.zshrc")).unwrap(),
+            b"legacy shell"
+        );
+        assert!(fs::read_to_string(quarantine.join("migration.log"))
+            .unwrap()
+            .contains("migration target already exists"));
+        write_lane_spec(&migrated).unwrap();
+        finish_lane_migration(&legacy, &mut migrated).unwrap();
+        assert!(!legacy.lane_dir().exists());
+        fs::remove_dir_all(quarantine).unwrap();
+        fs::remove_dir_all(project).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_home_migration_quarantines_unsupported_entries_and_resumes_staging() {
+        use std::os::unix::net::UnixListener;
+
+        let token = Uuid::new_v4().to_string();
+        let project = std::env::temp_dir().join(format!("worklane-socket-project-{token}"));
+        fs::create_dir_all(project.join(".worklane/migration-staging/.config")).unwrap();
+        fs::write(
+            project.join(".worklane/migration-v1"),
+            format!("{}\n", token),
+        )
+        .unwrap();
+        fs::write(
+            project.join(".worklane/migration-staging/.config/partial"),
+            b"partial",
+        )
+        .unwrap();
+        let mut legacy = LaneSpec::new(
+            "socket".into(),
+            "local".into(),
+            project.clone(),
+            Profile::default(),
+        )
+        .unwrap();
+        legacy.id = token;
+        legacy.version = 1;
+        legacy.lane_dir_name_override = Some(format!("sock-{}", &legacy.id[..8]));
+        let source = legacy.home_dir();
+        fs::create_dir_all(source.join(".config")).unwrap();
+        let listener = UnixListener::bind(source.join(".config/agent.sock")).unwrap();
+
+        let migrated = prepare_lane_migration(&legacy).unwrap();
+        assert_eq!(migrated.version, 2);
+        assert!(source.join(".config").exists());
+        assert!(migration_quarantine_dir(&legacy)
+            .join("items/.config/agent.sock")
+            .exists());
+        assert!(project.join(".config").is_dir());
+        assert!(!project.join(".config/partial").exists());
+        assert!(!project.join(".worklane/migration-staging/.config").exists());
+
+        drop(listener);
+        fs::remove_dir_all(migration_quarantine_dir(&legacy)).unwrap();
         fs::remove_dir_all(legacy.lane_dir()).unwrap();
+        fs::remove_dir_all(project).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migration_helpers_preserve_links_compare_trees_and_keep_duplicate_quarantine_entries() {
+        use std::os::unix::fs::symlink;
+
+        let token = Uuid::new_v4().to_string();
+        let project = std::env::temp_dir().join(format!("worklane-helper-project-{token}"));
+        fs::create_dir_all(&project).unwrap();
+        let mut lane = LaneSpec::new(
+            "helpers".into(),
+            "local".into(),
+            project.clone(),
+            Profile::default(),
+        )
+        .unwrap();
+        lane.id = token;
+        let scratch = lane.lane_dir().join("helper-test");
+        let left = scratch.join("left");
+        let right = scratch.join("right");
+        fs::create_dir_all(left.join("nested")).unwrap();
+        fs::create_dir_all(right.join("nested")).unwrap();
+        fs::write(left.join("nested/file"), b"same").unwrap();
+        fs::write(right.join("nested/file"), b"same").unwrap();
+        assert!(paths_equal(&left, &right).unwrap());
+        fs::write(right.join("nested/file"), b"different").unwrap();
+        assert!(!paths_equal(&left, &right).unwrap());
+
+        let source_link = scratch.join("source-link");
+        let copied_link = scratch.join("copied-link");
+        symlink("nested/file", &source_link).unwrap();
+        copy_for_migration(&lane, &source_link, &copied_link, Path::new("copied-link")).unwrap();
+        assert_eq!(
+            fs::read_link(&copied_link).unwrap(),
+            PathBuf::from("nested/file")
+        );
+        remove_path(&copied_link).unwrap();
+
+        let first = scratch.join("first");
+        let second = scratch.join("second");
+        fs::write(&first, b"first").unwrap();
+        fs::write(&second, b"second").unwrap();
+        let first_destination =
+            quarantine_path(&lane, &first, Path::new("duplicate"), "first").unwrap();
+        let second_destination =
+            quarantine_path(&lane, &second, Path::new("duplicate"), "second").unwrap();
+        assert_ne!(first_destination, second_destination);
+        assert_eq!(fs::read(first_destination).unwrap(), b"first");
+        assert_eq!(fs::read(second_destination).unwrap(), b"second");
+
+        fs::remove_dir_all(migration_quarantine_dir(&lane)).unwrap();
+        fs::remove_dir_all(lane.lane_dir()).unwrap();
         fs::remove_dir_all(project).unwrap();
     }
 

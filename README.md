@@ -74,10 +74,13 @@ controller registry entry and deliberately leaves the manifest and Podman
 state intact. There are no ambiguous archive, destroy, or purge commands.
 
 Legacy lanes are migrated automatically before start, attach, or upgrade. Stop
-a running legacy lane first. Migration preflights every path, aborts before
-copying on a collision, copies and verifies the old hidden home into the
-selected directory, commits the manifest and registry, and only then removes
-the exact legacy lane directory. Existing legacy archives are left untouched.
+a running legacy lane first. Migration copies and verifies supported entries
+from the old hidden home into the selected directory, commits the manifest and
+registry, and only then removes the exact legacy lane directory. Conflicting,
+unsupported, or unreadable entries do not block the lane: they are moved to
+`~/.local/share/worklane/quarantine/<lane-id>/items`, with recovery details in
+`migration.log`. Interrupted migrations resume safely. Existing legacy archives
+are left untouched.
 
 ## Hosts and deployment
 
