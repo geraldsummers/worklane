@@ -98,14 +98,12 @@ pub fn validate_profile(
     if !matches!(profile.network.as_str(), "outbound" | "none") {
         bail!("profile network must be 'outbound' or 'none'")
     }
-    for mount in &profile.mounts {
+    for (index, mount) in profile.mounts.iter().enumerate() {
         if !mount.source.is_absolute() || !mount.target.is_absolute() {
             bail!("profile mount source and target must be absolute paths")
         }
         if mount.target == home
             || mount.target == workspace
-            || mount.target.starts_with(home)
-            || mount.target.starts_with(workspace)
             || home.starts_with(&mount.target)
             || workspace.starts_with(&mount.target)
         {
@@ -116,6 +114,13 @@ pub fn validate_profile(
                 "profile mount source does not exist: {}",
                 mount.source.display()
             )
+        }
+        if profile.mounts[..index].iter().any(|other| {
+            mount.target == other.target
+                || mount.target.starts_with(&other.target)
+                || other.target.starts_with(&mount.target)
+        }) {
+            bail!("profile mount targets must not overlap")
         }
     }
     Ok(())
@@ -146,6 +151,9 @@ pub struct LaneSpec {
     /// Lane-owned data directory name assigned when the lane is created. Missing on legacy lanes.
     #[serde(default, rename = "lane_dir_name")]
     pub lane_dir_name_override: Option<String>,
+    /// Stable Herdr session name. Missing on legacy lanes, which used the display name.
+    #[serde(default, rename = "session_name")]
+    pub session_name_override: Option<String>,
     #[serde(default)]
     pub image_digest: Option<String>,
 }
@@ -156,6 +164,16 @@ pub const CONTAINER_USER: &str = "dev";
 fn default_lane_user() -> String {
     CONTAINER_USER.into()
 }
+pub fn validate_lane_name(name: &str) -> Result<()> {
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        || name.is_empty()
+    {
+        bail!("lane name must contain only letters, digits, '-' or '_'");
+    }
+    Ok(())
+}
 impl LaneSpec {
     pub fn new(
         name: String,
@@ -163,22 +181,16 @@ impl LaneSpec {
         project_path: PathBuf,
         profile: Profile,
     ) -> Result<Self> {
-        if !name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-            || name.is_empty()
-        {
-            bail!("lane name must contain only letters, digits, '-' or '_'");
-        }
+        validate_lane_name(&name)?;
         let id = Uuid::new_v4().to_string();
+        let runtime_name = format!("worklane-{id}");
         Ok(Self {
-            version: 1,
+            version: 2,
             id: id.clone(),
-            container_name_override: Some(name.clone()),
-            container_workspace_override: Some(
-                PathBuf::from("/home").join(CONTAINER_USER).join(&name),
-            ),
-            lane_dir_name_override: Some(name.clone()),
+            container_name_override: Some(runtime_name.clone()),
+            container_workspace_override: Some(PathBuf::from("/home").join(CONTAINER_USER)),
+            lane_dir_name_override: None,
+            session_name_override: Some(runtime_name),
             name,
             host,
             user: default_lane_user(),
@@ -204,7 +216,11 @@ impl LaneSpec {
             .unwrap_or_else(|| self.id.clone())
     }
     pub fn home_dir(&self) -> PathBuf {
-        self.lane_dir().join("home")
+        if self.version >= 2 {
+            self.project_path.clone()
+        } else {
+            self.lane_dir().join("home")
+        }
     }
     pub fn container_home(&self) -> PathBuf {
         PathBuf::from("/home").join(CONTAINER_USER)
@@ -213,6 +229,18 @@ impl LaneSpec {
         self.container_workspace_override
             .clone()
             .unwrap_or_else(|| self.container_home().join("workspace"))
+    }
+    pub fn session_name(&self) -> &str {
+        self.session_name_override
+            .as_deref()
+            .unwrap_or(self.name.as_str())
+    }
+    pub fn manifest_path(&self) -> PathBuf {
+        if self.version >= 2 {
+            self.project_path.join(".worklane").join("lane.toml")
+        } else {
+            lane_toml_path(self)
+        }
     }
 }
 
@@ -340,13 +368,7 @@ impl Store {
     }
     pub fn rename_lane(&self, id: &str, new_name: &str) -> Result<LaneSpec> {
         let mut spec = self.lane(id)?;
-        if !new_name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-            || new_name.is_empty()
-        {
-            bail!("lane name must contain only letters, digits, '-' or '_'")
-        }
+        validate_lane_name(new_name)?;
         spec.name = new_name.into();
         self.save_lane(&spec, "unknown", false)?;
         Ok(spec)
@@ -521,22 +543,158 @@ pub fn meaningful_drift_lines(diff: &str, container_home: &Path) -> Vec<String> 
         .collect()
 }
 pub fn write_lane_spec(spec: &LaneSpec) -> Result<()> {
-    fs::create_dir_all(spec.home_dir())?;
-    fs::write(lane_toml_path(spec), toml::to_string_pretty(spec)?)?;
+    let path = spec.manifest_path();
+    let parent = path.parent().context("lane manifest has no parent")?;
+    fs::create_dir_all(parent)?;
+    let tmp = parent.join(format!(".lane.toml.{}.tmp", Uuid::new_v4()));
+    let body = toml::to_string_pretty(spec)?;
+    fs::write(&tmp, body)?;
+    fs::File::open(&tmp)?.sync_all()?;
+    if let Err(error) = fs::rename(&tmp, &path) {
+        let _ = fs::remove_file(tmp);
+        return Err(error.into());
+    }
+    fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
-pub fn archive_lane(spec: &LaneSpec) -> Result<PathBuf> {
-    let src = spec.lane_dir();
-    let dst = data_dir().join("archives").join(format!(
-        "{}-{}",
-        spec.lane_dir_name(),
-        Utc::now().format("%Y%m%d%H%M%S")
-    ));
-    fs::create_dir_all(dst.parent().unwrap())?;
-    if src.exists() {
-        fs::rename(&src, &dst)?
+
+fn copy_verified(src: &Path, dst: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(src)?;
+    if metadata.file_type().is_symlink() {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(fs::read_link(src)?, dst)?;
+        #[cfg(not(unix))]
+        bail!("lane migration cannot preserve symlinks on this platform");
+    } else if metadata.is_dir() {
+        fs::create_dir(dst)?;
+        for entry in fs::read_dir(src)? {
+            let entry = entry?;
+            copy_verified(&entry.path(), &dst.join(entry.file_name()))?;
+        }
+        fs::set_permissions(dst, metadata.permissions())?;
+    } else if metadata.is_file() {
+        fs::copy(src, dst)?;
+        fs::set_permissions(dst, metadata.permissions())?;
+        if sha256_file(src)? != sha256_file(dst)? {
+            bail!("copied file failed verification: {}", src.display())
+        }
+    } else {
+        bail!("unsupported file type in legacy home: {}", src.display())
+    }
+    Ok(())
+}
+
+fn paths_equal(left: &Path, right: &Path) -> Result<bool> {
+    let left_meta = fs::symlink_metadata(left)?;
+    let right_meta = fs::symlink_metadata(right)?;
+    if left_meta.file_type().is_symlink() && right_meta.file_type().is_symlink() {
+        return Ok(fs::read_link(left)? == fs::read_link(right)?);
+    }
+    if left_meta.is_file() && right_meta.is_file() {
+        return Ok(sha256_file(left)? == sha256_file(right)?);
+    }
+    if !left_meta.is_dir() || !right_meta.is_dir() {
+        return Ok(false);
+    }
+    let mut left_names = fs::read_dir(left)?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut right_names = fs::read_dir(right)?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<Result<Vec<_>, _>>()?;
+    left_names.sort();
+    right_names.sort();
+    if left_names != right_names {
+        return Ok(false);
+    }
+    for name in left_names {
+        if !paths_equal(&left.join(&name), &right.join(name))? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Copy a legacy hidden home into the user-selected directory without removing
+/// the source. Repeated calls resume an interrupted, verified migration.
+pub fn prepare_lane_migration(spec: &LaneSpec) -> Result<LaneSpec> {
+    if spec.version >= 2 {
+        return Ok(spec.clone());
+    }
+    if !spec.project_path.is_dir() {
+        bail!(
+            "lane project directory does not exist: {}",
+            spec.project_path.display()
+        )
+    }
+    let source = spec.home_dir();
+    let control = spec.project_path.join(".worklane");
+    let marker = control.join("migration-v1");
+    let resuming = marker.exists();
+    if control.exists() && !resuming {
+        bail!(
+            "migration target already contains reserved path: {}",
+            control.display()
+        )
+    }
+    let entries = if source.exists() {
+        fs::read_dir(&source)?.collect::<Result<Vec<_>, _>>()?
+    } else {
+        Vec::new()
     };
-    Ok(dst)
+    for entry in &entries {
+        if entry.file_name() == ".worklane" {
+            bail!("legacy home contains reserved path '.worklane'")
+        }
+        let target = spec.project_path.join(entry.file_name());
+        if target.exists() && (!resuming || !paths_equal(&entry.path(), &target)?) {
+            bail!("migration path collision: {}", target.display())
+        }
+    }
+    fs::create_dir_all(&control)?;
+    fs::write(&marker, format!("{}\n", spec.id))?;
+    let staging = control.join("migration-staging");
+    fs::create_dir_all(&staging)?;
+    for entry in entries {
+        let target = spec.project_path.join(entry.file_name());
+        if target.exists() {
+            continue;
+        }
+        let staged = staging.join(entry.file_name());
+        if staged.exists() {
+            fs::remove_dir_all(&staged).or_else(|_| fs::remove_file(&staged))?;
+        }
+        copy_verified(&entry.path(), &staged)?;
+        fs::rename(&staged, &target)?;
+    }
+    let mut migrated = spec.clone();
+    migrated.version = 2;
+    migrated.container_workspace_override = Some(migrated.container_home());
+    migrated.session_name_override = Some(spec.name.clone());
+    Ok(migrated)
+}
+
+/// Remove only Worklane's exact legacy storage after the migrated manifest and
+/// registry record have been committed.
+pub fn finish_lane_migration(old_spec: &LaneSpec, migrated: &mut LaneSpec) -> Result<()> {
+    if old_spec.version >= 2 {
+        return Ok(());
+    }
+    let legacy = old_spec.lane_dir();
+    if legacy.exists() {
+        fs::remove_dir_all(&legacy)?;
+    }
+    let control = migrated.project_path.join(".worklane");
+    let staging = control.join("migration-staging");
+    if staging.exists() {
+        fs::remove_dir_all(staging)?;
+    }
+    let marker = control.join("migration-v1");
+    if marker.exists() {
+        fs::remove_file(marker)?;
+    }
+    migrated.lane_dir_name_override = None;
+    Ok(())
 }
 pub fn image_digest(r: &impl Runner, image: &str) -> Result<String> {
     let out = podman(r, ["image", "inspect", "--format", "{{.Digest}}", image])?;
@@ -663,7 +821,7 @@ mod tests {
     }
 
     #[test]
-    fn new_lanes_use_lane_names_and_legacy_lanes_keep_their_container_name() {
+    fn new_lanes_use_stable_runtime_names_and_mount_the_selected_directory_as_home() {
         let spec = LaneSpec::new(
             "docs".into(),
             "local".into(),
@@ -671,17 +829,25 @@ mod tests {
             Profile::default(),
         )
         .unwrap();
-        assert_eq!(spec.container_name(), "docs");
+        assert!(spec.container_name().starts_with("worklane-"));
+        assert_eq!(spec.session_name(), spec.container_name());
+        assert_eq!(spec.home_dir(), PathBuf::from("/tmp"));
+        assert_eq!(spec.container_workspace(), PathBuf::from("/home/dev"));
+        assert_eq!(
+            spec.manifest_path(),
+            PathBuf::from("/tmp/.worklane/lane.toml")
+        );
         let mut legacy = spec.clone();
+        legacy.version = 1;
         legacy.container_name_override = None;
         legacy.container_workspace_override = None;
         legacy.lane_dir_name_override = None;
+        legacy.session_name_override = None;
         assert_eq!(
             legacy.container_name(),
             format!("worklane-{}", &legacy.id[..8])
         );
-        assert_eq!(spec.container_workspace(), PathBuf::from("/home/dev/docs"));
-        assert_eq!(spec.lane_dir_name(), "docs");
+        assert_eq!(spec.lane_dir_name(), spec.id);
         assert_eq!(
             legacy.container_workspace(),
             PathBuf::from("/home/dev/workspace")
@@ -723,6 +889,18 @@ mod tests {
             Path::new("/home/gerald/workspace"),
             false
         )
+        .is_ok());
+        profile.mounts.push(MountSpec {
+            source: PathBuf::from("/var/tmp"),
+            target: PathBuf::from("/home/gerald/workspace/tools/nested"),
+            read_only: true,
+        });
+        assert!(validate_profile(
+            &profile,
+            Path::new("/home/gerald"),
+            Path::new("/home/gerald/workspace"),
+            false
+        )
         .is_err());
         profile.mounts.clear();
         profile.mounts.push(MountSpec {
@@ -745,6 +923,75 @@ mod tests {
             false
         )
         .is_err());
+    }
+
+    #[test]
+    fn legacy_home_migration_merges_verified_data_and_preserves_source_until_commit() {
+        let token = Uuid::new_v4().to_string();
+        let project = std::env::temp_dir().join(format!("worklane-migration-project-{token}"));
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("project.txt"), b"project").unwrap();
+        let mut legacy = LaneSpec::new(
+            "legacy".into(),
+            "local".into(),
+            project.clone(),
+            Profile::default(),
+        )
+        .unwrap();
+        legacy.version = 1;
+        legacy.lane_dir_name_override = Some(format!("migration-test-{token}"));
+        legacy.container_workspace_override = None;
+        legacy.session_name_override = None;
+        let source = legacy.home_dir();
+        fs::create_dir_all(source.join(".cache/tool")).unwrap();
+        fs::write(source.join(".zshrc"), b"legacy shell").unwrap();
+        fs::write(source.join(".cache/tool/state"), b"cached").unwrap();
+
+        let mut migrated = prepare_lane_migration(&legacy).unwrap();
+        assert_eq!(migrated.version, 2);
+        assert_eq!(migrated.home_dir(), project);
+        assert_eq!(fs::read(project.join(".zshrc")).unwrap(), b"legacy shell");
+        assert_eq!(
+            fs::read(project.join(".cache/tool/state")).unwrap(),
+            b"cached"
+        );
+        assert!(source.exists());
+        assert!(project.join(".worklane/migration-v1").exists());
+
+        write_lane_spec(&migrated).unwrap();
+        finish_lane_migration(&legacy, &mut migrated).unwrap();
+        write_lane_spec(&migrated).unwrap();
+        assert!(!source.exists());
+        assert!(!project.join(".worklane/migration-v1").exists());
+        assert!(project.join(".worklane/lane.toml").exists());
+        fs::remove_dir_all(project).unwrap();
+    }
+
+    #[test]
+    fn legacy_home_migration_rejects_collisions_before_copying() {
+        let token = Uuid::new_v4().to_string();
+        let project = std::env::temp_dir().join(format!("worklane-collision-project-{token}"));
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join(".zshrc"), b"project shell").unwrap();
+        let mut legacy = LaneSpec::new(
+            "collision".into(),
+            "local".into(),
+            project.clone(),
+            Profile::default(),
+        )
+        .unwrap();
+        legacy.version = 1;
+        legacy.lane_dir_name_override = Some(format!("collision-test-{token}"));
+        let source = legacy.home_dir();
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join(".zshrc"), b"legacy shell").unwrap();
+
+        let error = prepare_lane_migration(&legacy).unwrap_err().to_string();
+        assert!(error.contains("migration path collision"));
+        assert!(!project.join(".worklane").exists());
+        assert_eq!(fs::read(project.join(".zshrc")).unwrap(), b"project shell");
+        fs::remove_dir_all(legacy.lane_dir()).unwrap();
+        fs::remove_dir_all(project).unwrap();
     }
 
     #[test]

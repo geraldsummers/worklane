@@ -28,16 +28,18 @@ struct App {
     message: String,
     confirming_delete: bool,
     confirming_forget: bool,
-    upgrade: Option<Receiver<UpgradeEvent>>,
+    rename_input: Option<String>,
+    job: Option<Receiver<JobEvent>>,
     state_poll: Option<Receiver<StatePollResult>>,
     state_poll_pending: usize,
 }
-enum UpgradeEvent {
+enum JobEvent {
     Progress(String),
-    Complete(UpgradeResult),
+    Complete(JobResult),
 }
-struct UpgradeResult {
-    label: &'static str,
+struct JobResult {
+    label: String,
+    verb: String,
     output: Result<CommandOutput, String>,
 }
 struct CommandOutput {
@@ -55,6 +57,7 @@ enum UiAction {
     None,
     Quit,
     Command(&'static str, bool),
+    Rename(String),
     UpgradeAll,
     Reload,
     EditContainerfile,
@@ -72,7 +75,8 @@ impl App {
             message: String::new(),
             confirming_delete: false,
             confirming_forget: false,
-            upgrade: None,
+            rename_input: None,
+            job: None,
             state_poll: None,
             state_poll_pending: 0,
         };
@@ -86,6 +90,29 @@ impl App {
             .collect()
     }
     fn handle_key(&mut self, key: KeyCode) -> UiAction {
+        if let Some(input) = &mut self.rename_input {
+            return match key {
+                KeyCode::Esc => {
+                    self.rename_input = None;
+                    self.message = "rename cancelled".into();
+                    UiAction::None
+                }
+                KeyCode::Enter if !input.is_empty() => {
+                    let name = input.clone();
+                    self.rename_input = None;
+                    UiAction::Rename(name)
+                }
+                KeyCode::Backspace => {
+                    input.pop();
+                    UiAction::None
+                }
+                KeyCode::Char(c) => {
+                    input.push(c);
+                    UiAction::None
+                }
+                _ => UiAction::None,
+            };
+        }
         if self.filtering {
             return match key {
                 KeyCode::Esc => {
@@ -177,6 +204,11 @@ impl App {
                 UiAction::None
             }
             KeyCode::Char('i') => UiAction::Command("inspect", false),
+            KeyCode::Char('n') if self.visible().get(self.selected).is_some() => {
+                self.rename_input = Some(String::new());
+                self.message = "enter a new lane name; Enter saves, Esc cancels".into();
+                UiAction::None
+            }
             KeyCode::Char('r') => UiAction::Reload,
             KeyCode::Char('e') => UiAction::EditContainerfile,
             KeyCode::Char('/') => {
@@ -212,6 +244,9 @@ fn sort_lanes(lanes: &mut [LaneStatus]) {
             .cmp(&a.spec.last_attached)
             .then_with(|| a.spec.name.cmp(&b.spec.name))
     });
+}
+fn clamp_selection(app: &mut App) {
+    app.selected = app.selected.min(app.visible().len().saturating_sub(1));
 }
 fn action(app: &mut App, verb: &str) -> Result<()> {
     action_with_args(app, verb, &[])
@@ -301,41 +336,57 @@ fn action_with_args(app: &mut App, verb: &str, extra: &[&str]) -> Result<()> {
         app.message = format!("{verb}: ok");
         app.lanes = load_cached_lanes()?;
         sort_lanes(&mut app.lanes);
+        clamp_selection(app);
     } else {
         app.message = format!("{verb}: failed");
         app.detail = String::from_utf8_lossy(&output.stderr).trim().into();
     }
     Ok(())
 }
-fn start_upgrade(app: &mut App, all: bool) -> Result<()> {
-    if app.upgrade.is_some() {
-        app.message = "upgrade already running".into();
+fn start_job(app: &mut App, verb: &str, extra: &[String], all: bool) -> Result<()> {
+    if app.job.is_some() {
+        app.message = "another action is already running".into();
         return Ok(());
     }
     let args = if all {
-        vec!["lane".into(), "upgrade".into(), "--all".into()]
+        vec!["lane".into(), verb.into(), "--all".into()]
     } else {
         let visible = app.visible();
         let Some(item) = visible.get(app.selected) else {
             return Ok(());
         };
-        vec!["lane".into(), "upgrade".into(), item.spec.id.clone()]
+        let mut args = vec!["lane".into(), verb.into(), item.spec.id.clone()];
+        args.extend(extra.iter().cloned());
+        args
     };
-    let label = if all { "upgrade all" } else { "upgrade" };
+    let label = if all {
+        format!("{verb} all")
+    } else {
+        verb.to_string()
+    };
+    let worker_label = label.clone();
+    let worker_verb = verb.to_string();
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
         let output = run_verbose_command("worklane", &args, &sender);
-        let _ = sender.send(UpgradeEvent::Complete(UpgradeResult { label, output }));
+        let _ = sender.send(JobEvent::Complete(JobResult {
+            label: worker_label,
+            verb: worker_verb,
+            output,
+        }));
     });
-    app.upgrade = Some(receiver);
+    app.job = Some(receiver);
     app.message = format!("{label}: running in background");
     app.detail = format!("{label}: starting");
     Ok(())
 }
+fn start_upgrade(app: &mut App, all: bool) -> Result<()> {
+    start_job(app, "upgrade", &[], all)
+}
 fn run_verbose_command(
     program: &str,
     args: &[String],
-    sender: &mpsc::Sender<UpgradeEvent>,
+    sender: &mpsc::Sender<JobEvent>,
 ) -> Result<CommandOutput, String> {
     let mut child = Command::new(program)
         .args(args)
@@ -353,13 +404,13 @@ fn run_verbose_command(
                 Ok(line) => {
                     bytes.extend_from_slice(line.as_bytes());
                     bytes.push(b'\n');
-                    let _ = progress_sender.send(UpgradeEvent::Progress(line));
+                    let _ = progress_sender.send(JobEvent::Progress(line));
                 }
                 Err(error) => {
                     let line = format!("failed to read progress: {error}");
                     bytes.extend_from_slice(line.as_bytes());
                     bytes.push(b'\n');
-                    let _ = progress_sender.send(UpgradeEvent::Progress(line));
+                    let _ = progress_sender.send(JobEvent::Progress(line));
                     break;
                 }
             }
@@ -380,23 +431,43 @@ fn run_verbose_command(
         stderr,
     })
 }
-fn poll_upgrade(app: &mut App) -> Result<()> {
-    let Some(receiver) = app.upgrade.take() else {
+fn poll_job(app: &mut App) -> Result<()> {
+    let Some(receiver) = app.job.take() else {
         return Ok(());
     };
     loop {
         match receiver.try_recv() {
-            Ok(UpgradeEvent::Progress(line)) => {
-                app.message = "upgrade running; lane controls locked".into();
+            Ok(JobEvent::Progress(line)) => {
+                app.message = "action running; lane controls locked".into();
                 append_detail_line(app, &line);
             }
-            Ok(UpgradeEvent::Complete(result)) => {
+            Ok(JobEvent::Complete(result)) => {
                 match result.output {
                     Ok(output) if output.success => {
-                        app.detail = upgrade_detail(&output.stdout)?;
+                        app.detail = match result.verb.as_str() {
+                            "upgrade" => upgrade_detail(&output.stdout)?,
+                            "diff" => {
+                                let value: serde_json::Value =
+                                    serde_json::from_slice(&output.stdout)?;
+                                let lines = value["diff"]
+                                    .as_array()
+                                    .into_iter()
+                                    .flatten()
+                                    .filter_map(serde_json::Value::as_str)
+                                    .collect::<Vec<_>>();
+                                if lines.is_empty() {
+                                    "No meaningful writable-root changes.".into()
+                                } else {
+                                    lines.join("\n")
+                                }
+                            }
+                            "inspect" => inspect_detail(&output.stdout)?,
+                            _ => String::new(),
+                        };
                         app.message = format!("{}: completed", result.label);
                         app.lanes = load_cached_lanes()?;
                         sort_lanes(&mut app.lanes);
+                        clamp_selection(app);
                     }
                     Ok(output) => {
                         app.message = format!("{}: failed", result.label);
@@ -410,11 +481,11 @@ fn poll_upgrade(app: &mut App) -> Result<()> {
                 return Ok(());
             }
             Err(TryRecvError::Empty) => {
-                app.upgrade = Some(receiver);
+                app.job = Some(receiver);
                 return Ok(());
             }
             Err(TryRecvError::Disconnected) => {
-                app.message = "upgrade worker stopped unexpectedly".into();
+                app.message = "action worker stopped unexpectedly".into();
                 return Ok(());
             }
         }
@@ -536,6 +607,7 @@ fn update_lane_status(app: &mut App, status: LaneStatus) {
         *lane = status;
     }
     sort_lanes(&mut app.lanes);
+    clamp_selection(app);
 }
 fn mark_lane_state(app: &mut App, lane_id: &str, state: &str, drift: bool) {
     if let Some(lane) = app.lanes.iter_mut().find(|lane| lane.spec.id == lane_id) {
@@ -550,6 +622,7 @@ fn refresh_all(app: &mut App) {
             lane.drift = false;
         }
         sort_lanes(&mut app.lanes);
+        clamp_selection(app);
         app.detail.clear();
     }
     start_state_poll(app);
@@ -618,14 +691,14 @@ fn run_app(
     mut next_key: impl FnMut() -> Result<Option<KeyCode>>,
 ) -> Result<()> {
     loop {
-        poll_upgrade(app)?;
+        poll_job(app)?;
         poll_state(app)?;
         redraw(app)?;
         let Some(key) = next_key()? else {
             continue;
         };
-        if app.upgrade.is_some() && key != KeyCode::Char('q') {
-            app.message = "upgrade running; lane controls locked".into();
+        if app.job.is_some() && key != KeyCode::Char('q') {
+            app.message = "action running; lane controls locked".into();
             continue;
         }
         match app.handle_key(key) {
@@ -638,11 +711,14 @@ fn run_app(
             }
             UiAction::Command("upgrade", false) => start_upgrade(app, false)?,
             UiAction::Command(verb, false) => {
-                action(app, verb)?;
                 if verb == "attach" {
+                    action(app, verb)?;
                     break;
+                } else {
+                    start_job(app, verb, &[], false)?;
                 }
             }
+            UiAction::Rename(name) => start_job(app, "rename", &[name], false)?,
             UiAction::Reload => {
                 refresh_all(app);
             }
@@ -739,8 +815,10 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         ),
         areas[0],
     );
-    f.render_widget(
-        Paragraph::new(format!(
+    let input_line = if let Some(name) = &app.rename_input {
+        format!("Rename (typing; Enter saves, Esc cancels): {name}")
+    } else {
+        format!(
             "Filter{}: {}",
             if app.filtering {
                 " (typing; Enter keeps, Esc clears)"
@@ -748,8 +826,10 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                 " (/ to edit)"
             },
             app.filter
-        ))
-        .block(Block::default().borders(Borders::ALL)),
+        )
+    };
+    f.render_widget(
+        Paragraph::new(input_line).block(Block::default().borders(Borders::ALL)),
         areas[1],
     );
     if !app.detail.is_empty() {
@@ -765,7 +845,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     f.render_widget(
         Paragraph::new(format!(
             "{}\n\
-             j/k mv  / filt  Esc  q  a/S attach  s/x run  d diff  D del  F forget  i info  e edit  u/U up  r ref",
+             j/k  /  Esc q  a/S attach  s/x run  n rename  d diff  D del  F forget  i info  e edit  u/U up  r",
             if app.message.is_empty() {
                 "ready"
             } else {
@@ -809,7 +889,8 @@ mod tests {
             message: String::new(),
             confirming_delete: false,
             confirming_forget: false,
-            upgrade: None,
+            rename_input: None,
+            job: None,
             state_poll: None,
             state_poll_pending: 0,
         }
@@ -857,6 +938,18 @@ mod tests {
             app.handle_key(KeyCode::Char('d')),
             UiAction::Command("diff", false)
         );
+        assert_eq!(app.handle_key(KeyCode::Char('n')), UiAction::None);
+        assert_eq!(app.rename_input.as_deref(), Some(""));
+        app.handle_key(KeyCode::Char('b'));
+        app.handle_key(KeyCode::Char('e'));
+        app.handle_key(KeyCode::Backspace);
+        assert_eq!(app.handle_key(KeyCode::Enter), UiAction::Rename("b".into()));
+        assert!(app.rename_input.is_none());
+        app.handle_key(KeyCode::Char('n'));
+        assert_eq!(app.handle_key(KeyCode::Enter), UiAction::None);
+        assert_eq!(app.handle_key(KeyCode::F(2)), UiAction::None);
+        assert_eq!(app.handle_key(KeyCode::Esc), UiAction::None);
+        assert!(app.rename_input.is_none());
         assert_eq!(app.handle_key(KeyCode::Char('D')), UiAction::None);
         assert!(app.confirming_delete);
         assert!(app.message.contains("Bind-mounted data is preserved"));
@@ -889,6 +982,9 @@ mod tests {
         app.handle_key(KeyCode::Char('/'));
         app.handle_key(KeyCode::Char('z'));
         assert_eq!(app.filter, "z");
+        app.handle_key(KeyCode::Backspace);
+        assert!(app.filter.is_empty());
+        assert_eq!(app.handle_key(KeyCode::F(3)), UiAction::None);
         app.handle_key(KeyCode::Esc);
         assert!(app.filter.is_empty());
         app.handle_key(KeyCode::Down);
@@ -907,6 +1003,19 @@ mod tests {
         assert_eq!(
             lane_style("unknown", true).fg,
             Some(Color::Rgb(230, 69, 190))
+        );
+        assert_eq!(
+            upgrade_detail(br#"[]"#).unwrap(),
+            "No lanes were selected for upgrade."
+        );
+        assert_eq!(
+            upgrade_detail(br#"[{"lane":"alpha","outcome":"skipped"}]"#).unwrap(),
+            "alpha: skipped"
+        );
+        assert!(
+            upgrade_detail(br#"[{"spec":{"name":"alpha"},"state":"running","drift":true}]"#)
+                .unwrap()
+                .contains("(drift)")
         );
     }
 
@@ -1012,6 +1121,51 @@ mod tests {
                 .state,
             "running"
         );
+
+        let (sender, receiver) = mpsc::channel();
+        app.state_poll = Some(receiver);
+        app.state_poll_pending = 1;
+        let failed_output = Command::new("sh")
+            .args(["-c", "printf failure >&2; exit 1"])
+            .output()
+            .unwrap();
+        sender
+            .send(StatePollResult {
+                lane_id: beta.spec.id.clone(),
+                lane_name: beta.spec.name.clone(),
+                output: Ok(failed_output),
+            })
+            .unwrap();
+        poll_state(&mut app).unwrap();
+        assert_eq!(app.detail, "failure");
+
+        let (sender, receiver) = mpsc::channel();
+        app.state_poll = Some(receiver);
+        app.state_poll_pending = 1;
+        sender
+            .send(StatePollResult {
+                lane_id: beta.spec.id.clone(),
+                lane_name: beta.spec.name.clone(),
+                output: Err("offline".into()),
+            })
+            .unwrap();
+        poll_state(&mut app).unwrap();
+        assert_eq!(app.message, "state checks complete");
+        assert_eq!(app.detail, "offline");
+
+        let (sender, receiver) = mpsc::channel();
+        app.state_poll = Some(receiver);
+        app.state_poll_pending = 1;
+        drop(sender);
+        poll_state(&mut app).unwrap();
+        assert!(app.message.contains("stopped with 1 pending"));
+
+        let (sender, receiver) = mpsc::channel::<StatePollResult>();
+        app.state_poll = Some(receiver);
+        app.state_poll_pending = 0;
+        drop(sender);
+        poll_state(&mut app).unwrap();
+        assert_eq!(app.message, "state checks complete");
     }
 
     #[test]
@@ -1024,7 +1178,7 @@ mod tests {
         let worklane = bin.join("worklane");
         fs::write(
             &worklane,
-            "#!/bin/sh\nstatus='{\"spec\":{\"version\":1,\"id\":\"alpha-id\",\"name\":\"alpha\",\"host\":\"lab\",\"user\":\"dev\",\"project_path\":\"/tmp\",\"profile\":{\"image\":\"test:latest\",\"build_context\":null,\"containerfile\":\"Containerfile\",\"embedded_containerfile\":true,\"network\":\"outbound\",\"mounts\":[]},\"profile_name\":\"default\",\"created_at\":\"2026-01-01T00:00:00Z\",\"image_digest\":null},\"state\":\"running\",\"drift\":false,\"cached_at\":\"2026-01-01T00:00:00Z\"}'\ncase \"$*\" in *diff*) printf '{\"diff\":[]}\\n';; *inspect*) printf '%s\\n' \"$status\";; *upgrade*) printf 'building alpha\\n' >&2; printf '[%s]\\n' \"$status\";; *refresh*) printf '[%s]\\n' \"$status\";; esac\nexit 0\n",
+            "#!/bin/sh\nstatus='{\"spec\":{\"version\":1,\"id\":\"alpha-id\",\"name\":\"alpha\",\"host\":\"lab\",\"user\":\"dev\",\"project_path\":\"/tmp\",\"profile\":{\"image\":\"test:latest\",\"build_context\":null,\"containerfile\":\"Containerfile\",\"embedded_containerfile\":true,\"network\":\"outbound\",\"mounts\":[]},\"profile_name\":\"default\",\"created_at\":\"2026-01-01T00:00:00Z\",\"image_digest\":null},\"state\":\"running\",\"drift\":false,\"cached_at\":\"2026-01-01T00:00:00Z\"}'\ncase \"$*\" in *fail*) printf 'command failed\\n' >&2; exit 1;; *diff*) printf '{\"diff\":[]}\\n';; *inspect*) printf '%s\\n' \"$status\";; *upgrade*) printf 'building alpha\\n' >&2; printf '[%s]\\n' \"$status\";; *refresh*) printf '[%s]\\n' \"$status\";; esac\nexit 0\n",
         )
         .unwrap();
         #[cfg(unix)]
@@ -1062,16 +1216,118 @@ mod tests {
         assert!(app.detail.contains("State: running"));
         action(&mut app, "upgrade").unwrap();
         assert_eq!(app.detail, "alpha: running");
+        action(&mut app, "fail").unwrap();
+        assert_eq!(app.message, "fail: failed");
+        assert_eq!(app.detail, "command failed");
         start_upgrade(&mut app, true).unwrap();
         for _ in 0..100 {
-            poll_upgrade(&mut app).unwrap();
-            if app.upgrade.is_none() {
+            poll_job(&mut app).unwrap();
+            if app.job.is_none() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(app.message, "upgrade all: completed");
         assert!(app.detail.contains("alpha: running"));
+        start_job(&mut app, "rename", &["renamed".into()], false).unwrap();
+        start_job(&mut app, "start", &[], false).unwrap();
+        assert_eq!(app.message, "another action is already running");
+        for _ in 0..100 {
+            poll_job(&mut app).unwrap();
+            if app.job.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(app.message, "rename: completed");
+
+        let (sender, receiver) = mpsc::channel();
+        app.job = Some(receiver);
+        sender.send(JobEvent::Progress("working".into())).unwrap();
+        sender
+            .send(JobEvent::Complete(JobResult {
+                label: "diff".into(),
+                verb: "diff".into(),
+                output: Ok(CommandOutput {
+                    success: true,
+                    stdout: br#"{"diff":["A /opt/result"]}"#.to_vec(),
+                    stderr: vec![],
+                }),
+            }))
+            .unwrap();
+        poll_job(&mut app).unwrap();
+        assert_eq!(app.detail, "A /opt/result");
+
+        let (sender, receiver) = mpsc::channel();
+        app.job = Some(receiver);
+        sender
+            .send(JobEvent::Complete(JobResult {
+                label: "diff".into(),
+                verb: "diff".into(),
+                output: Ok(CommandOutput {
+                    success: true,
+                    stdout: br#"{"diff":[]}"#.to_vec(),
+                    stderr: vec![],
+                }),
+            }))
+            .unwrap();
+        poll_job(&mut app).unwrap();
+        assert_eq!(app.detail, "No meaningful writable-root changes.");
+
+        let (sender, receiver) = mpsc::channel();
+        app.job = Some(receiver);
+        sender
+            .send(JobEvent::Complete(JobResult {
+                label: "inspect".into(),
+                verb: "inspect".into(),
+                output: Ok(CommandOutput {
+                    success: true,
+                    stdout: br#"{"spec":{"name":"alpha","host":"lab","project_path":"/tmp","profile":{"image":"test"}},"state":"running","drift":true}"#.to_vec(),
+                    stderr: vec![],
+                }),
+            }))
+            .unwrap();
+        poll_job(&mut app).unwrap();
+        assert!(app.detail.contains("(drift)"));
+
+        let (sender, receiver) = mpsc::channel();
+        app.job = Some(receiver);
+        sender
+            .send(JobEvent::Complete(JobResult {
+                label: "start".into(),
+                verb: "start".into(),
+                output: Ok(CommandOutput {
+                    success: false,
+                    stdout: vec![],
+                    stderr: b"runtime failed".to_vec(),
+                }),
+            }))
+            .unwrap();
+        poll_job(&mut app).unwrap();
+        assert_eq!(app.detail, "runtime failed");
+
+        let (sender, receiver) = mpsc::channel();
+        app.job = Some(receiver);
+        sender
+            .send(JobEvent::Complete(JobResult {
+                label: "stop".into(),
+                verb: "stop".into(),
+                output: Err("spawn failed".into()),
+            }))
+            .unwrap();
+        poll_job(&mut app).unwrap();
+        assert_eq!(app.detail, "spawn failed");
+
+        let (sender, receiver) = mpsc::channel::<JobEvent>();
+        app.job = Some(receiver);
+        drop(sender);
+        poll_job(&mut app).unwrap();
+        assert_eq!(app.message, "action worker stopped unexpectedly");
+        app.detail.clear();
+        for index in 0..205 {
+            append_detail_line(&mut app, &format!("line {index}"));
+        }
+        assert_eq!(app.detail.lines().count(), 200);
         let mut loaded = App::load().unwrap();
         for _ in 0..100 {
             poll_state(&mut loaded).unwrap();
@@ -1084,8 +1340,6 @@ mod tests {
         let mut keys = vec![
             None,
             Some(KeyCode::Backspace),
-            Some(KeyCode::Char('s')),
-            Some(KeyCode::Char('x')),
             Some(KeyCode::Char('r')),
             Some(KeyCode::Char('q')),
         ]
@@ -1100,7 +1354,7 @@ mod tests {
             || Ok(keys.next().expect("test has a key for every redraw")),
         )
         .unwrap();
-        assert_eq!(redraws, 6);
+        assert_eq!(redraws, 4);
         assert!(
             app.message.starts_with("checking lane states:")
                 || app.message == "state checks complete",
@@ -1108,7 +1362,7 @@ mod tests {
             app.message
         );
         let (sender, receiver) = mpsc::channel();
-        app.upgrade = Some(receiver);
+        app.job = Some(receiver);
         let _sender = sender;
         let mut locked_keys = vec![Some(KeyCode::Char('s')), Some(KeyCode::Char('q'))].into_iter();
         let mut locked_redraws = 0;
@@ -1122,8 +1376,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(locked_redraws, 2);
-        assert_eq!(app.message, "upgrade running; lane controls locked");
-        app.upgrade = None;
+        assert_eq!(app.message, "action running; lane controls locked");
+        app.job = None;
         let mut attach_key = Some(KeyCode::Char('a'));
         let mut attach_redraws = 0;
         run_app(
@@ -1145,11 +1399,13 @@ mod tests {
             message: String::new(),
             confirming_delete: false,
             confirming_forget: false,
-            upgrade: None,
+            rename_input: None,
+            job: None,
             state_poll: None,
             state_poll_pending: 0,
         };
         action(&mut empty, "start").unwrap();
+        start_job(&mut empty, "start", &[], false).unwrap();
         if let Some(value) = previous_data {
             env::set_var("XDG_DATA_HOME", value);
         } else {
@@ -1199,6 +1455,7 @@ mod tests {
         assert!(text.contains("Controls"));
         assert!(text.contains("Esc"));
         assert!(text.contains("a/S attach"));
+        assert!(text.contains("n rename"));
         assert!(text.contains("D del"));
         assert!(text.contains("F forget"));
         assert!(text.contains("u/U up"));

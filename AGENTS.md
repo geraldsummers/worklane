@@ -7,7 +7,7 @@ system image from inside the lane.
 
 Use these locations for additions and generated state:
 
-- Project dependencies and generated files: `/home/dev/<lane-name>`
+- Project dependencies and generated files: `/home/dev`
 - Personal tools and binaries: `/home/dev/.local/bin`
 - Python virtual environments: `/home/dev/.venv` or a project `.venv`
 - Node global packages: `/home/dev/.local`
@@ -20,8 +20,26 @@ The base image already provides common build, debugging, search, archive, networ
 language tooling. Prefer the installed tool before adding a new one.
 
 Herdr is the lane session manager. A normal `worklane lane attach` enters the lane through
-`herdr --session <lane-name>`, with the lane workspace focused at `/home/dev/<lane-name>`.
+a stable lane session, with the lane workspace focused at `/home/dev`.
 Use Herdr-managed sessions unless the user explicitly asks for a plain shell.
+
+## Git and agent coordination
+
+- Before editing repository files, inspect `git status --short`. Treat existing
+  dirty and untracked files as user-owned unless the user explicitly says
+  otherwise.
+- Agents may delegate concrete, bounded subtasks to other agents when useful
+  and remain responsible for the combined result.
+- Coordinate through `$HOME/.local/share/worklane/agent-work/`. Use one
+  Markdown claim per agent named `agent--<id>.md`, where the canonical agent ID
+  loses its leading `/` and every remaining `/` becomes `--`. For example,
+  `/root/api` uses `agent--root--api.md`.
+- Read all claims at the start of every turn and immediately before editing.
+  Each agent updates and removes only its own file. Record the agent ID,
+  files/area, status, and an updated UTC timestamp. Treat claims as advisory
+  soft locks and coordinate before overlapping.
+- Before pushing, run the repository's CI-equivalent tests and validation
+  locally. Do not push while a required local check fails.
 
 ## Fresh dist builds
 

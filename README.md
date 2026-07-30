@@ -1,6 +1,10 @@
 # Worklane
 
-Rust-native management for disposable, rootless Podman development lanes. A lane keeps its `/home/dev` in host storage and bind-mounts its project at `/home/dev/<lane-name>`; the container root filesystem is read-only and intentionally disposable. Agents have no `sudo`; user-space tooling belongs under `/home/dev`.
+Rust-native management for disposable, rootless Podman development lanes. The
+directory selected for a lane is mounted once, as the container's `/home/dev`
+and working directory. Project files, dotfiles, caches, agent state, and
+user-space tools therefore remain together in the user-managed directory. The
+container root filesystem is read-only and intentionally disposable.
 
 ## Build
 
@@ -19,9 +23,11 @@ worklane completions zsh > ~/.zfunc/_worklane
 ```
 
 On first startup, Worklane seeds its embedded standard image recipe to
-`~/.local/share/worklane/Containerfile`. The file is never overwritten, so it can be customized
-directly or opened with `worklane image edit` (the `e` key in `lane`). Standard image builds and
-lane upgrades use this file. Pass `--file PATH` to override it for a single build. Worklane v1
+`~/.local/share/worklane/Containerfile`. Custom edits are preserved, while a
+recognized older stock recipe can be refreshed by a newer binary. Open it with
+`worklane image edit` (the `e` key in `lane`). Standard image builds and
+lane upgrades use this file. Pass `--file PATH` to override it for a single build and
+`--no-cache` only when a clean Podman build is required. Worklane currently
 deliberately has no OCI registry: each host builds and retains its own Podman image.
 
 The standard image includes Python (pip and venv), Node.js/npm, TypeScript,
@@ -41,8 +47,9 @@ the lane starts. `lane attach` starts or reattaches the lane's default persisten
 Detach with `Ctrl-B q`; panes and agents keep running in the lane. Use
 `worklane lane attach my-project --shell` for a plain zsh login shell. Use
 Herdr's own session commands only after attaching when you deliberately need a
-separate Herdr server. On the first Herdr attach, Worklane installs Herdr's Codex integration into the lane's
-persistent home so supported Codex sessions can be restored after a Herdr server restart.
+separate Herdr server. On the first Herdr attach, Worklane installs Herdr's
+Codex integration into the selected directory so supported Codex sessions can
+be restored after a Herdr server restart.
 
 To build for a managed host, the Containerfile and build context must already exist on that host:
 
@@ -52,7 +59,25 @@ worklane lane create my-project --host lab --project /home/gerald/projects/my-pr
   --profile default
 ```
 
-The canonical controller registry is `~/.local/share/worklane/worklane.db`. Each local lane has a recoverable specification at `~/.local/share/worklane/lanes/<lane-name>/lane.toml` and persistent home under the same directory. New containers, Herdr sessions, Herdr workspace labels, project mount directories, and lane-owned data directories are named after the lane; legacy lanes retain their existing generated names. `lane delete NAME` (the `D` key in `lane`) removes an undrifted disposable container and its registry entry, but never alters any bind-mounted source. If the cached lane state is `unknown`, `delete` behaves like `forget` and removes only the local registry entry. `lane forget NAME` (the `F` key in `lane`) is the explicit registry-only escape hatch and never contacts a host or container runtime. `destroy` archives the lane-owned directory and never touches the project. `purge --yes` is explicitly destructive.
+The canonical controller registry is `~/.local/share/worklane/worklane.db`.
+Each selected directory also contains a portable, atomically written
+`.worklane/lane.toml`. Recover a missing registry entry with
+`worklane lane import PATH`, where `PATH` is either the selected directory or
+its manifest. A lane's display name can change (`lane rename`, or `n` in the
+TUI), while its Podman and Herdr identifiers remain stable.
+
+`lane delete NAME` (the `D` key) always contacts the owning host, checks drift,
+removes the disposable container, removes the registry record, and deletes only
+the exact `.worklane/lane.toml` control file. It never deletes the selected
+directory or its contents. `lane forget NAME` (the `F` key) removes only the
+controller registry entry and deliberately leaves the manifest and Podman
+state intact. There are no ambiguous archive, destroy, or purge commands.
+
+Legacy lanes are migrated automatically before start, attach, or upgrade. Stop
+a running legacy lane first. Migration preflights every path, aborts before
+copying on a collision, copies and verifies the old hidden home into the
+selected directory, commits the manifest and registry, and only then removes
+the exact legacy lane directory. Existing legacy archives are left untouched.
 
 ## Hosts and deployment
 
@@ -64,7 +89,17 @@ worklane host deploy lab --binary target/x86_64-unknown-linux-gnu/release/workla
 
 The SSH transport uses the existing OpenSSH configuration with `StrictHostKeyChecking=yes`; unknown or changed keys are rejected. Deployment copies a versioned binary, verifies SHA-256 on the host, then atomically updates `~/.local/bin/worklane`.
 
-All control commands accept `--json`. `image build` and `image inspect` accept `--host`; `image push` is intentionally unavailable. `lane upgrade` rebuilds embedded/default lanes from the current standard Containerfile, rebuilds custom-image lanes from their stored host-native build context, and then recreates the container so its immutable root filesystem is fresh. Run `lane` for the keyboard-first terminal view; it uses cached lane state when hosts are unreachable.
+All control commands accept `--json`. `image build` and `image inspect` accept
+`--host`; `image push` is intentionally unavailable. Builds use Podman's cache
+by default and accept `--no-cache` explicitly. `lane upgrade --all` builds each
+distinct effective profile once per host, then recreates its lanes so their
+immutable root filesystems are fresh. Run `lane` for the keyboard-first
+terminal view; host operations run in the background and it uses cached lane
+state when hosts are unreachable.
+
+Worklane does not impose a per-lane disk quota or preallocate storage. Because
+all persistent state is in the selected directory, users can inspect, back up,
+move, and constrain it with their filesystem's normal tools.
 
 ## Profiles
 
@@ -79,10 +114,10 @@ network = "outbound"
 
 [[profiles.docs.mounts]]
 source = "/home/gerald/.cache/pip"
-target = "/home/gerald/.cache/pip"
+target = "/home/dev/.cache/pip"
 read_only = false
 ```
 
 Create with `worklane lane create docs --profile docs`. Mount sources and
-targets must be absolute; Worklane rejects mounts that overlap its managed home
-or project workspace.
+targets must be absolute. Targets may live below `/home/dev`, but they may not
+replace `/home/dev`, contain it, or overlap another custom target.

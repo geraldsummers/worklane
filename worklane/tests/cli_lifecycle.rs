@@ -49,8 +49,16 @@ fn local_lifecycle_uses_podman_and_preserves_project() {
     let bin_dir = root.join("bin");
     let data = root.join("data");
     let project = root.join("project");
+    let default_project = root.join("default-project");
+    let registry_project = root.join("registry-project");
+    let stale_project = root.join("stale-project");
+    let stale_forget_project = root.join("stale-forget-project");
     fs::create_dir_all(&bin_dir).unwrap();
     fs::create_dir_all(&project).unwrap();
+    fs::create_dir_all(&default_project).unwrap();
+    fs::create_dir_all(&registry_project).unwrap();
+    fs::create_dir_all(&stale_project).unwrap();
+    fs::create_dir_all(&stale_forget_project).unwrap();
     let podman = bin_dir.join("podman");
     fs::write(
         &podman,
@@ -94,11 +102,21 @@ esac
         ],
     );
     assert!(created.contains("\"state\":\"running\""));
+    assert!(fs::read_to_string(project.join(".worklane/lane.toml"))
+        .unwrap()
+        .contains("container_name = \"worklane-smoke-fixed-id\""));
     assert!(run(
         binary,
         &data,
         &bin_dir,
-        &["--json", "lane", "create", "defaults",]
+        &[
+            "--json",
+            "lane",
+            "create",
+            "defaults",
+            "--project",
+            &default_project.to_string_lossy(),
+        ]
     )
     .contains("\"state\":\"running\""));
     let default_lane = run(
@@ -173,7 +191,7 @@ esac
             "create",
             "registry-only",
             "--project",
-            &project_arg,
+            &registry_project.to_string_lossy(),
             "--id",
             "registry-only-fixed-id",
             "--user",
@@ -196,10 +214,29 @@ esac
         &[
             "--json",
             "lane",
+            "import",
+            &registry_project.to_string_lossy(),
+        ],
+    )
+    .contains("registry-only"));
+    assert!(run(
+        binary,
+        &data,
+        &bin_dir,
+        &["--json", "lane", "forget", "registry-only"]
+    )
+    .contains("forgot"));
+    assert!(run(
+        binary,
+        &data,
+        &bin_dir,
+        &[
+            "--json",
+            "lane",
             "create",
             "stale",
             "--project",
-            &project_arg,
+            &stale_project.to_string_lossy(),
             "--id",
             "stale-fixed-id",
             "--user",
@@ -215,7 +252,7 @@ esac
     )
     .contains("stale-renamed"));
     assert!(
-        fs::read_to_string(data.join("worklane/lanes/stale/lane.toml"))
+        fs::read_to_string(stale_project.join(".worklane/lane.toml"))
             .unwrap()
             .contains("name = \"stale-renamed\"")
     );
@@ -225,7 +262,7 @@ esac
         &bin_dir,
         &["--json", "lane", "delete", "stale-renamed"]
     )
-    .contains("forgot"));
+    .contains("deleted"));
     assert!(!run(binary, &data, &bin_dir, &["--json", "lane", "list"]).contains("stale-renamed"));
     assert!(run(
         binary,
@@ -237,7 +274,7 @@ esac
             "create",
             "stale-forget",
             "--project",
-            &project_arg,
+            &stale_forget_project.to_string_lossy(),
             "--id",
             "stale-forget-fixed-id",
             "--user",
@@ -265,6 +302,7 @@ esac
         &["--json", "lane", "forget", "stale-forget-renamed"]
     )
     .contains("forgot"));
+    assert!(stale_forget_project.join(".worklane/lane.toml").exists());
     assert!(run(
         binary,
         &data,
@@ -273,31 +311,15 @@ esac
     )
     .contains("deleted"));
     assert!(project.exists());
-    assert!(data.join("worklane/lanes/smoke/home").exists());
+    assert!(!project.join(".worklane/lane.toml").exists());
     assert!(!run(binary, &data, &bin_dir, &["--json", "lane", "list"]).contains("smoke"));
-    let destroyed = run(
-        binary,
-        &data,
-        &bin_dir,
-        &["--json", "lane", "destroy", "defaults"],
-    );
-    assert!(destroyed.contains("destroyed"));
-    assert!(project.exists());
-    let archive = fs::read_dir(data.join("worklane/archives"))
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .file_name()
-        .into_string()
-        .unwrap();
     assert!(run(
         binary,
         &data,
         &bin_dir,
-        &["--json", "lane", "purge", &archive, "--yes"]
+        &["--json", "lane", "delete", "defaults"],
     )
-    .contains("purged"));
+    .contains("deleted"));
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -315,8 +337,9 @@ fn drift_protection_requires_an_explicit_override() {
         r#"#!/bin/sh
 case "$1:$2" in
   image:exists|rm:-f|run:-d|build:-f) exit 0 ;;
+  image:inspect) printf 'sha256:test-image\n'; exit 0 ;;
   inspect:--format) printf 'running\n'; exit 0 ;;
-  diff:drift) printf 'A /etc/worklane-test\n'; exit 0 ;;
+  diff:*) printf 'A /etc/worklane-test\n'; exit 0 ;;
   *) exit 0 ;;
 esac
 "#,
@@ -350,22 +373,16 @@ esac
     )
     .contains("skipped-drift"));
     assert!(
-        run_failure(binary, &data, &bin_dir, &["lane", "destroy", "drift"])
-            .contains("writable-root drift")
-    );
-    assert!(
         run_failure(binary, &data, &bin_dir, &["lane", "delete", "drift"])
             .contains("writable-root drift")
     );
-    run(
+    assert!(run(
         binary,
         &data,
         &bin_dir,
-        &["--json", "lane", "destroy", "drift", "--force"],
-    );
-    assert!(
-        run_failure(binary, &data, &bin_dir, &["lane", "purge", "drift"]).contains("pass --yes")
-    );
+        &["--json", "lane", "forget", "drift"],
+    )
+    .contains("forgot"));
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -599,8 +616,8 @@ JSON
         binary,
         &data,
         &bin_dir,
-        &["--json", "lane", "destroy", "remote", "--force"]
+        &["--json", "lane", "delete", "remote"]
     )
-    .contains("state"));
+    .contains("deleted"));
     fs::remove_dir_all(root).unwrap();
 }
