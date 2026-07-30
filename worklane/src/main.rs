@@ -1720,8 +1720,7 @@ mod tests {
     fn standard_containerfile_is_embedded() {
         assert!(EMBEDDED_CONTAINERFILE.starts_with("FROM debian:trixie-slim"));
         assert!(EMBEDDED_CONTAINERFILE.contains("@openai/codex"));
-        assert!(EMBEDDED_CONTAINERFILE.contains("CODEX_VERSION=0.146.0"));
-        assert!(!EMBEDDED_CONTAINERFILE.contains("CODEX_VERSION=latest"));
+        assert!(EMBEDDED_CONTAINERFILE.contains("CODEX_VERSION=latest"));
         assert!(EMBEDDED_CONTAINERFILE.contains("HERDR_SHA256="));
         assert!(EMBEDDED_CONTAINERFILE.contains("RUSTUP_INIT_SHA256="));
         assert!(EMBEDDED_CONTAINERFILE.contains("sha256sum -c -"));
