@@ -92,10 +92,13 @@ The SSH transport uses the existing OpenSSH configuration with `StrictHostKeyChe
 All control commands accept `--json`. `image build` and `image inspect` accept
 `--host`; `image push` is intentionally unavailable. Builds use Podman's cache
 by default and accept `--no-cache` explicitly. `lane upgrade --all` builds each
-distinct effective profile once per host, then recreates its lanes so their
-immutable root filesystems are fresh. Run `lane` for the keyboard-first
-terminal view; host operations run in the background and it uses cached lane
-state when hosts are unreachable.
+distinct effective image once per host, then recreates its lanes so their
+immutable root filesystems are fresh. In the TUI, `u` performs a cached upgrade
+of one lane, while `U` performs a fresh `--no-cache` upgrade of all effective
+images and pulls the standard image's base. Custom Containerfiles retain
+control over local-only base images. Run `lane` for the keyboard-first terminal
+view; host operations run in the background and it uses cached lane state when
+hosts are unreachable.
 
 Worklane does not impose a per-lane disk quota or preallocate storage. Because
 all persistent state is in the selected directory, users can inspect, back up,

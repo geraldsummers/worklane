@@ -349,7 +349,9 @@ fn start_job(app: &mut App, verb: &str, extra: &[String], all: bool) -> Result<(
         return Ok(());
     }
     let args = if all {
-        vec!["lane".into(), verb.into(), "--all".into()]
+        let mut args = vec!["lane".into(), verb.into(), "--all".into()];
+        args.extend(extra.iter().cloned());
+        args
     } else {
         let visible = app.visible();
         let Some(item) = visible.get(app.selected) else {
@@ -381,7 +383,11 @@ fn start_job(app: &mut App, verb: &str, extra: &[String], all: bool) -> Result<(
     Ok(())
 }
 fn start_upgrade(app: &mut App, all: bool) -> Result<()> {
-    start_job(app, "upgrade", &[], all)
+    if all {
+        start_job(app, "upgrade", &["--no-cache".into()], true)
+    } else {
+        start_job(app, "upgrade", &[], false)
+    }
 }
 fn run_verbose_command(
     program: &str,
@@ -1178,7 +1184,7 @@ mod tests {
         let worklane = bin.join("worklane");
         fs::write(
             &worklane,
-            "#!/bin/sh\nstatus='{\"spec\":{\"version\":1,\"id\":\"alpha-id\",\"name\":\"alpha\",\"host\":\"lab\",\"user\":\"dev\",\"project_path\":\"/tmp\",\"profile\":{\"image\":\"test:latest\",\"build_context\":null,\"containerfile\":\"Containerfile\",\"embedded_containerfile\":true,\"network\":\"outbound\",\"mounts\":[]},\"profile_name\":\"default\",\"created_at\":\"2026-01-01T00:00:00Z\",\"image_digest\":null},\"state\":\"running\",\"drift\":false,\"cached_at\":\"2026-01-01T00:00:00Z\"}'\ncase \"$*\" in *fail*) printf 'command failed\\n' >&2; exit 1;; *diff*) printf '{\"diff\":[]}\\n';; *inspect*) printf '%s\\n' \"$status\";; *upgrade*) printf 'building alpha\\n' >&2; printf '[%s]\\n' \"$status\";; *refresh*) printf '[%s]\\n' \"$status\";; esac\nexit 0\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.log\"\nstatus='{\"spec\":{\"version\":1,\"id\":\"alpha-id\",\"name\":\"alpha\",\"host\":\"lab\",\"user\":\"dev\",\"project_path\":\"/tmp\",\"profile\":{\"image\":\"test:latest\",\"build_context\":null,\"containerfile\":\"Containerfile\",\"embedded_containerfile\":true,\"network\":\"outbound\",\"mounts\":[]},\"profile_name\":\"default\",\"created_at\":\"2026-01-01T00:00:00Z\",\"image_digest\":null},\"state\":\"running\",\"drift\":false,\"cached_at\":\"2026-01-01T00:00:00Z\"}'\ncase \"$*\" in *fail*) printf 'command failed\\n' >&2; exit 1;; *diff*) printf '{\"diff\":[]}\\n';; *inspect*) printf '%s\\n' \"$status\";; *upgrade*) printf 'building alpha\\n' >&2; printf '[%s]\\n' \"$status\";; *refresh*) printf '[%s]\\n' \"$status\";; esac\nexit 0\n",
         )
         .unwrap();
         #[cfg(unix)]
@@ -1229,6 +1235,10 @@ mod tests {
         }
         assert_eq!(app.message, "upgrade all: completed");
         assert!(app.detail.contains("alpha: running"));
+        assert!(fs::read_to_string(worklane.with_extension("log"))
+            .unwrap()
+            .lines()
+            .any(|line| line == "lane upgrade --all --no-cache"));
         start_job(&mut app, "rename", &["renamed".into()], false).unwrap();
         start_job(&mut app, "start", &[], false).unwrap();
         assert_eq!(app.message, "another action is already running");

@@ -266,6 +266,7 @@ fn image_build_args<R: Runner>(
     context: &std::path::Path,
     tag: &str,
     no_cache: bool,
+    pull: bool,
 ) -> Result<Vec<String>> {
     let file = match file {
         Some(path) => path.clone(),
@@ -289,7 +290,21 @@ fn image_build_args<R: Runner>(
     if no_cache {
         args.insert(1, "--no-cache".into());
     }
+    if pull {
+        args.insert(1, "--pull=always".into());
+    }
     Ok(args)
+}
+fn image_build_key(spec: &LaneSpec) -> Result<String> {
+    if spec.profile.embedded_containerfile {
+        return Ok(serde_json::to_string(&("embedded", &spec.profile.image))?);
+    }
+    Ok(serde_json::to_string(&(
+        "custom",
+        &spec.profile.image,
+        &spec.profile.build_context,
+        &spec.profile.containerfile,
+    ))?)
 }
 fn build_local_image<R: Runner>(r: &R, spec: &LaneSpec, no_cache: bool) -> Result<()> {
     let (file, context) = if spec.profile.embedded_containerfile {
@@ -305,7 +320,14 @@ fn build_local_image<R: Runner>(r: &R, spec: &LaneSpec, no_cache: bool) -> Resul
     eprintln!("worklane: building image '{}'...", spec.profile.image);
     podman_stream(
         r,
-        image_build_args(r, file.as_ref(), &context, &spec.profile.image, no_cache)?,
+        image_build_args(
+            r,
+            file.as_ref(),
+            &context,
+            &spec.profile.image,
+            no_cache,
+            no_cache && spec.profile.embedded_containerfile,
+        )?,
     )?;
     Ok(())
 }
@@ -1088,7 +1110,7 @@ fn main() -> Result<()> {
                     eprintln!("worklane: building image '{tag}'...");
                     podman_stream(
                         &r,
-                        image_build_args(&r, file.as_ref(), &context, &tag, no_cache)?,
+                        image_build_args(&r, file.as_ref(), &context, &tag, no_cache, false)?,
                     )?;
                     emit(
                         cli.json,
@@ -1489,12 +1511,7 @@ fn main() -> Result<()> {
                         }
                         if s.host == "local" {
                             let r = SystemRunner;
-                            let build_key = serde_json::to_string(&(
-                                &s.profile.image,
-                                &s.profile.build_context,
-                                &s.profile.containerfile,
-                                s.profile.embedded_containerfile,
-                            ))?;
+                            let build_key = image_build_key(&s)?;
                             if built_profiles.insert(build_key) {
                                 build_local_image(&r, &s, no_cache)?;
                             }
@@ -1949,6 +1966,7 @@ CMD ["sleep", "infinity"]
             &PathBuf::from("/tmp/context"),
             "localhost/test:latest",
             false,
+            false,
         )
         .unwrap();
         assert!(!args.contains(&"--no-cache".into()));
@@ -1961,9 +1979,33 @@ CMD ["sleep", "infinity"]
             &PathBuf::from("/tmp/context"),
             "localhost/test:latest",
             true,
+            true,
         )
         .unwrap();
         assert!(uncached.contains(&"--no-cache".into()));
+        assert!(uncached.contains(&"--pull=always".into()));
+    }
+
+    #[test]
+    fn embedded_lanes_share_one_build_key_but_custom_contexts_do_not() {
+        let first = spec("local");
+        let mut second = first.clone();
+        second.project_path = PathBuf::from("/var/tmp/another-lane");
+        second.profile.build_context = Some(second.project_path.clone());
+        assert_eq!(
+            image_build_key(&first).unwrap(),
+            image_build_key(&second).unwrap()
+        );
+
+        let mut first_custom = first;
+        first_custom.profile.embedded_containerfile = false;
+        first_custom.profile.build_context = Some(PathBuf::from("/tmp/context-a"));
+        let mut second_custom = first_custom.clone();
+        second_custom.profile.build_context = Some(PathBuf::from("/tmp/context-b"));
+        assert_ne!(
+            image_build_key(&first_custom).unwrap(),
+            image_build_key(&second_custom).unwrap()
+        );
     }
 
     #[test]

@@ -181,6 +181,32 @@ esac
         &["--json", "lane", "upgrade", "smoke", "--force"]
     )
     .contains("running"));
+    fs::write(podman.with_extension("log"), "").unwrap();
+    assert!(run(
+        binary,
+        &data,
+        &bin_dir,
+        &[
+            "--json",
+            "lane",
+            "upgrade",
+            "--all",
+            "--force",
+            "--no-cache",
+        ]
+    )
+    .contains("running"));
+    let full_upgrade_log = fs::read_to_string(podman.with_extension("log")).unwrap();
+    assert_eq!(
+        full_upgrade_log
+            .lines()
+            .filter(|line| line.starts_with("build "))
+            .count(),
+        1
+    );
+    assert!(full_upgrade_log
+        .lines()
+        .any(|line| line.starts_with("build --pull=always --no-cache ")));
     assert!(run(
         binary,
         &data,
