@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::{
     event::{self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, Event, KeyCode},
     execute,
@@ -12,10 +12,11 @@ use ratatui::{
     Terminal,
 };
 use std::{
-    io::{self, BufRead, BufReader, Read},
+    collections::{HashMap, VecDeque},
+    io::{self, BufRead, BufReader, Read, Write},
     process::{Command, Stdio},
-    sync::mpsc::{self, Receiver, TryRecvError},
-    time::Duration,
+    sync::mpsc::{self, Receiver, Sender, TryRecvError},
+    time::{Duration, Instant},
 };
 use worklane_core::{LaneStatus, Store};
 
@@ -25,13 +26,22 @@ struct App {
     filter: String,
     filtering: bool,
     detail: String,
+    lane_errors: HashMap<String, String>,
     message: String,
     confirming_delete: bool,
     confirming_forget: bool,
+    confirming_reconcile: bool,
     rename_input: Option<String>,
-    job: Option<Receiver<JobEvent>>,
+    jobs: Vec<ActiveJob>,
+    job_queue: VecDeque<JobRequest>,
     state_poll: Option<Receiver<StatePollResult>>,
+    state_poll_sender: Option<Sender<StatePollResult>>,
+    state_poll_queue: VecDeque<StatePollRequest>,
+    state_poll_inflight: usize,
     state_poll_pending: usize,
+    state_poll_errors: Vec<String>,
+    refresh_generations: HashMap<String, u64>,
+    next_refresh_generation: u64,
 }
 enum JobEvent {
     Progress(String),
@@ -41,6 +51,22 @@ struct JobResult {
     label: String,
     verb: String,
     output: Result<CommandOutput, String>,
+    cached_lanes: Option<Vec<LaneStatus>>,
+}
+struct ActiveJob {
+    lane_id: Option<String>,
+    host: Option<String>,
+    verb: String,
+    label: String,
+    started: Instant,
+    receiver: Receiver<JobEvent>,
+}
+struct JobRequest {
+    lane_id: Option<String>,
+    host: Option<String>,
+    label: String,
+    verb: String,
+    args: Vec<String>,
 }
 struct CommandOutput {
     success: bool,
@@ -50,7 +76,13 @@ struct CommandOutput {
 struct StatePollResult {
     lane_id: String,
     lane_name: String,
+    generation: u64,
     output: Result<std::process::Output, String>,
+}
+struct StatePollRequest {
+    lane_id: String,
+    lane_name: String,
+    generation: u64,
 }
 #[derive(Debug, PartialEq, Eq)]
 enum UiAction {
@@ -61,6 +93,7 @@ enum UiAction {
     UpgradeAll,
     Reload,
     EditContainerfile,
+    Reconcile(bool),
 }
 impl App {
     fn load() -> Result<Self> {
@@ -72,13 +105,22 @@ impl App {
             filter: String::new(),
             filtering: false,
             detail: String::new(),
+            lane_errors: HashMap::new(),
             message: String::new(),
             confirming_delete: false,
             confirming_forget: false,
+            confirming_reconcile: false,
             rename_input: None,
-            job: None,
+            jobs: Vec::new(),
+            job_queue: VecDeque::new(),
             state_poll: None,
+            state_poll_sender: None,
+            state_poll_queue: VecDeque::new(),
+            state_poll_inflight: 0,
             state_poll_pending: 0,
+            state_poll_errors: Vec::new(),
+            refresh_generations: HashMap::new(),
+            next_refresh_generation: 0,
         };
         start_state_poll(&mut app);
         Ok(app)
@@ -166,8 +208,25 @@ impl App {
                 _ => UiAction::None,
             };
         }
+        if self.confirming_reconcile {
+            return match key {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.confirming_reconcile = false;
+                    UiAction::Reconcile(true)
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.confirming_reconcile = false;
+                    self.message = "reconcile apply cancelled".into();
+                    UiAction::None
+                }
+                _ => UiAction::None,
+            };
+        }
         match key {
-            KeyCode::Esc if !self.detail.is_empty() => {
+            KeyCode::Esc if !self.detail.is_empty() || !self.lane_errors.is_empty() => {
+                if let Some(lane_id) = selected_lane_id(self) {
+                    self.lane_errors.remove(&lane_id);
+                }
                 self.detail.clear();
                 self.message = "details closed".into();
                 UiAction::None
@@ -193,14 +252,26 @@ impl App {
             KeyCode::Char('d') => UiAction::Command("diff", false),
             KeyCode::Char('D') if self.visible().get(self.selected).is_some() => {
                 self.confirming_delete = true;
-                self.message =
-                    "Delete selected lane and registry? Bind-mounted data is preserved. y/N".into();
+                let lane = self.visible()[self.selected];
+                self.message = format!(
+                    "Delete '{}' ({}) on {}? Container and manifest are removed; project {} is preserved. y/N",
+                    lane.spec.name,
+                    lane.spec.id,
+                    lane.spec.host,
+                    lane.spec.project_path.display()
+                );
                 UiAction::None
             }
             KeyCode::Char('F') if self.visible().get(self.selected).is_some() => {
                 self.confirming_forget = true;
-                self.message =
-                    "Forget selected lane from registry only? Podman is untouched. y/N".into();
+                let lane = self.visible()[self.selected];
+                self.message = format!(
+                    "Forget '{}' ({}) on {} from this registry? Container, manifest, and project {} are preserved. y/N",
+                    lane.spec.name,
+                    lane.spec.id,
+                    lane.spec.host,
+                    lane.spec.project_path.display()
+                );
                 UiAction::None
             }
             KeyCode::Char('i') => UiAction::Command("inspect", false),
@@ -210,6 +281,16 @@ impl App {
                 UiAction::None
             }
             KeyCode::Char('r') => UiAction::Reload,
+            KeyCode::Char('c') => UiAction::Reconcile(false),
+            KeyCode::Char('C') if self.visible().get(self.selected).is_some() => {
+                self.confirming_reconcile = true;
+                let lane = self.visible()[self.selected];
+                self.message = format!(
+                    "Apply verified reconciliation for '{}' ({}) on {}? y/N",
+                    lane.spec.name, lane.spec.id, lane.spec.host
+                );
+                UiAction::None
+            }
             KeyCode::Char('e') => UiAction::EditContainerfile,
             KeyCode::Char('/') => {
                 self.filter.clear();
@@ -227,12 +308,7 @@ impl App {
     }
 }
 fn load_registered_lanes() -> Result<Vec<LaneStatus>> {
-    let mut lanes = Store::open_default()?.lanes()?;
-    for lane in &mut lanes {
-        lane.state = "unknown".into();
-        lane.drift = false;
-    }
-    Ok(lanes)
+    Store::open_default()?.lanes()
 }
 fn load_cached_lanes() -> Result<Vec<LaneStatus>> {
     Store::open_default()?.lanes()
@@ -248,7 +324,38 @@ fn sort_lanes(lanes: &mut [LaneStatus]) {
 fn clamp_selection(app: &mut App) {
     app.selected = app.selected.min(app.visible().len().saturating_sub(1));
 }
-fn action(app: &mut App, verb: &str) -> Result<()> {
+fn selected_lane_id(app: &App) -> Option<String> {
+    app.visible()
+        .get(app.selected)
+        .map(|lane| lane.spec.id.clone())
+}
+fn restore_selection(app: &mut App, selected_id: Option<&str>) {
+    sort_lanes(&mut app.lanes);
+    if let Some(selected_id) = selected_id {
+        if let Some(index) = app
+            .visible()
+            .iter()
+            .position(|lane| lane.spec.id == selected_id)
+        {
+            app.selected = index;
+            return;
+        }
+    }
+    clamp_selection(app);
+}
+fn replace_lanes(app: &mut App, lanes: Vec<LaneStatus>) {
+    let selected_id = selected_lane_id(app);
+    app.lanes = lanes;
+    restore_selection(app, selected_id.as_deref());
+}
+fn invalidate_lane_refresh(app: &mut App, lane_id: &str) {
+    app.next_refresh_generation += 1;
+    app.refresh_generations
+        .insert(lane_id.into(), app.next_refresh_generation);
+    app.state_poll_queue
+        .retain(|request| request.lane_id != lane_id);
+}
+fn action(app: &mut App, verb: &str) -> Result<bool> {
     action_with_args(app, verb, &[])
 }
 fn upgrade_detail(output: &[u8]) -> Result<String> {
@@ -297,19 +404,66 @@ fn inspect_detail(output: &[u8]) -> Result<String> {
         spec["profile"]["image"].as_str().unwrap_or("unknown"),
     ))
 }
-fn action_with_args(app: &mut App, verb: &str, extra: &[&str]) -> Result<()> {
-    let visible = app.visible();
-    let Some(item) = visible.get(app.selected) else {
-        return Ok(());
+fn command_error(stderr: &[u8], fallback: &str) -> String {
+    let error = String::from_utf8_lossy(stderr).trim().to_owned();
+    if error.is_empty() {
+        fallback.to_owned()
+    } else {
+        error
+    }
+}
+fn action_with_args(app: &mut App, verb: &str, extra: &[&str]) -> Result<bool> {
+    let Some(lane_id) = app
+        .visible()
+        .get(app.selected)
+        .map(|item| item.spec.id.clone())
+    else {
+        app.message = format!("{verb}: no lane selected");
+        return Ok(false);
     };
-    let mut args = vec!["lane", verb, &item.spec.id];
-    args.extend(extra.iter().copied());
+    invalidate_lane_refresh(app, &lane_id);
     let mut command = Command::new("worklane");
-    command.args(args);
+    command.args(["lane", verb, &lane_id]).args(extra);
     if verb == "attach" {
-        let status = command.status()?;
+        restore_terminal_state();
+        let _resume = ResumeTui;
+        let mut child = command
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("failed to start worklane attach")?;
+        let mut child_stderr = child
+            .stderr
+            .take()
+            .context("worklane attach stderr unavailable")?;
+        let stderr_thread = std::thread::spawn(move || -> io::Result<Vec<u8>> {
+            let mut captured = Vec::new();
+            let mut chunk = [0; 4096];
+            loop {
+                let count = child_stderr.read(&mut chunk)?;
+                if count == 0 {
+                    return Ok(captured);
+                }
+                captured.extend_from_slice(&chunk[..count]);
+                io::stderr().write_all(&chunk[..count])?;
+                io::stderr().flush()?;
+            }
+        });
+        let status = child.wait().context("failed to wait for worklane attach")?;
+        let stderr = stderr_thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("worklane attach error reader panicked"))?
+            .context("failed to read worklane attach error output")?;
         app.message = format!("{verb}: {}", if status.success() { "ok" } else { "failed" });
-        return Ok(());
+        if !status.success() {
+            app.detail = command_error(
+                &stderr,
+                &format!("worklane attach exited with {status} without an error message"),
+            );
+            app.lane_errors.insert(lane_id, app.detail.clone());
+        } else {
+            app.lane_errors.remove(&lane_id);
+        }
+        return Ok(status.success());
     }
     let output = command.output()?;
     if output.status.success() {
@@ -334,24 +488,21 @@ fn action_with_args(app: &mut App, verb: &str, extra: &[&str]) -> Result<()> {
             app.detail.clear();
         }
         app.message = format!("{verb}: ok");
-        app.lanes = load_cached_lanes()?;
-        sort_lanes(&mut app.lanes);
-        clamp_selection(app);
+        replace_lanes(app, load_cached_lanes()?);
     } else {
         app.message = format!("{verb}: failed");
-        app.detail = String::from_utf8_lossy(&output.stderr).trim().into();
+        app.detail = command_error(
+            &output.stderr,
+            &format!("worklane {verb} failed without an error message"),
+        );
     }
-    Ok(())
+    Ok(output.status.success())
 }
 fn start_job(app: &mut App, verb: &str, extra: &[String], all: bool) -> Result<()> {
-    if app.job.is_some() {
-        app.message = "another action is already running".into();
-        return Ok(());
-    }
-    let args = if all {
+    let (args, lane_id, host) = if all {
         let mut args = vec!["lane".into(), verb.into(), "--all".into()];
         args.extend(extra.iter().cloned());
-        args
+        (args, None, None)
     } else {
         let visible = app.visible();
         let Some(item) = visible.get(app.selected) else {
@@ -359,28 +510,100 @@ fn start_job(app: &mut App, verb: &str, extra: &[String], all: bool) -> Result<(
         };
         let mut args = vec!["lane".into(), verb.into(), item.spec.id.clone()];
         args.extend(extra.iter().cloned());
-        args
+        (
+            args,
+            Some(item.spec.id.clone()),
+            Some(item.spec.host.clone()),
+        )
     };
     let label = if all {
         format!("{verb} all")
     } else {
         verb.to_string()
     };
-    let worker_label = label.clone();
-    let worker_verb = verb.to_string();
-    let (sender, receiver) = mpsc::channel();
-    std::thread::spawn(move || {
-        let output = run_verbose_command("worklane", &args, &sender);
-        let _ = sender.send(JobEvent::Complete(JobResult {
-            label: worker_label,
-            verb: worker_verb,
-            output,
-        }));
+    let conflicts = app.jobs.iter().any(|job| {
+        lane_id.is_some() && job.lane_id == lane_id
+            || verb == "upgrade" && job.verb == "upgrade" && job.host == host
+    }) || app.job_queue.iter().any(|job| {
+        lane_id.is_some() && job.lane_id == lane_id
+            || verb == "upgrade" && job.verb == "upgrade" && job.host == host
     });
-    app.job = Some(receiver);
-    app.message = format!("{label}: running in background");
-    app.detail = format!("{label}: starting");
+    if conflicts {
+        app.message = format!("{label}: already queued or running");
+        return Ok(());
+    }
+    if let Some(lane_id) = &lane_id {
+        invalidate_lane_refresh(app, lane_id);
+    }
+    app.job_queue.push_back(JobRequest {
+        lane_id,
+        host,
+        label: label.clone(),
+        verb: verb.into(),
+        args,
+    });
+    app.message = format!("{label}: queued");
+    app.detail = format!("{label}: queued");
+    start_queued_jobs(app);
     Ok(())
+}
+fn start_queued_jobs(app: &mut App) {
+    const MAX_EXTERNAL_JOBS: usize = 4;
+    while app.jobs.len() < MAX_EXTERNAL_JOBS {
+        let eligible = app.job_queue.iter().position(|request| {
+            let same_host = request.host.as_ref().map_or(0, |host| {
+                app.jobs
+                    .iter()
+                    .filter(|job| job.host.as_ref() == Some(host))
+                    .count()
+            });
+            same_host < 2
+                && !(request.verb == "upgrade"
+                    && app
+                        .jobs
+                        .iter()
+                        .any(|job| job.verb == "upgrade" && job.host == request.host))
+        });
+        let Some(request) = eligible.and_then(|index| app.job_queue.remove(index)) else {
+            return;
+        };
+        let worker_label = request.label.clone();
+        let worker_verb = request.verb.clone();
+        let args = request.args;
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut output = run_verbose_command("worklane", &args, &sender);
+            let cached_lanes = if output.as_ref().is_ok_and(|output| output.success) {
+                match load_cached_lanes() {
+                    Ok(lanes) => Some(lanes),
+                    Err(error) => {
+                        output = Err(format!(
+                            "command completed but its cached result could not be loaded: {error:#}"
+                        ));
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let _ = sender.send(JobEvent::Complete(JobResult {
+                label: worker_label,
+                verb: worker_verb,
+                output,
+                cached_lanes,
+            }));
+        });
+        app.jobs.push(ActiveJob {
+            lane_id: request.lane_id,
+            host: request.host,
+            verb: request.verb,
+            label: request.label.clone(),
+            started: Instant::now(),
+            receiver,
+        });
+        app.message = format!("{}: running", request.label);
+        app.detail = format!("{}: starting", request.label);
+    }
 }
 fn start_upgrade(app: &mut App, all: bool) -> Result<()> {
     if all {
@@ -396,6 +619,7 @@ fn run_verbose_command(
 ) -> Result<CommandOutput, String> {
     let mut child = Command::new(program)
         .args(args)
+        .env("WORKLANE_EVENT_STREAM", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -408,9 +632,21 @@ fn run_verbose_command(
         for line in BufReader::new(stderr).lines() {
             match line {
                 Ok(line) => {
-                    bytes.extend_from_slice(line.as_bytes());
-                    bytes.push(b'\n');
-                    let _ = progress_sender.send(JobEvent::Progress(line));
+                    let display = match serde_json::from_str::<worklane_core::OperationEvent>(&line)
+                    {
+                        Ok(event) => format!(
+                            "{} · {:.1}s — {}",
+                            event.phase,
+                            event.elapsed_ms as f64 / 1000.0,
+                            event.message
+                        ),
+                        Err(_) => {
+                            bytes.extend_from_slice(line.as_bytes());
+                            bytes.push(b'\n');
+                            line
+                        }
+                    };
+                    let _ = progress_sender.send(JobEvent::Progress(display));
                 }
                 Err(error) => {
                     let line = format!("failed to read progress: {error}");
@@ -437,65 +673,110 @@ fn run_verbose_command(
         stderr,
     })
 }
-fn poll_job(app: &mut App) -> Result<()> {
-    let Some(receiver) = app.job.take() else {
-        return Ok(());
-    };
-    loop {
-        match receiver.try_recv() {
-            Ok(JobEvent::Progress(line)) => {
-                app.message = "action running; lane controls locked".into();
-                append_detail_line(app, &line);
-            }
-            Ok(JobEvent::Complete(result)) => {
-                match result.output {
-                    Ok(output) if output.success => {
-                        app.detail = match result.verb.as_str() {
-                            "upgrade" => upgrade_detail(&output.stdout)?,
-                            "diff" => {
-                                let value: serde_json::Value =
-                                    serde_json::from_slice(&output.stdout)?;
-                                let lines = value["diff"]
-                                    .as_array()
-                                    .into_iter()
-                                    .flatten()
-                                    .filter_map(serde_json::Value::as_str)
-                                    .collect::<Vec<_>>();
-                                if lines.is_empty() {
-                                    "No meaningful writable-root changes.".into()
-                                } else {
-                                    lines.join("\n")
+fn poll_jobs(app: &mut App) {
+    let mut active = Vec::new();
+    for job in std::mem::take(&mut app.jobs) {
+        let job_lane_id = job.lane_id.clone();
+        let mut complete = false;
+        loop {
+            match job.receiver.try_recv() {
+                Ok(JobEvent::Progress(line)) => {
+                    app.message = format!("{}: running", job.verb);
+                    append_detail_line(app, &line);
+                }
+                Ok(JobEvent::Complete(result)) => {
+                    let cached_lanes = result.cached_lanes;
+                    let applied = (|| -> Result<()> {
+                        match result.output {
+                            Ok(output) if output.success => {
+                                if let Some(lane_id) = &job_lane_id {
+                                    app.lane_errors.remove(lane_id);
+                                }
+                                app.detail = match result.verb.as_str() {
+                                    "upgrade" => upgrade_detail(&output.stdout)?,
+                                    "diff" => {
+                                        let value: serde_json::Value =
+                                            serde_json::from_slice(&output.stdout)?;
+                                        let lines = value["diff"]
+                                            .as_array()
+                                            .into_iter()
+                                            .flatten()
+                                            .filter_map(serde_json::Value::as_str)
+                                            .collect::<Vec<_>>();
+                                        if lines.is_empty() {
+                                            "No meaningful writable-root changes.".into()
+                                        } else {
+                                            lines.join("\n")
+                                        }
+                                    }
+                                    "inspect" => inspect_detail(&output.stdout)?,
+                                    "reconcile" => {
+                                        let value: serde_json::Value =
+                                            serde_json::from_slice(&output.stdout)?;
+                                        serde_json::to_string_pretty(&value)?
+                                    }
+                                    _ => String::new(),
+                                };
+                                app.message = format!("{}: completed", result.label);
+                                if let Some(lanes) = cached_lanes {
+                                    replace_lanes(app, lanes);
                                 }
                             }
-                            "inspect" => inspect_detail(&output.stdout)?,
-                            _ => String::new(),
-                        };
-                        app.message = format!("{}: completed", result.label);
-                        app.lanes = load_cached_lanes()?;
-                        sort_lanes(&mut app.lanes);
-                        clamp_selection(app);
-                    }
-                    Ok(output) => {
+                            Ok(output) => {
+                                app.message = format!("{}: failed", result.label);
+                                app.detail = command_error(
+                                    &output.stderr,
+                                    &format!("{} failed without an error message", result.label),
+                                );
+                                if let Some(lane_id) = &job_lane_id {
+                                    app.lane_errors.insert(lane_id.clone(), app.detail.clone());
+                                }
+                            }
+                            Err(error) => {
+                                app.message = format!("{}: failed", result.label);
+                                app.detail = error;
+                                if let Some(lane_id) = &job_lane_id {
+                                    app.lane_errors.insert(lane_id.clone(), app.detail.clone());
+                                }
+                            }
+                        }
+                        Ok(())
+                    })();
+                    if let Err(error) = applied {
                         app.message = format!("{}: failed", result.label);
-                        app.detail = String::from_utf8_lossy(&output.stderr).trim().into();
+                        app.detail = format!("{error:#}");
+                        if let Some(lane_id) = &job_lane_id {
+                            app.lane_errors.insert(lane_id.clone(), app.detail.clone());
+                        }
                     }
-                    Err(error) => {
-                        app.message = format!("{}: failed", result.label);
-                        app.detail = error;
-                    }
+                    complete = true;
+                    break;
                 }
-                return Ok(());
-            }
-            Err(TryRecvError::Empty) => {
-                app.job = Some(receiver);
-                return Ok(());
-            }
-            Err(TryRecvError::Disconnected) => {
-                app.message = "action worker stopped unexpectedly".into();
-                return Ok(());
+                Err(TryRecvError::Empty) => {
+                    break;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    app.message = format!("{} worker stopped unexpectedly", job.verb);
+                    app.detail = app.message.clone();
+                    if let Some(lane_id) = &job_lane_id {
+                        app.lane_errors.insert(lane_id.clone(), app.detail.clone());
+                    }
+                    complete = true;
+                    break;
+                }
             }
         }
+        if !complete {
+            active.push(job);
+        }
     }
+    app.jobs = active;
+    start_queued_jobs(app);
+}
+#[cfg(test)]
+fn poll_job(app: &mut App) -> Result<()> {
+    poll_jobs(app);
+    Ok(())
 }
 fn append_detail_line(app: &mut App, line: &str) {
     if !app.detail.is_empty() {
@@ -513,38 +794,71 @@ fn append_detail_line(app: &mut App, line: &str) {
             .join("\n");
     }
 }
+fn selected_has_error(app: &App) -> bool {
+    app.visible()
+        .get(app.selected)
+        .is_some_and(|lane| app.lane_errors.contains_key(&lane.spec.id))
+}
+fn set_background_message(app: &mut App, message: String) {
+    if !selected_has_error(app) {
+        app.message = message;
+    }
+}
 fn start_state_poll(app: &mut App) {
-    if app.state_poll.is_some() {
+    if app.state_poll_pending > 0 {
         app.message = "state check already running".into();
         return;
     }
     let (sender, receiver) = mpsc::channel();
-    let lanes = app
-        .lanes
-        .iter()
-        .map(|lane| (lane.spec.id.clone(), lane.spec.name.clone()))
-        .collect::<Vec<_>>();
-    if lanes.is_empty() {
+    if app.lanes.is_empty() {
         app.message = "no lanes registered".into();
         return;
     }
-    app.state_poll_pending = lanes.len();
-    for (lane_id, lane_name) in lanes {
-        let sender = sender.clone();
+    app.state_poll_queue.clear();
+    app.state_poll_errors.clear();
+    for lane in &app.lanes {
+        app.next_refresh_generation += 1;
+        let generation = app.next_refresh_generation;
+        app.refresh_generations
+            .insert(lane.spec.id.clone(), generation);
+        app.state_poll_queue.push_back(StatePollRequest {
+            lane_id: lane.spec.id.clone(),
+            lane_name: lane.spec.name.clone(),
+            generation,
+        });
+    }
+    app.state_poll_pending = app.state_poll_queue.len();
+    app.state_poll = Some(receiver);
+    app.state_poll_sender = Some(sender);
+    spawn_state_polls(app);
+    set_background_message(
+        app,
+        format!("checking lane states: {} pending", app.state_poll_pending),
+    );
+}
+fn spawn_state_polls(app: &mut App) {
+    const MAX_STATE_POLLS: usize = 4;
+    while app.state_poll_inflight < MAX_STATE_POLLS {
+        let Some(request) = app.state_poll_queue.pop_front() else {
+            return;
+        };
+        let Some(sender) = app.state_poll_sender.clone() else {
+            return;
+        };
+        app.state_poll_inflight += 1;
         std::thread::spawn(move || {
             let output = Command::new("worklane")
-                .args(["--json", "lane", "inspect", &lane_id, "--fast"])
+                .args(["--json", "lane", "inspect", &request.lane_id, "--fast"])
                 .output()
                 .map_err(|error| error.to_string());
             let _ = sender.send(StatePollResult {
-                lane_id,
-                lane_name,
+                lane_id: request.lane_id,
+                lane_name: request.lane_name,
+                generation: request.generation,
                 output,
             });
         });
     }
-    app.state_poll = Some(receiver);
-    app.message = format!("checking lane states: {} pending", app.state_poll_pending);
 }
 fn poll_state(app: &mut App) -> Result<()> {
     let Some(receiver) = app.state_poll.take() else {
@@ -553,36 +867,56 @@ fn poll_state(app: &mut App) -> Result<()> {
     loop {
         match receiver.try_recv() {
             Ok(result) => {
+                app.state_poll_inflight = app.state_poll_inflight.saturating_sub(1);
                 app.state_poll_pending = app.state_poll_pending.saturating_sub(1);
+                let current = app.refresh_generations.get(&result.lane_id).copied();
+                if current.is_some() && current != Some(result.generation) {
+                    spawn_state_polls(app);
+                    if app.state_poll_pending == 0 {
+                        finish_state_poll(app);
+                        app.state_poll_sender = None;
+                        return Ok(());
+                    }
+                    continue;
+                }
                 match result.output {
                     Ok(output) if output.status.success() => {
                         let status: LaneStatus = serde_json::from_slice(&output.stdout)?;
                         update_lane_status(app, status);
-                        app.message = format!(
-                            "checked {}; {} pending",
-                            result.lane_name, app.state_poll_pending
+                        set_background_message(
+                            app,
+                            format!(
+                                "checked {}; {} pending",
+                                result.lane_name, app.state_poll_pending
+                            ),
                         );
-                        app.detail.clear();
                     }
                     Ok(output) => {
-                        mark_lane_state(app, &result.lane_id, "unknown", false);
                         app.message = format!(
                             "state check failed for {}; {} pending",
                             result.lane_name, app.state_poll_pending
                         );
-                        app.detail = String::from_utf8_lossy(&output.stderr).trim().into();
+                        let error = command_error(
+                            &output.stderr,
+                            &format!(
+                                "state check exited with {} without an error message",
+                                output.status
+                            ),
+                        );
+                        record_state_poll_error(app, &result.lane_id, &result.lane_name, &error);
                     }
                     Err(error) => {
-                        mark_lane_state(app, &result.lane_id, "unknown", false);
                         app.message = format!(
                             "state check failed for {}; {} pending",
                             result.lane_name, app.state_poll_pending
                         );
-                        app.detail = error;
+                        record_state_poll_error(app, &result.lane_id, &result.lane_name, &error);
                     }
                 }
+                spawn_state_polls(app);
                 if app.state_poll_pending == 0 {
-                    app.message = "state checks complete".into();
+                    finish_state_poll(app);
+                    app.state_poll_sender = None;
                     return Ok(());
                 }
             }
@@ -592,19 +926,47 @@ fn poll_state(app: &mut App) -> Result<()> {
             }
             Err(TryRecvError::Disconnected) => {
                 if app.state_poll_pending == 0 {
-                    app.message = "state checks complete".into();
+                    finish_state_poll(app);
                 } else {
-                    app.message = format!(
-                        "state checker stopped with {} pending",
-                        app.state_poll_pending
-                    );
+                    let error = format!("stopped with {} pending", app.state_poll_pending);
+                    app.message = format!("state checker {error}");
+                    app.state_poll_errors
+                        .push(format!("state checker: {error}"));
+                    app.detail = app.state_poll_errors.join("\n");
                 }
+                app.state_poll_sender = None;
                 return Ok(());
             }
         }
     }
 }
+fn record_state_poll_error(app: &mut App, lane_id: &str, lane: &str, error: &str) {
+    app.state_poll_errors.push(format!("{lane}: {error}"));
+    app.lane_errors.insert(lane_id.into(), error.into());
+    app.detail = app.state_poll_errors.join("\n");
+}
+fn finish_state_poll(app: &mut App) {
+    let message = if app.state_poll_errors.is_empty() {
+        "state checks complete".into()
+    } else {
+        format!(
+            "state checks complete with {} failure{}; see details",
+            app.state_poll_errors.len(),
+            if app.state_poll_errors.len() == 1 {
+                ""
+            } else {
+                "s"
+            }
+        )
+    };
+    if app.state_poll_errors.is_empty() {
+        set_background_message(app, message);
+    } else {
+        app.message = message;
+    }
+}
 fn update_lane_status(app: &mut App, status: LaneStatus) {
+    let selected_id = selected_lane_id(app);
     if let Some(lane) = app
         .lanes
         .iter_mut()
@@ -612,25 +974,9 @@ fn update_lane_status(app: &mut App, status: LaneStatus) {
     {
         *lane = status;
     }
-    sort_lanes(&mut app.lanes);
-    clamp_selection(app);
-}
-fn mark_lane_state(app: &mut App, lane_id: &str, state: &str, drift: bool) {
-    if let Some(lane) = app.lanes.iter_mut().find(|lane| lane.spec.id == lane_id) {
-        lane.state = state.into();
-        lane.drift = drift;
-    }
+    restore_selection(app, selected_id.as_deref());
 }
 fn refresh_all(app: &mut App) {
-    if app.state_poll.is_none() {
-        for lane in &mut app.lanes {
-            lane.state = "unknown".into();
-            lane.drift = false;
-        }
-        sort_lanes(&mut app.lanes);
-        clamp_selection(app);
-        app.detail.clear();
-    }
     start_state_poll(app);
 }
 fn edit_containerfile(app: &mut App) -> Result<()> {
@@ -662,7 +1008,29 @@ impl Drop for TerminalGuard {
         restore_terminal_state();
     }
 }
-fn main() -> Result<()> {
+struct ResumeTui;
+impl Drop for ResumeTui {
+    fn drop(&mut self) {
+        let _ = execute!(io::stdout(), EnterAlternateScreen);
+        let _ = enable_raw_mode();
+    }
+}
+fn main() {
+    install_panic_hook();
+    if let Err(error) = run_tui() {
+        restore_terminal_state();
+        eprintln!("lane: {error:#}");
+        std::process::exit(1);
+    }
+}
+fn install_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal_state();
+        previous(info);
+    }));
+}
+fn run_tui() -> Result<()> {
     restore_terminal_state();
     enable_raw_mode()?;
     let _guard = TerminalGuard;
@@ -697,29 +1065,37 @@ fn run_app(
     mut next_key: impl FnMut() -> Result<Option<KeyCode>>,
 ) -> Result<()> {
     loop {
-        poll_job(app)?;
+        poll_jobs(app);
         poll_state(app)?;
+        if let Some(job) = app.jobs.first() {
+            app.message = format!(
+                "{}: running {:.1}s ({} active)",
+                job.label,
+                job.started.elapsed().as_secs_f32(),
+                app.jobs.len()
+            );
+        }
         redraw(app)?;
         let Some(key) = next_key()? else {
             continue;
         };
-        if app.job.is_some() && key != KeyCode::Char('q') {
-            app.message = "action running; lane controls locked".into();
-            continue;
-        }
         match app.handle_key(key) {
             UiAction::Quit => break,
             UiAction::Command(verb, true) => {
-                action_with_args(app, verb, &["--shell"])?;
-                if verb == "attach" {
-                    break;
+                app.message = format!("{verb}: connecting");
+                redraw(app)?;
+                if action_with_args(app, verb, &["--shell"])? {
+                    start_state_poll(app);
                 }
             }
             UiAction::Command("upgrade", false) => start_upgrade(app, false)?,
             UiAction::Command(verb, false) => {
                 if verb == "attach" {
-                    action(app, verb)?;
-                    break;
+                    app.message = "attach: connecting".into();
+                    redraw(app)?;
+                    if action(app, verb)? {
+                        start_state_poll(app);
+                    }
                 } else {
                     start_job(app, verb, &[], false)?;
                 }
@@ -729,7 +1105,19 @@ fn run_app(
                 refresh_all(app);
             }
             UiAction::UpgradeAll => start_upgrade(app, true)?,
-            UiAction::EditContainerfile => edit_containerfile(app)?,
+            UiAction::EditContainerfile => {
+                app.message = "Containerfile editor: opening".into();
+                redraw(app)?;
+                edit_containerfile(app)?;
+            }
+            UiAction::Reconcile(apply) => {
+                let extra = if apply {
+                    vec!["--apply".into()]
+                } else {
+                    Vec::new()
+                };
+                start_job(app, "reconcile", &extra, false)?;
+            }
             UiAction::None => {}
         }
     }
@@ -776,8 +1164,25 @@ fn lane_style(state: &str, drift: bool) -> Style {
         style
     }
 }
+fn cache_age(cached_at: chrono::DateTime<chrono::Utc>) -> String {
+    let seconds = (chrono::Utc::now() - cached_at).num_seconds().max(0);
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3600 {
+        format!("{}m", seconds / 60)
+    } else {
+        format!("{}h", seconds / 3600)
+    }
+}
+fn visible_detail(app: &App) -> &str {
+    selected_lane_id(app)
+        .and_then(|lane_id| app.lane_errors.get(&lane_id))
+        .map(String::as_str)
+        .unwrap_or(&app.detail)
+}
 fn draw(f: &mut ratatui::Frame, app: &App) {
-    let detail_height = if app.detail.is_empty() { 0 } else { 6 };
+    let detail = visible_detail(app);
+    let detail_height = if detail.is_empty() { 0 } else { 6 };
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -788,20 +1193,22 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         ])
         .split(f.area());
     let mut items = vec![ListItem::new(format!(
-        "{} {} {} {}",
+        "{} {} {} {} {}",
         column("NAME", 18),
         column("HOST", 14),
         column("STATE", 10),
+        column("AGE", 7),
         "IMAGE"
     ))
     .style(Style::default().fg(Color::DarkGray))];
     items.extend(app.visible().iter().enumerate().map(|(i, x)| {
         let flag = if x.drift { " drift" } else { "" };
         ListItem::new(format!(
-            "{} {} {} {}{}",
+            "{} {} {} {} {}{}",
             column(&x.spec.name, 18),
             column(&x.spec.host, 14),
             column(&x.state, 10),
+            column(&cache_age(x.cached_at), 7),
             x.spec.profile.image,
             flag
         ))
@@ -838,9 +1245,9 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         Paragraph::new(input_line).block(Block::default().borders(Borders::ALL)),
         areas[1],
     );
-    if !app.detail.is_empty() {
+    if !detail.is_empty() {
         f.render_widget(
-            Paragraph::new(app.detail.as_str()).block(
+            Paragraph::new(detail).block(
                 Block::default()
                     .title(" Details — Esc closes ")
                     .borders(Borders::ALL),
@@ -851,7 +1258,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     f.render_widget(
         Paragraph::new(format!(
             "{}\n\
-             j/k  /  Esc q  a/S attach  s/x run  n rename  d diff  D del  F forget  i info  e edit  u/U up  r",
+             j/k  /  Esc q  a/S attach  s/x run  n rename  d diff  D del  F forget  i info  e edit  u/U up  r c/C fix",
             if app.message.is_empty() {
                 "ready"
             } else {
@@ -892,19 +1299,38 @@ mod tests {
             filter: String::new(),
             filtering: false,
             detail: String::new(),
+            lane_errors: HashMap::new(),
             message: String::new(),
             confirming_delete: false,
             confirming_forget: false,
+            confirming_reconcile: false,
             rename_input: None,
-            job: None,
+            jobs: Vec::new(),
+            job_queue: VecDeque::new(),
             state_poll: None,
+            state_poll_sender: None,
+            state_poll_queue: VecDeque::new(),
+            state_poll_inflight: 0,
             state_poll_pending: 0,
+            state_poll_errors: Vec::new(),
+            refresh_generations: HashMap::new(),
+            next_refresh_generation: 0,
         }
     }
 
     fn environment_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+    fn inject_job(app: &mut App, receiver: Receiver<JobEvent>, verb: &str) {
+        app.jobs.push(ActiveJob {
+            lane_id: Some(app.lanes[0].spec.id.clone()),
+            host: Some(app.lanes[0].spec.host.clone()),
+            verb: verb.into(),
+            label: verb.into(),
+            started: Instant::now(),
+            receiver,
+        });
     }
     #[test]
     fn reducer_covers_navigation_filter_and_actions() {
@@ -958,7 +1384,8 @@ mod tests {
         assert!(app.rename_input.is_none());
         assert_eq!(app.handle_key(KeyCode::Char('D')), UiAction::None);
         assert!(app.confirming_delete);
-        assert!(app.message.contains("Bind-mounted data is preserved"));
+        assert!(app.message.contains("project /tmp is preserved"));
+        assert_eq!(app.handle_key(KeyCode::Char('?')), UiAction::None);
         assert_eq!(app.handle_key(KeyCode::Char('n')), UiAction::None);
         assert!(!app.confirming_delete);
         assert_eq!(app.handle_key(KeyCode::Char('D')), UiAction::None);
@@ -968,7 +1395,8 @@ mod tests {
         );
         assert_eq!(app.handle_key(KeyCode::Char('F')), UiAction::None);
         assert!(app.confirming_forget);
-        assert!(app.message.contains("Podman is untouched"));
+        assert!(app.message.contains("Container, manifest"));
+        assert_eq!(app.handle_key(KeyCode::Char('?')), UiAction::None);
         assert_eq!(app.handle_key(KeyCode::Esc), UiAction::None);
         assert!(!app.confirming_forget);
         assert_eq!(app.handle_key(KeyCode::Char('F')), UiAction::None);
@@ -980,6 +1408,21 @@ mod tests {
         assert_eq!(app.handle_key(KeyCode::Esc), UiAction::None);
         assert!(app.detail.is_empty());
         assert_eq!(app.handle_key(KeyCode::Char('r')), UiAction::Reload);
+        assert_eq!(
+            app.handle_key(KeyCode::Char('c')),
+            UiAction::Reconcile(false)
+        );
+        assert_eq!(app.handle_key(KeyCode::Char('C')), UiAction::None);
+        assert!(app.confirming_reconcile);
+        assert!(app.message.contains("Apply verified reconciliation"));
+        assert_eq!(app.handle_key(KeyCode::Char('?')), UiAction::None);
+        assert_eq!(app.handle_key(KeyCode::Char('n')), UiAction::None);
+        assert!(!app.confirming_reconcile);
+        assert_eq!(app.handle_key(KeyCode::Char('C')), UiAction::None);
+        assert_eq!(
+            app.handle_key(KeyCode::Char('y')),
+            UiAction::Reconcile(true)
+        );
         assert_eq!(
             app.handle_key(KeyCode::Char('e')),
             UiAction::EditContainerfile
@@ -1048,7 +1491,7 @@ mod tests {
     }
 
     #[test]
-    fn registered_lanes_start_unknown_until_polled() {
+    fn registered_lanes_render_cached_state_until_polled() {
         let _guard = environment_lock().lock().unwrap();
         let root = env::temp_dir().join(format!("lane-ui-unknown-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -1061,8 +1504,8 @@ mod tests {
             .unwrap();
 
         let lanes = load_registered_lanes().unwrap();
-        assert_eq!(lanes[0].state, "unknown");
-        assert!(!lanes[0].drift);
+        assert_eq!(lanes[0].state, "running");
+        assert!(lanes[0].drift);
 
         if let Some(value) = previous_data {
             env::set_var("XDG_DATA_HOME", value);
@@ -1104,6 +1547,7 @@ mod tests {
             .send(StatePollResult {
                 lane_id: beta.spec.id.clone(),
                 lane_name: beta.spec.name.clone(),
+                generation: 0,
                 output: Ok(output),
             })
             .unwrap();
@@ -1128,50 +1572,60 @@ mod tests {
             "running"
         );
 
-        let (sender, receiver) = mpsc::channel();
-        app.state_poll = Some(receiver);
-        app.state_poll_pending = 1;
         let failed_output = Command::new("sh")
             .args(["-c", "printf failure >&2; exit 1"])
             .output()
             .unwrap();
         sender
             .send(StatePollResult {
-                lane_id: beta.spec.id.clone(),
-                lane_name: beta.spec.name.clone(),
+                lane_id: app.lanes[0].spec.id.clone(),
+                lane_name: app.lanes[0].spec.name.clone(),
+                generation: 0,
                 output: Ok(failed_output),
             })
             .unwrap();
         poll_state(&mut app).unwrap();
-        assert_eq!(app.detail, "failure");
+        assert_eq!(
+            app.message,
+            "state checks complete with 1 failure; see details"
+        );
+        assert_eq!(app.detail, "alpha: failure");
 
         let (sender, receiver) = mpsc::channel();
         app.state_poll = Some(receiver);
         app.state_poll_pending = 1;
+        app.state_poll_errors.clear();
         sender
             .send(StatePollResult {
                 lane_id: beta.spec.id.clone(),
                 lane_name: beta.spec.name.clone(),
+                generation: 0,
                 output: Err("offline".into()),
             })
             .unwrap();
         poll_state(&mut app).unwrap();
-        assert_eq!(app.message, "state checks complete");
-        assert_eq!(app.detail, "offline");
+        assert_eq!(
+            app.message,
+            "state checks complete with 1 failure; see details"
+        );
+        assert_eq!(app.detail, "beta: offline");
 
         let (sender, receiver) = mpsc::channel();
         app.state_poll = Some(receiver);
         app.state_poll_pending = 1;
+        app.state_poll_errors.clear();
         drop(sender);
         poll_state(&mut app).unwrap();
         assert!(app.message.contains("stopped with 1 pending"));
+        assert!(app.detail.contains("state checker: stopped with 1 pending"));
 
         let (sender, receiver) = mpsc::channel::<StatePollResult>();
         app.state_poll = Some(receiver);
         app.state_poll_pending = 0;
+        app.state_poll_errors.clear();
         drop(sender);
         poll_state(&mut app).unwrap();
-        assert_eq!(app.message, "state checks complete");
+        assert!(app.message.contains("stopped with 1 pending"));
     }
 
     #[test]
@@ -1184,7 +1638,7 @@ mod tests {
         let worklane = bin.join("worklane");
         fs::write(
             &worklane,
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.log\"\nstatus='{\"spec\":{\"version\":1,\"id\":\"alpha-id\",\"name\":\"alpha\",\"host\":\"lab\",\"user\":\"dev\",\"project_path\":\"/tmp\",\"profile\":{\"image\":\"test:latest\",\"build_context\":null,\"containerfile\":\"Containerfile\",\"embedded_containerfile\":true,\"network\":\"outbound\",\"mounts\":[]},\"profile_name\":\"default\",\"created_at\":\"2026-01-01T00:00:00Z\",\"image_digest\":null},\"state\":\"running\",\"drift\":false,\"cached_at\":\"2026-01-01T00:00:00Z\"}'\ncase \"$*\" in *fail*) printf 'command failed\\n' >&2; exit 1;; *diff*) printf '{\"diff\":[]}\\n';; *inspect*) printf '%s\\n' \"$status\";; *upgrade*) printf 'building alpha\\n' >&2; printf '[%s]\\n' \"$status\";; *refresh*) printf '[%s]\\n' \"$status\";; esac\nexit 0\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.log\"\nstatus='{\"spec\":{\"schema_version\":3,\"id\":\"00000000-0000-4000-8000-000000000006\",\"name\":\"alpha\",\"container_name\":\"worklane-00000000-0000-4000-8000-000000000006\",\"session_name\":\"alpha\",\"container_home\":\"/home/dev\",\"host\":\"lab\",\"project_path\":\"/tmp\",\"profile\":{\"image\":\"test:latest\",\"build_context\":\"project\",\"containerfile\":\"Containerfile\",\"embedded_containerfile\":true,\"network\":\"outbound\",\"mounts\":[]},\"profile_name\":\"default\",\"created_at\":\"2026-01-01T00:00:00Z\",\"last_attached\":null,\"image_digest\":null},\"state\":\"running\",\"drift\":false,\"cached_at\":\"2026-01-01T00:00:00Z\"}'\ncase \"$*\" in *fail*) printf 'command failed\\n' >&2; exit 1;; *diff*) printf '{\"diff\":[]}\\n';; *inspect*) printf '%s\\n' \"$status\";; *upgrade*) printf 'building alpha\\n' >&2; printf '[%s]\\n' \"$status\";; *refresh*) printf '[%s]\\n' \"$status\";; esac\nexit 0\n",
         )
         .unwrap();
         #[cfg(unix)]
@@ -1212,7 +1666,7 @@ mod tests {
             .unwrap()
             .save_lane(&app.lanes[0].spec, "running", false)
             .unwrap();
-        action(&mut app, "start").unwrap();
+        assert!(action(&mut app, "start").unwrap());
         assert_eq!(app.message, "start: ok");
         action_with_args(&mut app, "attach", &["--shell"]).unwrap();
         assert_eq!(app.message, "attach: ok");
@@ -1222,13 +1676,13 @@ mod tests {
         assert!(app.detail.contains("State: running"));
         action(&mut app, "upgrade").unwrap();
         assert_eq!(app.detail, "alpha: running");
-        action(&mut app, "fail").unwrap();
+        assert!(!action(&mut app, "fail").unwrap());
         assert_eq!(app.message, "fail: failed");
         assert_eq!(app.detail, "command failed");
         start_upgrade(&mut app, true).unwrap();
         for _ in 0..100 {
             poll_job(&mut app).unwrap();
-            if app.job.is_none() {
+            if app.jobs.is_empty() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(5));
@@ -1241,10 +1695,10 @@ mod tests {
             .any(|line| line == "lane upgrade --all --no-cache"));
         start_job(&mut app, "rename", &["renamed".into()], false).unwrap();
         start_job(&mut app, "start", &[], false).unwrap();
-        assert_eq!(app.message, "another action is already running");
+        assert_eq!(app.message, "start: already queued or running");
         for _ in 0..100 {
             poll_job(&mut app).unwrap();
-            if app.job.is_none() {
+            if app.jobs.is_empty() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(5));
@@ -1252,7 +1706,7 @@ mod tests {
         assert_eq!(app.message, "rename: completed");
 
         let (sender, receiver) = mpsc::channel();
-        app.job = Some(receiver);
+        inject_job(&mut app, receiver, "diff");
         sender.send(JobEvent::Progress("working".into())).unwrap();
         sender
             .send(JobEvent::Complete(JobResult {
@@ -1263,13 +1717,14 @@ mod tests {
                     stdout: br#"{"diff":["A /opt/result"]}"#.to_vec(),
                     stderr: vec![],
                 }),
+                cached_lanes: None,
             }))
             .unwrap();
         poll_job(&mut app).unwrap();
         assert_eq!(app.detail, "A /opt/result");
 
         let (sender, receiver) = mpsc::channel();
-        app.job = Some(receiver);
+        inject_job(&mut app, receiver, "diff");
         sender
             .send(JobEvent::Complete(JobResult {
                 label: "diff".into(),
@@ -1279,13 +1734,14 @@ mod tests {
                     stdout: br#"{"diff":[]}"#.to_vec(),
                     stderr: vec![],
                 }),
+                cached_lanes: None,
             }))
             .unwrap();
         poll_job(&mut app).unwrap();
         assert_eq!(app.detail, "No meaningful writable-root changes.");
 
         let (sender, receiver) = mpsc::channel();
-        app.job = Some(receiver);
+        inject_job(&mut app, receiver, "inspect");
         sender
             .send(JobEvent::Complete(JobResult {
                 label: "inspect".into(),
@@ -1295,13 +1751,14 @@ mod tests {
                     stdout: br#"{"spec":{"name":"alpha","host":"lab","project_path":"/tmp","profile":{"image":"test"}},"state":"running","drift":true}"#.to_vec(),
                     stderr: vec![],
                 }),
+                cached_lanes: None,
             }))
             .unwrap();
         poll_job(&mut app).unwrap();
         assert!(app.detail.contains("(drift)"));
 
         let (sender, receiver) = mpsc::channel();
-        app.job = Some(receiver);
+        inject_job(&mut app, receiver, "start");
         sender
             .send(JobEvent::Complete(JobResult {
                 label: "start".into(),
@@ -1311,28 +1768,30 @@ mod tests {
                     stdout: vec![],
                     stderr: b"runtime failed".to_vec(),
                 }),
+                cached_lanes: None,
             }))
             .unwrap();
         poll_job(&mut app).unwrap();
         assert_eq!(app.detail, "runtime failed");
 
         let (sender, receiver) = mpsc::channel();
-        app.job = Some(receiver);
+        inject_job(&mut app, receiver, "stop");
         sender
             .send(JobEvent::Complete(JobResult {
                 label: "stop".into(),
                 verb: "stop".into(),
                 output: Err("spawn failed".into()),
+                cached_lanes: None,
             }))
             .unwrap();
         poll_job(&mut app).unwrap();
         assert_eq!(app.detail, "spawn failed");
 
         let (sender, receiver) = mpsc::channel::<JobEvent>();
-        app.job = Some(receiver);
+        inject_job(&mut app, receiver, "test");
         drop(sender);
         poll_job(&mut app).unwrap();
-        assert_eq!(app.message, "action worker stopped unexpectedly");
+        assert_eq!(app.message, "test worker stopped unexpectedly");
         app.detail.clear();
         for index in 0..205 {
             append_detail_line(&mut app, &format!("line {index}"));
@@ -1349,7 +1808,7 @@ mod tests {
         assert_eq!(loaded.lanes.len(), 1);
         let mut keys = vec![
             None,
-            Some(KeyCode::Backspace),
+            Some(KeyCode::Esc),
             Some(KeyCode::Char('r')),
             Some(KeyCode::Char('q')),
         ]
@@ -1372,7 +1831,7 @@ mod tests {
             app.message
         );
         let (sender, receiver) = mpsc::channel();
-        app.job = Some(receiver);
+        inject_job(&mut app, receiver, "start");
         let _sender = sender;
         let mut locked_keys = vec![Some(KeyCode::Char('s')), Some(KeyCode::Char('q'))].into_iter();
         let mut locked_redraws = 0;
@@ -1386,9 +1845,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(locked_redraws, 2);
-        assert_eq!(app.message, "action running; lane controls locked");
-        app.job = None;
-        let mut attach_key = Some(KeyCode::Char('a'));
+        assert!(app.message.contains("queued") || app.message.contains("running"));
+        app.jobs.clear();
+        app.job_queue.clear();
+        fs::write(
+            &worklane,
+            "#!/bin/sh\nprintf 'attach exploded\\n' >&2\nexit 17\n",
+        )
+        .unwrap();
+        let mut attach_keys = vec![Some(KeyCode::Char('a')), Some(KeyCode::Char('q'))].into_iter();
         let mut attach_redraws = 0;
         run_app(
             &mut app,
@@ -1396,23 +1861,38 @@ mod tests {
                 attach_redraws += 1;
                 Ok(())
             },
-            || Ok(attach_key.take()),
+            || {
+                Ok(attach_keys
+                    .next()
+                    .expect("failed attach must redraw before quit"))
+            },
         )
         .unwrap();
-        assert_eq!(attach_redraws, 1);
+        assert_eq!(attach_redraws, 3);
+        assert_eq!(app.message, "attach: failed");
+        assert_eq!(app.detail, "attach exploded");
         let mut empty = App {
             lanes: vec![],
             selected: 0,
             filter: String::new(),
             filtering: false,
             detail: String::new(),
+            lane_errors: HashMap::new(),
             message: String::new(),
             confirming_delete: false,
             confirming_forget: false,
+            confirming_reconcile: false,
             rename_input: None,
-            job: None,
+            jobs: Vec::new(),
+            job_queue: VecDeque::new(),
             state_poll: None,
+            state_poll_sender: None,
+            state_poll_queue: VecDeque::new(),
+            state_poll_inflight: 0,
             state_poll_pending: 0,
+            state_poll_errors: Vec::new(),
+            refresh_generations: HashMap::new(),
+            next_refresh_generation: 0,
         };
         action(&mut empty, "start").unwrap();
         start_job(&mut empty, "start", &[], false).unwrap();
@@ -1471,7 +1951,7 @@ mod tests {
         assert!(text.contains("u/U up"));
 
         let inspected = inspect_detail(
-            br#"{"spec":{"name":"alpha","host":"lab","project_path":"/tmp","user":"gerald","profile":{"image":"test:latest"}},"state":"running","drift":false}"#,
+            br#"{"spec":{"name":"alpha","host":"lab","project_path":"/tmp","profile":{"image":"test:latest"}},"state":"running","drift":false}"#,
         )
         .unwrap();
         assert!(inspected.contains("Home: /home/dev"));

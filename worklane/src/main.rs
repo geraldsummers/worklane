@@ -8,6 +8,8 @@ use std::{
     io::{self, Read, Write},
     path::{Path, PathBuf},
     process::Command,
+    sync::OnceLock,
+    time::Instant,
 };
 use worklane_core::*;
 
@@ -16,6 +18,28 @@ const EMBEDDED_CONTAINERFILE: &str = include_str!("../../Containerfile");
 const STANDARD_CONTAINERFILE_MARKER: &str = "worklane-standard-containerfile";
 /// Guidance seeded into Codex's global instructions on first lane attach.
 const LANE_AGENTS_MD: &str = include_str!("../../AGENTS.md");
+static OPERATION_CONTEXT: OnceLock<(String, Instant)> = OnceLock::new();
+
+fn report_phase(lane_id: Option<&str>, status: &str, phase: &str, message: &str) {
+    let (operation_id, started) =
+        OPERATION_CONTEXT.get_or_init(|| (uuid::Uuid::new_v4().to_string(), Instant::now()));
+    let event = OperationEvent {
+        operation_id: operation_id.clone(),
+        lane_id: lane_id.map(str::to_owned),
+        status: status.into(),
+        phase: phase.into(),
+        elapsed_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+        message: message.into(),
+    };
+    if std::env::var_os("WORKLANE_EVENT_STREAM").is_some() {
+        eprintln!(
+            "{}",
+            serde_json::to_string(&event).expect("operation event serializes")
+        );
+    } else {
+        eprintln!("worklane: {phase}: {message}");
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "worklane", about = "Rootless Podman development lanes")]
@@ -30,6 +54,7 @@ enum Top {
     Host(HostCmd),
     Image(ImageCmd),
     Lane(LaneCmd),
+    Registry(RegistryCmd),
     /// Generate shell completion scripts.
     #[command(alias = "completion")]
     Completions {
@@ -38,6 +63,19 @@ enum Top {
     },
     #[command(hide = true)]
     Executor,
+}
+#[derive(Args)]
+struct RegistryCmd {
+    #[command(subcommand)]
+    command: RegistryAction,
+}
+#[derive(Subcommand)]
+enum RegistryAction {
+    /// Explicitly acknowledge a clean v3 registry while preserving older databases.
+    Init {
+        #[arg(long)]
+        fresh: bool,
+    },
 }
 #[derive(Args)]
 struct HostCmd {
@@ -108,8 +146,6 @@ enum LaneAction {
         #[arg(long, hide = true)]
         id: Option<String>,
         #[arg(long, hide = true)]
-        user: Option<String>,
-        #[arg(long, hide = true)]
         profile_json: Option<String>,
         #[arg(long, default_value = "default")]
         profile: String,
@@ -169,9 +205,13 @@ enum LaneAction {
     Forget {
         lane: String,
     },
-    #[command(hide = true)]
-    Migrate {
-        lane: String,
+    /// Report manifest/index/runtime divergence; apply only verified repairs with --apply.
+    Reconcile {
+        lane: Option<String>,
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        apply: bool,
     },
 }
 fn emit<T: Serialize>(json: bool, value: &T) -> Result<()> {
@@ -199,12 +239,13 @@ fn remote<R: Runner>(
     if host.local {
         return Ok(None);
     }
+    let request = new_executor_request(args);
     let out = runner.run_with_input(
         "ssh",
         &executor_command(&host.ssh_target),
-        &executor_request(args)?,
+        &serde_json::to_vec(&request)?,
     )?;
-    Ok(Some(out))
+    Ok(Some(decode_executor_response(&out, &request.request_id)?))
 }
 fn remote_host<R: Runner>(
     runner: &R,
@@ -223,11 +264,42 @@ fn remote_host<R: Runner>(
     if host.local {
         return Ok(None);
     }
-    Ok(Some(runner.run_with_input(
-        "ssh",
-        &executor_command(&host.ssh_target),
-        &executor_request(args)?,
+    let request = new_executor_request(args);
+    Ok(Some(decode_executor_response(
+        &runner.run_with_input(
+            "ssh",
+            &executor_command(&host.ssh_target),
+            &serde_json::to_vec(&request)?,
+        )?,
+        &request.request_id,
     )?))
+}
+fn decode_executor_response(document: &str, request_id: &str) -> Result<String> {
+    let response: ExecutorResponse = serde_json::from_str(document)
+        .context("remote executor did not return a versioned response envelope")?;
+    if response.protocol_version != EXECUTOR_PROTOCOL {
+        bail!("executor response protocol mismatch: deploy a matching worklane binary")
+    }
+    if response.request_id != request_id {
+        bail!("executor response request ID mismatch; the remote response is ambiguous")
+    }
+    if !response.success {
+        let error = response
+            .error
+            .context("remote executor failed without an error report")?;
+        bail!(
+            "remote operation failed [{}]: {}{}",
+            error.code,
+            error.message,
+            error
+                .guidance
+                .map(|guidance| format!("; {guidance}"))
+                .unwrap_or_default()
+        )
+    }
+    Ok(serde_json::to_string(
+        &response.payload.unwrap_or(serde_json::Value::Null),
+    )?)
 }
 fn ensure_standard_containerfile() -> Result<PathBuf> {
     let path = containerfile_path();
@@ -302,9 +374,15 @@ fn image_build_key(spec: &LaneSpec) -> Result<String> {
     Ok(serde_json::to_string(&(
         "custom",
         &spec.profile.image,
-        &spec.profile.build_context,
+        effective_build_context(spec),
         &spec.profile.containerfile,
     ))?)
+}
+fn effective_build_context(spec: &LaneSpec) -> &Path {
+    spec.profile
+        .build_context
+        .as_deref()
+        .unwrap_or(&spec.project_path)
 }
 fn build_local_image<R: Runner>(r: &R, spec: &LaneSpec, no_cache: bool) -> Result<()> {
     let (file, context) = if spec.profile.embedded_containerfile {
@@ -312,12 +390,15 @@ fn build_local_image<R: Runner>(r: &R, spec: &LaneSpec, no_cache: bool) -> Resul
     } else {
         (
             Some(spec.profile.containerfile.clone()),
-            spec.profile.build_context.clone().context(
-                "lane has no build context; recreate manually or create it with --build-context",
-            )?,
+            effective_build_context(spec).to_path_buf(),
         )
     };
-    eprintln!("worklane: building image '{}'...", spec.profile.image);
+    report_phase(
+        Some(&spec.id),
+        "running",
+        "building",
+        &format!("building image '{}'", spec.profile.image),
+    );
     podman_stream(
         r,
         image_build_args(
@@ -358,17 +439,16 @@ fn host_timezone() -> Option<String> {
         .ok()
         .and_then(|link| timezone_from_localtime_link(&link))
 }
-fn local_start<R: Runner>(r: &R, spec: &LaneSpec) -> Result<()> {
+fn create_local_container<R: Runner>(r: &R, spec: &LaneSpec, name: &str) -> Result<()> {
     if !image_exists(r, &spec.profile.image)? {
         build_local_image(r, spec, false)?;
     }
-    let _ = podman(r, ["rm", "-f", &spec.container_name()]);
-    fs::create_dir_all(spec.home_dir())?;
+    fs::create_dir_all(&spec.project_path)?;
     let mut a = vec![
         "run".into(),
         "-d".into(),
         "--name".into(),
-        spec.container_name(),
+        name.into(),
         "--userns=keep-id".into(),
         "--read-only".into(),
         "--tmpfs".into(),
@@ -382,20 +462,10 @@ fn local_start<R: Runner>(r: &R, spec: &LaneSpec) -> Result<()> {
         "--mount".into(),
         format!(
             "type=bind,src={},dst={}",
-            spec.home_dir().display(),
+            spec.project_path.display(),
             spec.container_home().display()
         ),
     ];
-    if spec.project_path != spec.home_dir() || spec.container_workspace() != spec.container_home() {
-        a.extend([
-            "--mount".into(),
-            format!(
-                "type=bind,src={},dst={}",
-                spec.project_path.display(),
-                spec.container_workspace().display()
-            ),
-        ]);
-    }
     if let Some(timezone) = host_timezone() {
         a.extend(["--env".into(), format!("TZ={timezone}")]);
     }
@@ -429,14 +499,90 @@ fn local_start<R: Runner>(r: &R, spec: &LaneSpec) -> Result<()> {
     Ok(())
 }
 fn ensure_local_started<R: Runner>(r: &R, spec: &LaneSpec) -> Result<()> {
-    if host_runtime_state(r, spec) != "running" {
-        local_start(r, spec)?;
+    match host_runtime_state(r, spec)?.as_str() {
+        "running" => {}
+        "absent" => create_local_container(r, spec, &spec.container_name())?,
+        "stopped" | "exited" | "created" => {
+            podman(r, ["start", &spec.container_name()])?;
+        }
+        state => bail!(
+            "container '{}' is in ambiguous state '{state}'; inspect it before retrying start",
+            spec.container_name()
+        ),
     }
     Ok(())
 }
+fn verify_container_owner<R: Runner>(r: &R, name: &str, lane_id: &str) -> Result<()> {
+    let owner = podman(
+        r,
+        [
+            "inspect",
+            "--format",
+            "{{ index .Config.Labels \"io.worklane.id\" }}",
+            name,
+        ],
+    )?;
+    if owner != lane_id {
+        bail!(
+            "container '{name}' is not owned by lane '{lane_id}' (label was '{owner}'); refusing to modify it"
+        )
+    }
+    Ok(())
+}
+fn remove_owned_container<R: Runner>(r: &R, name: &str, lane_id: &str) -> Result<()> {
+    if container_runtime_state(r, name)? == "absent" {
+        return Ok(());
+    }
+    verify_container_owner(r, name, lane_id)?;
+    podman(r, ["rm", "-f", name])?;
+    Ok(())
+}
+fn apply_local_upgrade<R: Runner>(r: &R, spec: &LaneSpec) -> Result<Option<String>> {
+    let canonical = spec.container_name();
+    let staging = format!("{canonical}.next");
+    let previous = format!("{canonical}.previous");
+
+    if container_runtime_state(r, &previous)? != "absent" {
+        verify_container_owner(r, &previous, &spec.id)?;
+        if container_runtime_state(r, &canonical)? == "absent" {
+            bail!(
+                "upgrade stopped after preserving the previous container; run lane reconcile before retrying"
+            )
+        }
+        verify_container_owner(r, &canonical, &spec.id)?;
+        return Ok(Some(previous));
+    }
+
+    remove_owned_container(r, &staging, &spec.id)?;
+    create_local_container(r, spec, &staging)?;
+    if container_runtime_state(r, &staging)? != "running" {
+        bail!("staged upgrade container did not reach running state")
+    }
+    verify_container_owner(r, &staging, &spec.id)?;
+
+    if container_runtime_state(r, &canonical)? != "absent" {
+        verify_container_owner(r, &canonical, &spec.id)?;
+        podman(r, ["stop", &canonical])?;
+        podman(r, ["rename", &canonical, &previous])?;
+    }
+    if let Err(error) = podman(r, ["rename", &staging, &canonical]) {
+        if container_runtime_state(r, &previous)? != "absent"
+            && container_runtime_state(r, &canonical)? == "absent"
+        {
+            let _ = podman(r, ["rename", &previous, &canonical]);
+            let _ = podman(r, ["start", &canonical]);
+        }
+        return Err(error);
+    }
+    if container_runtime_state(r, &canonical)? != "running" {
+        bail!("upgraded canonical container is not running; run lane reconcile")
+    }
+    Ok((container_runtime_state(r, &previous)? != "absent").then_some(previous))
+}
 fn refresh<R: Runner>(runner: &R, store: &Store, spec: &LaneSpec) -> Result<LaneStatus> {
-    let (state, drift) = if spec.host == "local" {
-        host_state(runner, spec)?
+    let (resolved, state, drift) = if spec.host == "local" {
+        let (state, drift) = host_state(runner, spec)?;
+        (spec.clone(), state, drift)
     } else {
         let out = remote(
             runner,
@@ -447,11 +593,14 @@ fn refresh<R: Runner>(runner: &R, store: &Store, spec: &LaneSpec) -> Result<Lane
         .context("remote host unexpectedly treated as local")?;
         let remote_status: LaneStatus = serde_json::from_str(&out)
             .context("remote worklane did not return a LaneStatus JSON document")?;
-        (remote_status.state, remote_status.drift)
+        let mut resolved = remote_status.spec;
+        resolved.host = spec.host.clone();
+        resolved.project_path = spec.project_path.clone();
+        (resolved, remote_status.state, remote_status.drift)
     };
-    store.save_lane(spec, &state, drift)?;
+    store.save_lane(&resolved, &state, drift)?;
     Ok(LaneStatus {
-        spec: spec.clone(),
+        spec: resolved,
         state,
         drift,
         cached_at: Utc::now(),
@@ -463,8 +612,8 @@ fn refresh_state_only<R: Runner>(runner: &R, store: &Store, spec: &LaneSpec) -> 
         .into_iter()
         .find(|status| status.spec.id == spec.id)
         .is_some_and(|status| status.drift);
-    let state = if spec.host == "local" {
-        host_runtime_state(runner, spec)
+    let (resolved, state) = if spec.host == "local" {
+        (spec.clone(), host_runtime_state(runner, spec)?)
     } else {
         let out = remote(
             runner,
@@ -480,11 +629,14 @@ fn refresh_state_only<R: Runner>(runner: &R, store: &Store, spec: &LaneSpec) -> 
         .context("remote host unexpectedly treated as local")?;
         let remote_status: LaneStatus = serde_json::from_str(&out)
             .context("remote worklane did not return a LaneStatus JSON document")?;
-        remote_status.state
+        let mut resolved = remote_status.spec;
+        resolved.host = spec.host.clone();
+        resolved.project_path = spec.project_path.clone();
+        (resolved, remote_status.state)
     };
-    store.save_lane(spec, &state, existing_drift)?;
+    store.save_lane(&resolved, &state, existing_drift)?;
     Ok(LaneStatus {
-        spec: spec.clone(),
+        spec: resolved,
         state,
         drift: existing_drift,
         cached_at: Utc::now(),
@@ -509,64 +661,18 @@ fn validate_lane_registration(store: &Store, candidate: &LaneSpec) -> Result<()>
     }
     Ok(())
 }
-fn migrate_local_lane<R: Runner>(runner: &R, store: &Store, spec: &LaneSpec) -> Result<LaneSpec> {
-    if spec.version >= 2 {
-        let marker = spec.project_path.join(".worklane").join("migration-v1");
-        if !marker.exists() {
-            return Ok(spec.clone());
-        }
-        let mut migrated = spec.clone();
-        let mut legacy = spec.clone();
-        legacy.version = 1;
-        finish_lane_migration(&legacy, &mut migrated)?;
-        write_lane_spec(&migrated)?;
-        store.save_lane(&migrated, "unknown", false)?;
-        return Ok(migrated);
-    }
-    let state = host_runtime_state(runner, spec);
-    if !matches!(state.as_str(), "absent" | "exited" | "stopped") {
-        bail!(
-            "legacy lane '{}' has runtime state '{state}'; stop it before migration",
-            spec.name,
-        )
-    }
-    let mut migrated = prepare_lane_migration(spec)?;
-    write_lane_spec(&migrated)?;
-    store.save_lane(&migrated, "unknown", false)?;
-    finish_lane_migration(spec, &mut migrated)?;
-    write_lane_spec(&migrated)?;
-    store.save_lane(&migrated, "unknown", false)?;
-    let quarantine = migration_quarantine_dir(&migrated);
-    if quarantine.exists() {
-        eprintln!(
-            "migration completed with recoverable entries quarantined at {}",
-            quarantine.display()
-        );
-    }
-    Ok(migrated)
-}
-fn ensure_lane_layout<R: Runner>(runner: &R, store: &Store, spec: &LaneSpec) -> Result<LaneSpec> {
-    if spec.version >= 2 {
-        if spec.host == "local" {
-            return migrate_local_lane(runner, store, spec);
-        }
-        return Ok(spec.clone());
-    }
+fn ensure_no_pending_operation(spec: &LaneSpec, verb: &str) -> Result<()> {
     if spec.host == "local" {
-        return migrate_local_lane(runner, store, spec);
+        if let Some(journal) = read_operation_journal(spec)? {
+            bail!(
+                "cannot {verb} lane '{}' while its '{}' operation is paused at '{}'; retry that operation or run lane reconcile",
+                spec.name,
+                journal.kind,
+                journal.phase
+            )
+        }
     }
-    let out = remote(
-        runner,
-        store,
-        spec,
-        vec!["lane".into(), "migrate".into(), spec.id.clone()],
-    )?
-    .context("remote host unexpectedly treated as local")?;
-    let mut migrated: LaneSpec =
-        serde_json::from_str(&out).context("remote worklane did not return a migrated LaneSpec")?;
-    migrated.host = spec.host.clone();
-    store.save_lane(&migrated, "unknown", false)?;
-    Ok(migrated)
+    Ok(())
 }
 fn refresh_all<R: Runner>(runner: &R, store: &Store) -> Result<Vec<LaneStatus>> {
     let specs = store
@@ -580,6 +686,154 @@ fn refresh_all<R: Runner>(runner: &R, store: &Store) -> Result<Vec<LaneStatus>> 
     }
     Ok(statuses)
 }
+fn reconcile_local(
+    runner: &impl Runner,
+    store: &Store,
+    index: &LaneIndex,
+    apply: bool,
+) -> Result<ReconcileReport> {
+    let mut report = ReconcileReport {
+        lane_id: index.id.clone(),
+        applied: apply,
+        findings: Vec::new(),
+        changes: Vec::new(),
+        unresolved: Vec::new(),
+    };
+    let project = index
+        .manifest_path
+        .parent()
+        .and_then(Path::parent)
+        .context("indexed manifest path has no project parent")?;
+    let journal = read_operation_journal_at(project)?;
+    if let Some(journal) = &journal {
+        report.findings.push(ReconcileFinding {
+            code: "pending-operation".into(),
+            component: "operation-journal".into(),
+            message: format!("{} is paused at phase {}", journal.kind, journal.phase),
+            repairable: matches!(
+                (journal.kind.as_str(), journal.phase.as_str()),
+                ("create" | "upgrade", "runtime-applied")
+                    | ("rename", "manifest-applied")
+                    | ("delete", "manifest-removed")
+            ),
+        });
+    }
+    let manifest_exists = index.manifest_path.exists();
+    let manifest = if manifest_exists {
+        match read_lane_spec(
+            &index.manifest_path,
+            index.host.clone(),
+            index.last_attached,
+        ) {
+            Ok(spec) => Some(spec),
+            Err(error) => {
+                report.unresolved.push(format!("manifest: {error:#}"));
+                None
+            }
+        }
+    } else {
+        report.findings.push(ReconcileFinding {
+            code: "manifest-missing".into(),
+            component: "manifest".into(),
+            message: format!("{} does not exist", index.manifest_path.display()),
+            repairable: journal.as_ref().is_some_and(|journal| {
+                matches!(
+                    (journal.kind.as_str(), journal.phase.as_str()),
+                    ("create" | "upgrade", "runtime-applied") | ("delete", "manifest-removed")
+                )
+            }),
+        });
+        None
+    };
+    if let Some(spec) = &manifest {
+        if spec.name != index.name
+            || spec.container_name != index.container_name
+            || spec.session_name != index.session_name
+            || spec.profile != index.profile
+        {
+            report.findings.push(ReconcileFinding {
+                code: "index-stale".into(),
+                component: "registry-cache".into(),
+                message: "cached manifest projection differs from the authoritative manifest"
+                    .into(),
+                repairable: true,
+            });
+            if apply {
+                store.save_lane(spec, &index.state, index.drift)?;
+                report
+                    .changes
+                    .push("updated registry projection from manifest".into());
+            }
+        }
+    }
+    match container_runtime_state(runner, &index.container_name) {
+        Ok(state) if state != index.state => {
+            report.findings.push(ReconcileFinding {
+                code: "status-stale".into(),
+                component: "runtime".into(),
+                message: format!(
+                    "cached state '{}' differs from runtime '{state}'",
+                    index.state
+                ),
+                repairable: true,
+            });
+            if apply {
+                store.save_status(&index.id, &state, index.drift)?;
+                report
+                    .changes
+                    .push(format!("cached runtime state as {state}"));
+            }
+        }
+        Ok(_) => {}
+        Err(error) => report.unresolved.push(format!("runtime: {error:#}")),
+    }
+    if apply {
+        if let Some(journal) = journal {
+            let desired = LaneSpec::from_manifest(
+                journal.desired_manifest,
+                index.host.clone(),
+                project.to_path_buf(),
+                index.last_attached,
+            )?;
+            let desired_is_current = manifest.as_ref().is_some_and(|current| {
+                manifest_sha256(current).ok() == Some(journal.desired_manifest_sha256.clone())
+            });
+            match (journal.kind.as_str(), journal.phase.as_str()) {
+                ("create" | "upgrade", "runtime-applied") => {
+                    if manifest_exists && manifest.is_none() {
+                        report.unresolved.push(
+                            "operation commit refused because the existing manifest is unreadable or unsupported"
+                                .into(),
+                        );
+                        return Ok(report);
+                    }
+                    write_lane_spec(&desired)?;
+                    store.save_lane(&desired, &index.state, index.drift)?;
+                    clear_operation_journal(&desired)?;
+                    report
+                        .changes
+                        .push(format!("completed {} commit", journal.kind));
+                }
+                ("rename", "manifest-applied") | ("rename", "prepared") if desired_is_current => {
+                    store.save_lane(&desired, &index.state, index.drift)?;
+                    clear_operation_journal(&desired)?;
+                    report.changes.push("completed rename index commit".into());
+                }
+                ("delete", "manifest-removed") => {
+                    store.record_tombstone(&desired.id, &desired.name, "delete")?;
+                    store.remove_lane(&desired.id)?;
+                    clear_operation_journal(&desired)?;
+                    report.changes.push("completed delete commit".into());
+                }
+                _ => report.unresolved.push(format!(
+                    "{} at phase {} must be retried with the original command",
+                    journal.kind, journal.phase
+                )),
+            }
+        }
+    }
+    Ok(report)
+}
 fn lane_attach_args(session: &str, shell: bool) -> Vec<String> {
     if shell {
         return vec!["zsh".into(), "-l".into()];
@@ -587,13 +841,8 @@ fn lane_attach_args(session: &str, shell: bool) -> Vec<String> {
     vec!["herdr".into(), "--session".into(), session.into()]
 }
 
-/// Herdr session and workspace labels are user-facing, unlike legacy storage names.
-fn herdr_session_name(spec: &LaneSpec) -> &str {
-    spec.session_name()
-}
-
 fn bootstrap_herdr(spec: &LaneSpec) -> Result<()> {
-    let session = herdr_session_name(spec);
+    let session = spec.session_name();
     let script = r#"set -eu
 marker="$HOME/.local/share/worklane/herdr-codex-integration-v1"
 if [ ! -e "$marker" ]; then
@@ -617,14 +866,24 @@ else
 fi
 watcher="$HOME/.local/share/worklane/bin/worklane-git-diff-pane"
 manager="$HOME/.local/share/worklane/bin/worklane-git-diff-pane-manager"
-if pgrep -u "$(id -u)" -f "$manager" >/dev/null 2>&1; then
-  pkill -u "$(id -u)" -f "$manager" >/dev/null 2>&1 || true
-fi
-if pgrep -u "$(id -u)" -f "$watcher" >/dev/null 2>&1; then
-  pkill -u "$(id -u)" -f "$watcher" >/dev/null 2>&1 || true
+manager_pid_file="$HOME/.local/share/worklane/git-diff-pane-manager.pid"
+if [ -r "$manager_pid_file" ]; then
+  old_pid="$(cat "$manager_pid_file")"
+  case "$old_pid" in
+    *[!0-9]*|'') ;;
+    *)
+      old_command="$(ps -p "$old_pid" -o args= 2>/dev/null || true)"
+      case "$old_command" in
+        *"$manager"*) kill "$old_pid" >/dev/null 2>&1 || true ;;
+      esac
+      ;;
+  esac
 fi
 if [ -x "$manager" ]; then
-  "$manager" >/dev/null 2>&1 &!
+  "$manager" >/dev/null 2>&1 &
+  manager_pid=$!
+  printf '%s\n' "$manager_pid" > "$manager_pid_file"
+  disown "$manager_pid" 2>/dev/null || true
 fi"#;
     let output = Command::new("podman")
         .args([
@@ -634,10 +893,7 @@ fi"#;
             "--env",
             &format!("WORKLANE_SESSION={session}"),
             "--env",
-            &format!(
-                "WORKLANE_WORKSPACE={}",
-                spec.container_workspace().display()
-            ),
+            &format!("WORKLANE_WORKSPACE={}", spec.container_home().display()),
             &spec.container_name(),
             "zsh",
             "-lc",
@@ -848,7 +1104,7 @@ chmod 755 "$HOME/.local/share/worklane/bin/worklane-git-diff-pane"
 cat > "$HOME/.local/share/worklane/bin/worklane-git-diff-pane-manager" <<'WORKLANE_GIT_DIFF_PANE_MANAGER'
 #!/bin/sh
 interval="${{WORKLANE_GIT_DIFF_MANAGER_INTERVAL:-2}}"
-session="${{WORKLANE_NAME:-}}"
+session="${{WORKLANE_SESSION:-}}"
 watcher="$HOME/.local/share/worklane/bin/worklane-git-diff-pane"
 [ -n "$session" ] || exit 0
 
@@ -914,7 +1170,7 @@ fi"#
 }
 fn bootstrap_shell(spec: &LaneSpec) -> Result<()> {
     let script = bootstrap_shell_script();
-    let session = herdr_session_name(spec);
+    let session = spec.session_name();
     let status = Command::new("podman")
         .args([
             "exec",
@@ -923,10 +1179,7 @@ fn bootstrap_shell(spec: &LaneSpec) -> Result<()> {
             "--env",
             &format!("WORKLANE_SESSION={session}"),
             "--env",
-            &format!(
-                "WORKLANE_WORKSPACE={}",
-                spec.container_workspace().display()
-            ),
+            &format!("WORKLANE_WORKSPACE={}", spec.container_home().display()),
             &spec.container_name(),
             "zsh",
             "-lc",
@@ -943,9 +1196,10 @@ fn run_executor() -> Result<()> {
     let mut input = Vec::new();
     io::stdin().read_to_end(&mut input)?;
     let request: ExecutorRequest = serde_json::from_slice(&input)?;
-    if request.protocol != EXECUTOR_PROTOCOL {
+    if request.protocol_version != EXECUTOR_PROTOCOL {
         bail!("executor protocol mismatch: deploy a matching worklane binary")
     }
+    validate_lane_id(&request.request_id).context("executor request ID is not a canonical UUID")?;
     if request.args.first().is_some_and(|arg| arg == "executor") {
         bail!("nested executor request rejected")
     }
@@ -954,11 +1208,33 @@ fn run_executor() -> Result<()> {
         .args(&request.args)
         .output()?;
     io::stderr().write_all(&output.stderr)?;
-    io::stdout().write_all(&output.stdout)?;
-    if !output.status.success() {
-        bail!("executor command failed")
-    }
-    Ok(())
+    let response = if output.status.success() {
+        ExecutorResponse {
+            protocol_version: EXECUTOR_PROTOCOL,
+            request_id: request.request_id,
+            success: true,
+            payload: Some(
+                serde_json::from_slice(&output.stdout)
+                    .with_context(|| "executor command succeeded without a valid JSON result")?,
+            ),
+            error: None,
+        }
+    } else {
+        ExecutorResponse {
+            protocol_version: EXECUTOR_PROTOCOL,
+            request_id: request.request_id,
+            success: false,
+            payload: None,
+            error: Some(ErrorReport {
+                code: "executor-command-failed".into(),
+                message: String::from_utf8_lossy(&output.stderr).trim().into(),
+                guidance: Some("retry after resolving the reported remote error".into()),
+                lane_id: None,
+                retryable: true,
+            }),
+        }
+    };
+    emit(true, &response)
 }
 fn strict_ssh_args(target: &str, command: String) -> Vec<String> {
     vec![
@@ -980,11 +1256,25 @@ fn main() -> Result<()> {
         clap_complete::generate(*shell, &mut command, "worklane", &mut io::stdout());
         return Ok(());
     }
+    if let Top::Registry(RegistryCmd {
+        command: RegistryAction::Init { fresh },
+    }) = &cli.command
+    {
+        if !fresh {
+            bail!("registry initialization requires --fresh acknowledgement")
+        }
+        let _ = Store::init_fresh_default()?;
+        return emit(
+            cli.json,
+            &serde_json::json!({"schema":DATABASE_SCHEMA_VERSION,"initialized":true,"legacy_preserved":true}),
+        );
+    }
     ensure_standard_containerfile()?;
     let store = Store::open_default()?;
     let runner = SystemRunner;
     match cli.command {
         Top::Executor => run_executor(),
+        Top::Registry(_) => unreachable!("registry initialization handled before normal startup"),
         Top::Completions { .. } => unreachable!("completions handled before store initialization"),
         Top::Host(c) => match c.command {
             HostAction::Add { name, ssh } => {
@@ -1165,7 +1455,6 @@ fn main() -> Result<()> {
                     host,
                     project,
                     id,
-                    user,
                     profile_json,
                     profile: profile_name,
                 } => {
@@ -1176,56 +1465,113 @@ fn main() -> Result<()> {
                     } else {
                         project
                     };
-                    let mut selected_profile: Profile = match profile_json {
-                        Some(json) => serde_json::from_str(&json)?,
-                        None => load_profiles()?
-                            .remove(&profile_name)
-                            .with_context(|| format!("unknown profile '{profile_name}'"))?,
-                    };
-                    selected_profile
-                        .build_context
-                        .get_or_insert_with(|| p.clone());
-                    let mut spec = LaneSpec::new(name, host, p, selected_profile)?;
-                    spec.profile_name = profile_name;
-                    if let Some(id) = id {
-                        let runtime_name = format!("worklane-{id}");
-                        spec.id = id;
-                        spec.container_name_override = Some(runtime_name.clone());
-                        spec.session_name_override = Some(runtime_name);
-                    }
-                    // Accepted only for compatibility with older controller binaries.
-                    // The image always provides /home/dev, irrespective of host login.
-                    let _ = user;
-                    validate_profile(
-                        &spec.profile,
-                        &spec.container_home(),
-                        &spec.container_workspace(),
-                        spec.host == "local",
-                    )?;
-                    validate_lane_registration(&store, &spec)?;
-                    if spec.host == "local" && spec.manifest_path().exists() {
-                        bail!(
-                            "directory already contains a Worklane manifest: {}",
-                            spec.manifest_path().display()
-                        )
-                    }
-                    if spec.host == "local" {
-                        write_lane_spec(&spec)?;
-                        if let Err(error) = local_start(&runner, &spec) {
-                            let manifest = spec.manifest_path();
-                            let _ = fs::remove_file(&manifest);
-                            if let Some(control) = manifest.parent() {
-                                let _ = fs::remove_dir(control);
+                    if host == "local" {
+                        let manifest_path = p.join(".worklane/lane.toml");
+                        if manifest_path.exists() {
+                            let existing = read_lane_spec(&manifest_path, host.clone(), None)?;
+                            if existing.name != name {
+                                bail!(
+                                    "directory already contains lane '{}' ({}) rather than requested lane '{name}'",
+                                    existing.name,
+                                    existing.id
+                                )
                             }
-                            return Err(error);
+                            if let Some(requested_id) = &id {
+                                if requested_id != &existing.id {
+                                    bail!("existing manifest UUID differs from requested UUID")
+                                }
+                            }
+                            if let Some(journal) = read_operation_journal(&existing)? {
+                                if journal.kind != "create"
+                                    || journal.requested_name != name
+                                    || journal.desired_manifest_sha256
+                                        != manifest_sha256(&existing)?
+                                {
+                                    bail!(
+                                        "project has a pending '{}' operation at '{}'; retry it or run lane reconcile",
+                                        journal.kind,
+                                        journal.phase
+                                    )
+                                }
+                            }
+                            store.save_lane(&existing, "unknown", false)?;
+                            ensure_local_started(&runner, &existing)?;
+                            clear_operation_journal(&existing)?;
+                            return emit(cli.json, &refresh(&runner, &store, &existing)?);
                         }
-                        store.save_lane(&spec, "created", false)?;
+                    }
+                    let pending = if host == "local" {
+                        read_operation_journal_at(&p)?
                     } else {
-                        let h = store
-                            .hosts()?
-                            .into_iter()
-                            .find(|h| h.name == spec.host)
-                            .context("unknown host")?;
+                        None
+                    };
+                    let mut spec = if let Some(journal) = &pending {
+                        if journal.kind != "create" || journal.requested_name != name {
+                            bail!(
+                                "project has an unfinished '{}' operation for lane '{}'; run lane reconcile before creating",
+                                journal.kind,
+                                journal.requested_name
+                            )
+                        }
+                        LaneSpec::from_manifest(
+                            journal.desired_manifest.clone(),
+                            host.clone(),
+                            p.clone(),
+                            None,
+                        )?
+                    } else {
+                        let selected_profile: Profile = match profile_json {
+                            Some(json) => serde_json::from_str(&json)?,
+                            None => load_profiles()?
+                                .remove(&profile_name)
+                                .with_context(|| format!("unknown profile '{profile_name}'"))?,
+                        };
+                        let mut created =
+                            LaneSpec::new(name.clone(), host.clone(), p.clone(), selected_profile)?;
+                        created.profile_name = profile_name;
+                        created
+                    };
+                    if let Some(id) = id {
+                        validate_lane_id(&id)?;
+                        if pending.is_some() && spec.id != id {
+                            bail!("pending create UUID differs from requested UUID")
+                        }
+                        spec.id = id.clone();
+                        spec.container_name = format!("worklane-{id}");
+                    }
+                    validate_profile(&spec.profile, &spec.container_home(), spec.host == "local")?;
+                    validate_lane_registration(&store, &spec)?;
+                    if spec.host == "local" {
+                        let _lock = lock_lane_operation(&spec)?;
+                        let mut journal =
+                            pending.unwrap_or(OperationJournal::new(&spec, "create", "prepared")?);
+                        write_operation_journal(&spec, &journal)?;
+                        report_phase(
+                            Some(&spec.id),
+                            "running",
+                            "preparing-container",
+                            "ensuring the lane container is running",
+                        );
+                        ensure_local_started(&runner, &spec)?;
+                        journal.phase = "runtime-applied".into();
+                        journal.updated_at = Utc::now();
+                        write_operation_journal(&spec, &journal)?;
+                        write_lane_spec(&spec)?;
+                        report_phase(
+                            Some(&spec.id),
+                            "running",
+                            "updating-index",
+                            "committing the registry projection",
+                        );
+                        store.save_lane(&spec, "created", false)?;
+                        clear_operation_journal(&spec)?;
+                    } else {
+                        report_phase(
+                            Some(&spec.id),
+                            "running",
+                            "connecting",
+                            &format!("connecting to host '{}'", spec.host),
+                        );
                         let mut args = vec![
                             "lane".into(),
                             "create".into(),
@@ -1236,8 +1582,6 @@ fn main() -> Result<()> {
                             spec.project_path.display().to_string(),
                             "--id".into(),
                             spec.id.clone(),
-                            "--user".into(),
-                            CONTAINER_USER.into(),
                         ];
                         args.extend([
                             "--profile".into(),
@@ -1245,13 +1589,13 @@ fn main() -> Result<()> {
                             "--profile-json".into(),
                             serde_json::to_string(&spec.profile)?,
                         ]);
-                        let out = SystemRunner.run_with_input(
-                            "ssh",
-                            &executor_command(&h.ssh_target),
-                            &executor_request(args)?,
-                        )?;
-                        let status: LaneStatus = serde_json::from_str(&out)?;
-                        store.save_lane(&spec, &status.state, status.drift)?;
+                        let out = remote(&runner, &store, &spec, args)?
+                            .context("remote host unexpectedly treated as local")?;
+                        let mut status: LaneStatus = serde_json::from_str(&out)?;
+                        status.spec.host = spec.host.clone();
+                        status.spec.project_path = spec.project_path.clone();
+                        store.save_lane(&status.spec, &status.state, status.drift)?;
+                        spec = status.spec;
                     };
                     emit(cli.json, &refresh(&runner, &store, &spec)?)
                 }
@@ -1273,28 +1617,20 @@ fn main() -> Result<()> {
                     {
                         bail!("manifest must be located at <directory>/.worklane/lane.toml")
                     }
-                    let project = manifest
-                        .parent()
-                        .and_then(Path::parent)
-                        .context("manifest must be located at <directory>/.worklane/lane.toml")?
-                        .canonicalize()
-                        .context("lane directory does not exist")?;
-                    let mut spec: LaneSpec = toml::from_str(
-                        &fs::read_to_string(&manifest)
-                            .with_context(|| format!("read {}", manifest.display()))?,
-                    )?;
-                    if spec.version < 2 {
-                        bail!("legacy manifests cannot be imported; migrate them on their original host")
+                    let spec = read_lane_spec(&manifest, "local".into(), None)?;
+                    validate_profile(&spec.profile, &spec.container_home(), spec.host == "local")?;
+                    if let Ok(existing) = store.index(&spec.id) {
+                        if existing.host != spec.host || existing.manifest_path != manifest {
+                            bail!(
+                                "lane UUID '{}' is already indexed at {}:{}; reconcile the conflict before importing",
+                                spec.id,
+                                existing.host,
+                                existing.manifest_path.display()
+                            )
+                        }
+                    } else {
+                        validate_lane_registration(&store, &spec)?;
                     }
-                    spec.project_path = project;
-                    validate_profile(
-                        &spec.profile,
-                        &spec.container_home(),
-                        &spec.container_workspace(),
-                        spec.host == "local",
-                    )?;
-                    validate_lane_registration(&store, &spec)?;
-                    write_lane_spec(&spec)?;
                     store.save_lane(&spec, "unknown", false)?;
                     emit(cli.json, &refresh_state_only(&runner, &store, &spec)?)
                 }
@@ -1309,6 +1645,26 @@ fn main() -> Result<()> {
                 }
                 LaneAction::Rename { lane, new_name } => {
                     let s = store.lane(&lane)?;
+                    if s.name == new_name {
+                        if s.host == "local" {
+                            if let Some(journal) = read_operation_journal(&s)? {
+                                if journal.kind == "rename"
+                                    && journal.requested_name == new_name
+                                    && journal.desired_manifest_sha256 == manifest_sha256(&s)?
+                                {
+                                    store.save_lane(&s, "unknown", false)?;
+                                    clear_operation_journal(&s)?;
+                                } else {
+                                    bail!(
+                                        "lane has a pending '{}' operation at '{}'; retry it or run lane reconcile",
+                                        journal.kind,
+                                        journal.phase
+                                    )
+                                }
+                            }
+                        }
+                        return emit(cli.json, &s);
+                    }
                     let mut renamed = s.clone();
                     renamed.name = new_name.clone();
                     validate_lane_name(&new_name)?;
@@ -1333,22 +1689,44 @@ fn main() -> Result<()> {
                         let mut remote_renamed: LaneSpec = serde_json::from_str(&out)
                             .context("remote worklane did not return the renamed LaneSpec")?;
                         remote_renamed.host = s.host.clone();
-                        if let Err(error) = store.save_lane(&remote_renamed, "unknown", false) {
-                            let _ = remote(
-                                &runner,
-                                &store,
-                                &s,
-                                vec!["lane".into(), "rename".into(), s.id.clone(), s.name.clone()],
-                            );
-                            return Err(error);
-                        }
+                        remote_renamed.project_path = s.project_path.clone();
+                        store.save_lane(&remote_renamed, "unknown", false)?;
                         emit(cli.json, &remote_renamed)
                     } else {
+                        let _lock = lock_lane_operation(&s)?;
+                        let mut journal = match read_operation_journal(&s)? {
+                            Some(journal)
+                                if journal.kind == "rename"
+                                    && journal.requested_name == new_name =>
+                            {
+                                renamed = LaneSpec::from_manifest(
+                                    journal.desired_manifest.clone(),
+                                    s.host.clone(),
+                                    s.project_path.clone(),
+                                    s.last_attached,
+                                )?;
+                                journal
+                            }
+                            Some(journal) => bail!(
+                                "cannot rename while '{}' is paused at '{}'; retry it or run lane reconcile",
+                                journal.kind,
+                                journal.phase
+                            ),
+                            None => OperationJournal::new(&renamed, "rename", "prepared")?,
+                        };
+                        write_operation_journal(&s, &journal)?;
+                        report_phase(
+                            Some(&s.id),
+                            "running",
+                            "committing-manifest",
+                            "updating the authoritative display name",
+                        );
                         write_lane_spec(&renamed)?;
-                        if let Err(error) = store.save_lane(&renamed, "unknown", false) {
-                            let _ = write_lane_spec(&s);
-                            return Err(error);
-                        }
+                        journal.phase = "manifest-applied".into();
+                        journal.updated_at = Utc::now();
+                        write_operation_journal(&renamed, &journal)?;
+                        store.save_lane(&renamed, "unknown", false)?;
+                        clear_operation_journal(&renamed)?;
                         emit(cli.json, &renamed)
                     }
                 }
@@ -1393,7 +1771,14 @@ fn main() -> Result<()> {
                     }
                 }
                 LaneAction::Start { lane } => {
-                    let s = ensure_lane_layout(&runner, &store, &store.lane(&lane)?)?;
+                    let s = store.lane(&lane)?;
+                    ensure_no_pending_operation(&s, "start")?;
+                    report_phase(
+                        Some(&s.id),
+                        "running",
+                        "starting",
+                        &format!("starting lane '{}'", s.name),
+                    );
                     if remote(
                         &runner,
                         &store,
@@ -1408,6 +1793,13 @@ fn main() -> Result<()> {
                 }
                 LaneAction::Stop { lane } => {
                     let s = store.lane(&lane)?;
+                    ensure_no_pending_operation(&s, "stop")?;
+                    report_phase(
+                        Some(&s.id),
+                        "running",
+                        "stopping",
+                        &format!("stopping lane '{}'", s.name),
+                    );
                     if remote(
                         &runner,
                         &store,
@@ -1416,12 +1808,22 @@ fn main() -> Result<()> {
                     )?
                     .is_none()
                     {
-                        podman(&SystemRunner, ["stop", &s.container_name()])?;
+                        match host_runtime_state(&runner, &s)?.as_str() {
+                            "absent" | "stopped" | "exited" => {}
+                            "running" | "starting" => {
+                                podman(&SystemRunner, ["stop", &s.container_name()])?;
+                            }
+                            state => bail!(
+                                "container '{}' is in ambiguous state '{state}'; inspect it before retrying stop",
+                                s.container_name()
+                            ),
+                        }
                     };
                     emit(cli.json, &refresh(&runner, &store, &s)?)
                 }
                 LaneAction::Attach { lane, shell } => {
-                    let mut s = ensure_lane_layout(&runner, &store, &store.lane(&lane)?)?;
+                    let mut s = store.lane(&lane)?;
+                    ensure_no_pending_operation(&s, "attach")?;
                     if s.host != "local" {
                         let host = store
                             .hosts()?
@@ -1452,8 +1854,8 @@ fn main() -> Result<()> {
                     if !shell {
                         bootstrap_herdr(&s)?;
                     }
-                    let session = herdr_session_name(&s);
-                    let command = lane_attach_args(session, shell);
+                    let session = s.session_name();
+                    let command = lane_attach_args(&session, shell);
                     let status = Command::new("podman")
                         .args([
                             "exec",
@@ -1463,7 +1865,7 @@ fn main() -> Result<()> {
                             "--env",
                             &format!("WORKLANE_SESSION={session}"),
                             "--env",
-                            &format!("WORKLANE_WORKSPACE={}", s.container_workspace().display()),
+                            &format!("WORKLANE_WORKSPACE={}", s.container_home().display()),
                             &s.container_name(),
                         ])
                         .args(command)
@@ -1491,7 +1893,7 @@ fn main() -> Result<()> {
                     let mut built_profiles = HashSet::new();
                     let mut upgraded_remote_hosts = HashSet::new();
                     for spec in specs {
-                        let mut s = ensure_lane_layout(&runner, &store, &spec)?;
+                        let mut s = spec;
                         if all && s.host != "local" {
                             if !upgraded_remote_hosts.insert(s.host.clone()) {
                                 continue;
@@ -1518,15 +1920,49 @@ fn main() -> Result<()> {
                         }
                         if s.host == "local" {
                             let r = SystemRunner;
-                            let build_key = image_build_key(&s)?;
-                            if built_profiles.insert(build_key) {
-                                build_local_image(&r, &s, no_cache)?;
-                            }
-                            s.image_digest = Some(image_identity(&r, &s.profile.image)?);
-                            local_start(&runner, &s)?;
-                            s.user = CONTAINER_USER.into();
+                            let _lock = lock_lane_operation(&s)?;
+                            let mut journal = match read_operation_journal(&s)? {
+                                Some(journal) if journal.kind == "upgrade" => {
+                                    s = LaneSpec::from_manifest(
+                                        journal.desired_manifest.clone(),
+                                        s.host.clone(),
+                                        s.project_path.clone(),
+                                        s.last_attached,
+                                    )?;
+                                    journal
+                                }
+                                Some(journal) => bail!(
+                                    "cannot upgrade while '{}' is paused at '{}'; retry it or run lane reconcile",
+                                    journal.kind,
+                                    journal.phase
+                                ),
+                                None => {
+                                    let build_key = image_build_key(&s)?;
+                                    if built_profiles.insert(build_key) {
+                                        build_local_image(&r, &s, no_cache)?;
+                                    }
+                                    s.image_digest =
+                                        Some(image_identity(&r, &s.profile.image)?);
+                                    OperationJournal::new(&s, "upgrade", "prepared")?
+                                }
+                            };
+                            write_operation_journal(&s, &journal)?;
+                            report_phase(
+                                Some(&s.id),
+                                "running",
+                                "switching-container",
+                                "validating and swapping the staged container",
+                            );
+                            let previous = apply_local_upgrade(&runner, &s)?;
+                            journal.phase = "runtime-applied".into();
+                            journal.updated_at = Utc::now();
+                            write_operation_journal(&s, &journal)?;
                             write_lane_spec(&s)?;
-                            out.push(serde_json::to_value(refresh(&runner, &store, &s)?)?)
+                            out.push(serde_json::to_value(refresh(&runner, &store, &s)?)?);
+                            if let Some(previous) = previous {
+                                remove_owned_container(&runner, &previous, &s.id)?;
+                            }
+                            clear_operation_journal(&s)?;
                         } else {
                             let mut args = vec!["lane".into(), "upgrade".into(), s.id.clone()];
                             if force {
@@ -1546,22 +1982,23 @@ fn main() -> Result<()> {
                     emit(cli.json, &out)
                 }
                 LaneAction::Delete { lane } => {
-                    let s = store.lane(&lane)?;
-                    if s.version < 2 {
-                        bail!(
-                            "legacy lane '{}' must be stopped and migrated before deletion",
-                            s.name
-                        )
-                    }
+                    let s = match store.lane(&lane) {
+                        Ok(spec) => spec,
+                        Err(_error)
+                            if store.tombstone_operation(&lane)?.as_deref() == Some("delete") =>
+                        {
+                            return emit(
+                                cli.json,
+                                &serde_json::json!({"deleted":lane,"already_complete":true}),
+                            )
+                        }
+                        Err(error) => return Err(error),
+                    };
                     let status = refresh(&runner, &store, &s)?;
                     if status.drift {
                         bail!("container has writable-root drift; inspect it before deleting")
                     }
-                    if s.host == "local" {
-                        if status.state != "absent" {
-                            podman(&SystemRunner, ["rm", "-f", &s.container_name()])?;
-                        }
-                    } else {
+                    if s.host != "local" {
                         remote(
                             &runner,
                             &store,
@@ -1571,33 +2008,118 @@ fn main() -> Result<()> {
                         .context("remote host unexpectedly treated as local")?;
                     }
                     if s.host == "local" {
+                        let _lock = lock_lane_operation(&s)?;
+                        let mut journal = match read_operation_journal(&s)? {
+                            Some(journal) if journal.kind == "delete" => journal,
+                            Some(journal) => bail!(
+                                "cannot delete while '{}' is paused at '{}'; retry it or run lane reconcile",
+                                journal.kind,
+                                journal.phase
+                            ),
+                            None => OperationJournal::new(&s, "delete", "prepared")?,
+                        };
+                        write_operation_journal(&s, &journal)?;
+                        report_phase(
+                            Some(&s.id),
+                            "running",
+                            "removing-runtime",
+                            "removing the verified disposable container",
+                        );
+                        remove_owned_container(&runner, &s.container_name(), &s.id)?;
+                        journal.phase = "runtime-removed".into();
+                        journal.updated_at = Utc::now();
+                        write_operation_journal(&s, &journal)?;
                         let manifest = s.manifest_path();
+                        let backup = manifest
+                            .with_file_name(format!("lane.toml.deleted-{}", journal.operation_id));
                         if manifest.exists() {
-                            fs::remove_file(&manifest)?;
+                            fs::rename(&manifest, &backup)?;
                         }
-                        if let Err(error) = store.remove_lane(&s.id) {
-                            let _ = write_lane_spec(&s);
-                            return Err(error);
+                        journal.phase = "manifest-removed".into();
+                        journal.updated_at = Utc::now();
+                        write_operation_journal(&s, &journal)?;
+                        store.record_tombstone(&s.id, &s.name, "delete")?;
+                        store.remove_lane(&s.id)?;
+                        if backup.exists() {
+                            fs::remove_file(backup)?;
                         }
-                        if let Some(control) = manifest.parent() {
-                            let _ = fs::remove_dir(control);
-                        }
+                        clear_operation_journal(&s)?;
                     } else {
+                        store.record_tombstone(&s.id, &s.name, "delete")?;
                         store.remove_lane(&s.id)?;
                     }
                     emit(cli.json, &serde_json::json!({"deleted":s.name}))
                 }
                 LaneAction::Forget { lane } => {
-                    let s = store.lane(&lane)?;
-                    store.remove_lane(&s.id)?;
-                    emit(cli.json, &serde_json::json!({"forgot":s.name}))
-                }
-                LaneAction::Migrate { lane } => {
-                    let s = store.lane(&lane)?;
-                    if s.host != "local" {
-                        bail!("lane migrate is an executor-only operation")
+                    let index = store.index(&lane)?;
+                    if index.host == "local" {
+                        let project = index
+                            .manifest_path
+                            .parent()
+                            .and_then(Path::parent)
+                            .context("indexed manifest path has no project parent")?;
+                        if let Some(journal) = read_operation_journal_at(project)? {
+                            bail!(
+                                "cannot forget lane '{}' while '{}' is paused at '{}'; retry it or run lane reconcile",
+                                index.name,
+                                journal.kind,
+                                journal.phase
+                            )
+                        }
                     }
-                    emit(cli.json, &migrate_local_lane(&runner, &store, &s)?)
+                    store.remove_lane(&index.id)?;
+                    emit(cli.json, &serde_json::json!({"forgot":index.name}))
+                }
+                LaneAction::Reconcile { lane, all, apply } => {
+                    let indices = if all {
+                        store
+                            .lanes()?
+                            .into_iter()
+                            .map(|status| store.index(&status.spec.id))
+                            .collect::<Result<Vec<_>>>()?
+                    } else {
+                        vec![store.index(&lane.context("provide a lane or --all")?)?]
+                    };
+                    let mut reports = Vec::new();
+                    for index in indices {
+                        if index.host == "local" {
+                            reports.push(reconcile_local(&runner, &store, &index, apply)?);
+                            continue;
+                        }
+                        let cached = store.lane(&index.id)?;
+                        let mut args = vec!["lane".into(), "reconcile".into(), index.id.clone()];
+                        if apply {
+                            args.push("--apply".into());
+                        }
+                        let output = remote(&runner, &store, &cached, args)?
+                            .context("remote host unexpectedly treated as local")?;
+                        let remote_reports: Vec<ReconcileReport> = serde_json::from_str(&output)?;
+                        reports.extend(remote_reports);
+                        if apply {
+                            let refreshed = remote(
+                                &runner,
+                                &store,
+                                &cached,
+                                vec![
+                                    "lane".into(),
+                                    "inspect".into(),
+                                    index.id.clone(),
+                                    "--fast".into(),
+                                ],
+                            )?
+                            .context("remote host unexpectedly treated as local")?;
+                            let mut status: LaneStatus = serde_json::from_str(&refreshed)?;
+                            status.spec.host = index.host.clone();
+                            status.spec.project_path = index
+                                .manifest_path
+                                .parent()
+                                .and_then(Path::parent)
+                                .unwrap_or(Path::new("."))
+                                .to_path_buf();
+                            store.save_lane(&status.spec, &status.state, status.drift)?;
+                        }
+                    }
+                    emit(cli.json, &reports)
                 }
             }
         }
@@ -1611,6 +2133,22 @@ mod tests {
 
     struct MockRunner {
         calls: Mutex<Vec<(String, Vec<String>)>>,
+    }
+    struct RuntimeStateRunner(&'static str);
+    impl Runner for RuntimeStateRunner {
+        fn run(&self, _program: &str, args: &[String]) -> Result<String> {
+            if args.first().is_some_and(|arg| arg == "inspect") {
+                return Ok(self.0.into());
+            }
+            Ok(String::new())
+        }
+        fn run_output(&self, _program: &str, _args: &[String]) -> Result<ProcessOutput> {
+            Ok(ProcessOutput {
+                code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
     }
     impl MockRunner {
         fn new() -> Self {
@@ -1642,6 +2180,38 @@ mod tests {
                 },
             )
         }
+        fn run_output(&self, program: &str, args: &[String]) -> Result<ProcessOutput> {
+            if program == "podman" && args.first().is_some_and(|arg| arg == "container") {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push((program.into(), args.into()));
+                return Ok(ProcessOutput {
+                    code: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                });
+            }
+            Ok(ProcessOutput {
+                code: 0,
+                stdout: self.run(program, args)?,
+                stderr: String::new(),
+            })
+        }
+        fn run_with_input(&self, program: &str, args: &[String], input: &[u8]) -> Result<String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((program.into(), args.into()));
+            let request: ExecutorRequest = serde_json::from_slice(input)?;
+            Ok(serde_json::to_string(&ExecutorResponse {
+                protocol_version: EXECUTOR_PROTOCOL,
+                request_id: request.request_id,
+                success: true,
+                payload: Some(serde_json::Value::String(String::new())),
+                error: None,
+            })?)
+        }
     }
     fn temp_store() -> (Store, PathBuf) {
         let path =
@@ -1665,14 +2235,100 @@ mod tests {
             vec!["herdr", "--session", "alpha"]
         );
         assert_eq!(lane_attach_args("alpha", true), vec!["zsh", "-l"]);
+        assert_eq!(spec("local").session_name(), "test");
     }
 
     #[test]
-    fn herdr_sessions_are_stable_across_display_renames() {
-        let mut lane = spec("local");
-        let session = herdr_session_name(&lane).to_string();
-        lane.name = "renamed".into();
-        assert_eq!(herdr_session_name(&lane), session);
+    fn reconciliation_reports_and_repairs_verified_partial_states() {
+        let root =
+            std::env::temp_dir().join(format!("worklane-reconcile-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let store = Store::open(root.join("registry.db")).unwrap();
+        let mut indexed = LaneSpec::new(
+            "indexed".into(),
+            "local".into(),
+            root.join("indexed"),
+            Profile::default(),
+        )
+        .unwrap();
+        fs::create_dir_all(&indexed.project_path).unwrap();
+        store.save_lane(&indexed, "stopped", false).unwrap();
+        indexed.name = "manifest-name".into();
+        write_lane_spec(&indexed).unwrap();
+
+        let index = store.index(&indexed.id).unwrap();
+        let dry = reconcile_local(&RuntimeStateRunner("running"), &store, &index, false).unwrap();
+        assert!(!dry.applied);
+        assert!(dry
+            .findings
+            .iter()
+            .any(|finding| finding.code == "index-stale"));
+        assert!(dry
+            .findings
+            .iter()
+            .any(|finding| finding.code == "status-stale"));
+        assert!(dry.changes.is_empty());
+
+        let applied =
+            reconcile_local(&RuntimeStateRunner("running"), &store, &index, true).unwrap();
+        assert!(applied.applied);
+        assert_eq!(applied.changes.len(), 2);
+        assert_eq!(store.index(&indexed.id).unwrap().name, "manifest-name");
+        assert_eq!(store.index(&indexed.id).unwrap().state, "running");
+
+        let create = LaneSpec::new(
+            "resume-create".into(),
+            "local".into(),
+            root.join("create"),
+            Profile::default(),
+        )
+        .unwrap();
+        fs::create_dir_all(&create.project_path).unwrap();
+        store.save_lane(&create, "running", false).unwrap();
+        let mut create_journal = OperationJournal::new(&create, "create", "prepared").unwrap();
+        create_journal.phase = "runtime-applied".into();
+        write_operation_journal(&create, &create_journal).unwrap();
+        let create_report = reconcile_local(
+            &RuntimeStateRunner("running"),
+            &store,
+            &store.index(&create.id).unwrap(),
+            true,
+        )
+        .unwrap();
+        assert!(create_report
+            .changes
+            .contains(&"completed create commit".into()));
+        assert!(create.manifest_path().exists());
+        assert!(read_operation_journal(&create).unwrap().is_none());
+
+        let delete = LaneSpec::new(
+            "resume-delete".into(),
+            "local".into(),
+            root.join("delete"),
+            Profile::default(),
+        )
+        .unwrap();
+        fs::create_dir_all(&delete.project_path).unwrap();
+        store.save_lane(&delete, "absent", false).unwrap();
+        let mut delete_journal = OperationJournal::new(&delete, "delete", "prepared").unwrap();
+        delete_journal.phase = "manifest-removed".into();
+        write_operation_journal(&delete, &delete_journal).unwrap();
+        let delete_report = reconcile_local(
+            &RuntimeStateRunner("absent"),
+            &store,
+            &store.index(&delete.id).unwrap(),
+            true,
+        )
+        .unwrap();
+        assert!(delete_report
+            .changes
+            .contains(&"completed delete commit".into()));
+        assert_eq!(
+            store.tombstone_operation(&delete.id).unwrap().as_deref(),
+            Some("delete")
+        );
+        assert!(store.index(&delete.id).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1685,8 +2341,10 @@ mod tests {
         assert!(source.contains("WORKLANE_SESSION={session}"));
         assert!(source.contains("WORKLANE_WORKSPACE={}"));
         assert!(source.contains("worklane-git-diff-pane-manager"));
-        assert!(source.contains("pkill -u \"$(id -u)\" -f \"$manager\""));
-        assert!(source.contains("\"$manager\" >/dev/null 2>&1 &!"));
+        assert!(source.contains("git-diff-pane-manager.pid"));
+        assert!(source.contains("ps -p \"$old_pid\" -o args="));
+        assert!(source.contains("*\"$manager\"*) kill \"$old_pid\""));
+        assert!(source.contains("manager_pid=$!"));
     }
 
     #[test]
@@ -1752,6 +2410,7 @@ mod tests {
         assert!(shell.contains("$HOME/.local/share/worklane/bin/worklane-git-diff-pane"));
         assert!(shell.contains("$HOME/.local/share/worklane/bin/worklane-git-diff-pane-manager"));
         assert!(shell.contains("WORKLANE_GIT_DIFF_MANAGER_INTERVAL:-2"));
+        assert!(shell.contains("session=\"${WORKLANE_SESSION:-}\""));
         assert!(shell.contains("herdr --session \"$session\" api snapshot"));
         assert!(shell.contains(".result.snapshot.tabs[]?.tab_id"));
         assert!(shell.contains("pane split \"$target\" --direction right --ratio 0.7"));
@@ -1852,7 +2511,7 @@ CMD ["sleep", "infinity"]
         let lane = spec("lab");
         assert_eq!(
             remote(&runner, &store, &lane, vec!["lane".into(), "list".into()]).unwrap(),
-            Some(String::new())
+            Some("\"\"".into())
         );
         assert_eq!(
             remote(&runner, &store, &spec("local"), vec!["lane".into()]).unwrap(),
@@ -1921,50 +2580,6 @@ CMD ["sleep", "infinity"]
     }
 
     #[test]
-    fn local_layout_migration_requires_a_stopped_lane_and_resumes_finalization() {
-        let token = uuid::Uuid::new_v4().to_string();
-        let project = std::env::temp_dir().join(format!("worklane-cli-migration-project-{token}"));
-        fs::create_dir_all(&project).unwrap();
-        let mut legacy = LaneSpec::new(
-            "legacy-cli".into(),
-            "local".into(),
-            project.clone(),
-            Profile::default(),
-        )
-        .unwrap();
-        legacy.version = 1;
-        legacy.lane_dir_name_override = Some(format!("cli-migration-test-{token}"));
-        legacy.container_workspace_override = None;
-        legacy.session_name_override = None;
-        fs::create_dir_all(legacy.home_dir()).unwrap();
-        fs::write(legacy.home_dir().join(".tool-state"), b"state").unwrap();
-        let (store, path) = temp_store();
-        store.save_lane(&legacy, "exited", false).unwrap();
-
-        assert!(migrate_local_lane(&MockRunner::new(), &store, &legacy)
-            .unwrap_err()
-            .to_string()
-            .contains("stop it before migration"));
-
-        let migrated = prepare_lane_migration(&legacy).unwrap();
-        write_lane_spec(&migrated).unwrap();
-        store.save_lane(&migrated, "unknown", false).unwrap();
-        let finalized = migrate_local_lane(&FailingRunner, &store, &migrated).unwrap();
-        assert_eq!(finalized.version, 2);
-        assert!(!legacy.lane_dir().exists());
-        assert!(!project.join(".worklane/migration-v1").exists());
-        assert_eq!(
-            ensure_lane_layout(&FailingRunner, &store, &finalized)
-                .unwrap()
-                .id,
-            finalized.id
-        );
-
-        std::fs::remove_dir_all(project).unwrap();
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
     fn image_build_inherits_calling_identity() {
         let runner = MockRunner::new();
         let args = image_build_args(
@@ -1998,7 +2613,6 @@ CMD ["sleep", "infinity"]
         let first = spec("local");
         let mut second = first.clone();
         second.project_path = PathBuf::from("/var/tmp/another-lane");
-        second.profile.build_context = Some(second.project_path.clone());
         assert_eq!(
             image_build_key(&first).unwrap(),
             image_build_key(&second).unwrap()
@@ -2006,20 +2620,73 @@ CMD ["sleep", "infinity"]
 
         let mut first_custom = first;
         first_custom.profile.embedded_containerfile = false;
-        first_custom.profile.build_context = Some(PathBuf::from("/tmp/context-a"));
         let mut second_custom = first_custom.clone();
-        second_custom.profile.build_context = Some(PathBuf::from("/tmp/context-b"));
+        second_custom.project_path = PathBuf::from("/tmp/context-b");
         assert_ne!(
             image_build_key(&first_custom).unwrap(),
             image_build_key(&second_custom).unwrap()
+        );
+        assert_eq!(effective_build_context(&first_custom), Path::new("/tmp"));
+        assert_eq!(
+            effective_build_context(&second_custom),
+            Path::new("/tmp/context-b")
+        );
+
+        first_custom.profile.build_context = Some(PathBuf::from("/tmp/explicit-context"));
+        first_custom.project_path = PathBuf::from("/tmp/moved-lane");
+        assert_eq!(
+            effective_build_context(&first_custom),
+            Path::new("/tmp/explicit-context")
         );
     }
 
     #[test]
     fn local_start_and_refresh_use_mock_podman() {
-        let runner = MockRunner::new();
+        struct LifecycleRunner {
+            calls: Mutex<Vec<(String, Vec<String>)>>,
+            exists: Mutex<bool>,
+        }
+        impl Runner for LifecycleRunner {
+            fn run(&self, program: &str, args: &[String]) -> Result<String> {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push((program.into(), args.into()));
+                if program == "podman" && args.first().is_some_and(|arg| arg == "run") {
+                    *self.exists.lock().unwrap() = true;
+                }
+                Ok(match (program, args.first().map(String::as_str)) {
+                    ("podman", Some("inspect")) => "running".into(),
+                    ("id", Some("-un")) => "gerald".into(),
+                    ("id", Some("-u") | Some("-g")) => "1000".into(),
+                    _ => String::new(),
+                })
+            }
+            fn run_output(&self, program: &str, args: &[String]) -> Result<ProcessOutput> {
+                if program == "podman" && args.first().is_some_and(|arg| arg == "container") {
+                    self.calls
+                        .lock()
+                        .unwrap()
+                        .push((program.into(), args.into()));
+                    return Ok(ProcessOutput {
+                        code: if *self.exists.lock().unwrap() { 0 } else { 1 },
+                        stdout: String::new(),
+                        stderr: String::new(),
+                    });
+                }
+                Ok(ProcessOutput {
+                    code: 0,
+                    stdout: self.run(program, args)?,
+                    stderr: String::new(),
+                })
+            }
+        }
+        let runner = LifecycleRunner {
+            calls: Mutex::new(vec![]),
+            exists: Mutex::new(false),
+        };
         let lane = spec("local");
-        local_start(&runner, &lane).unwrap();
+        ensure_local_started(&runner, &lane).unwrap();
         let calls = runner.calls.lock().unwrap();
         let run = calls
             .iter()
@@ -2093,6 +2760,24 @@ CMD ["sleep", "infinity"]
                     },
                 )
             }
+            fn run_output(&self, program: &str, args: &[String]) -> Result<ProcessOutput> {
+                if program == "podman" && args.first().is_some_and(|arg| arg == "container") {
+                    self.calls
+                        .lock()
+                        .unwrap()
+                        .push((program.into(), args.into()));
+                    return Ok(ProcessOutput {
+                        code: 0,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                    });
+                }
+                Ok(ProcessOutput {
+                    code: 0,
+                    stdout: self.run(program, args)?,
+                    stderr: String::new(),
+                })
+            }
         }
 
         let runner = StoppedRunner {
@@ -2103,13 +2788,13 @@ CMD ["sleep", "infinity"]
         let calls = runner.calls.lock().unwrap();
         assert!(calls
             .iter()
-            .any(|(_, args)| args.first() == Some(&"run".into())));
+            .any(|(_, args)| args.first() == Some(&"start".into())));
     }
 
     #[test]
     fn local_start_explains_when_the_image_is_missing() {
         let runner = FailingRunner;
-        assert!(local_start(&runner, &spec("local")).is_err());
+        assert!(ensure_local_started(&runner, &spec("local")).is_err());
     }
 
     #[test]
@@ -2119,7 +2804,7 @@ CMD ["sleep", "infinity"]
         };
         let mut lane = spec("local");
         lane.profile.build_context = Some(PathBuf::from("/tmp"));
-        local_start(&runner, &lane).unwrap();
+        ensure_local_started(&runner, &lane).unwrap();
         assert!(runner
             .calls
             .lock()
@@ -2156,6 +2841,24 @@ CMD ["sleep", "infinity"]
         );
     }
 
+    #[test]
+    fn custom_image_without_an_explicit_context_uses_the_current_lane_directory() {
+        let runner = MockRunner::new();
+        let mut lane = spec("local");
+        lane.project_path = PathBuf::from("/var/tmp/moved-lane");
+        lane.profile.embedded_containerfile = false;
+        lane.profile.build_context = None;
+        build_local_image(&runner, &lane, false).unwrap();
+        let calls = runner.calls.lock().unwrap();
+        let build = calls
+            .iter()
+            .find(|(program, args)| {
+                program == "podman" && args.first().is_some_and(|arg| arg == "build")
+            })
+            .unwrap();
+        assert_eq!(build.1.last().unwrap(), "/var/tmp/moved-lane");
+    }
+
     struct FailingRunner;
     impl Runner for FailingRunner {
         fn run(&self, _: &str, _: &[String]) -> Result<String> {
@@ -2176,6 +2879,21 @@ CMD ["sleep", "infinity"]
                 ("id", Some("-un")) => "gerald".into(),
                 ("id", Some("-u") | Some("-g")) => "1000".into(),
                 _ => String::new(),
+            })
+        }
+        fn run_output(&self, program: &str, args: &[String]) -> Result<ProcessOutput> {
+            if program == "podman" && args.first().is_some_and(|arg| arg == "container") {
+                self.calls.lock().unwrap().push(args.into());
+                return Ok(ProcessOutput {
+                    code: 1,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                });
+            }
+            Ok(ProcessOutput {
+                code: 0,
+                stdout: self.run(program, args)?,
+                stderr: String::new(),
             })
         }
     }

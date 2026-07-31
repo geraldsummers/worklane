@@ -59,12 +59,20 @@ worklane lane create my-project --host lab --project /home/gerald/projects/my-pr
   --profile default
 ```
 
-The canonical controller registry is `~/.local/share/worklane/worklane.db`.
-Each selected directory also contains a portable, atomically written
-`.worklane/lane.toml`. Recover a missing registry entry with
+The portable, schema-v3 `.worklane/lane.toml` in each selected directory is
+the authority for lane configuration. The controller registry at
+`~/.local/share/worklane/worklane-v3.db` is only a rebuildable locator and
+status cache. Recover a missing registry entry with
 `worklane lane import PATH`, where `PATH` is either the selected directory or
 its manifest. A lane's display name can change (`lane rename`, or `n` in the
-TUI), while its Podman and Herdr identifiers remain stable.
+TUI), while its UUID, Podman container name, and creation-time Herdr
+session/workspace name remain stable.
+
+This is an explicit clean break. If Worklane finds `worklane.db` or
+`worklane-v2.db` without a v3 registry, it stops and leaves the old database
+untouched. Acknowledge a clean registry with
+`worklane registry init --fresh`, then import only manifests you have verified.
+Older or unknown manifest schemas are rejected and never rewritten.
 
 `lane delete NAME` (the `D` key) always contacts the owning host, checks drift,
 removes the disposable container, removes the registry record, and deletes only
@@ -73,14 +81,13 @@ directory or its contents. `lane forget NAME` (the `F` key) removes only the
 controller registry entry and deliberately leaves the manifest and Podman
 state intact. There are no ambiguous archive, destroy, or purge commands.
 
-Legacy lanes are migrated automatically before start, attach, or upgrade. Stop
-a running legacy lane first. Migration copies and verifies supported entries
-from the old hidden home into the selected directory, commits the manifest and
-registry, and only then removes the exact legacy lane directory. Conflicting,
-unsupported, or unreadable entries do not block the lane: they are moved to
-`~/.local/share/worklane/quarantine/<lane-id>/items`, with recovery details in
-`migration.log`. Interrupted migrations resume safely. Existing legacy archives
-are left untouched.
+Lifecycle changes use a per-lane operation journal and commit the portable
+manifest and registry projection only after runtime preparation succeeds.
+Retries are safe. `worklane lane reconcile NAME` reports manifest, cache,
+runtime, and interrupted-operation differences without changing them;
+`--apply` performs only verified repairs and reports every change or unresolved
+condition. The TUI exposes the same commands with `c` (report) and a confirmed
+`C` (apply).
 
 ## Hosts and deployment
 
@@ -100,8 +107,10 @@ immutable root filesystems are fresh. In the TUI, `u` performs a cached upgrade
 of one lane, while `U` performs a fresh `--no-cache` upgrade of all effective
 images and pulls the standard image's base. Custom Containerfiles retain
 control over local-only base images. Run `lane` for the keyboard-first terminal
-view; host operations run in the background and it uses cached lane state when
-hosts are unreachable.
+view. Host operations and bounded state checks run in the background; cached
+state is rendered immediately with its age, navigation remains available, and
+an unreachable host does not hide other lanes. Errors stay attached to the
+affected lane until dismissed with `Esc` or cleared by a successful retry.
 
 Worklane does not impose a per-lane disk quota or preallocate storage. Because
 all persistent state is in the selected directory, users can inspect, back up,
@@ -112,6 +121,8 @@ move, and constrain it with their filesystem's normal tools.
 Profiles are named entries in `~/.config/worklane/profiles.toml`. The built-in
 `default` profile uses the embedded Containerfile, outbound networking, and no
 extra mounts. A profile is snapshotted when a lane is created.
+An omitted `build_context` follows the lane's selected directory when it is
+moved or imported; an explicit path remains fixed.
 
 ```toml
 [profiles.docs]

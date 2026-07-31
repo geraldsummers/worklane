@@ -1,20 +1,25 @@
 //! Shared durable model and process adapters for Worklane.
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
+use fs2::FileExt;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::{
-    fs, io,
-    io::Write,
+    fs,
+    fs::OpenOptions,
+    io,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
 use uuid::Uuid;
 
 pub const DEFAULT_IMAGE: &str = "worklane:latest";
-pub const EXECUTOR_PROTOCOL: u32 = 1;
+pub const MANIFEST_SCHEMA_VERSION: u32 = 3;
+pub const DATABASE_SCHEMA_VERSION: u32 = 3;
+pub const OPERATION_SCHEMA_VERSION: u32 = 1;
+pub const EXECUTOR_PROTOCOL: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Host {
@@ -26,10 +31,11 @@ pub struct Host {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Profile {
     pub image: String,
     /// Host-native context used to rebuild this host-local image during upgrade.
-    #[serde(default)]
+    #[serde(default, with = "build_context_serde")]
     pub build_context: Option<PathBuf>,
     #[serde(default = "default_containerfile")]
     pub containerfile: PathBuf,
@@ -41,7 +47,32 @@ pub struct Profile {
     #[serde(default)]
     pub mounts: Vec<MountSpec>,
 }
+mod build_context_serde {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::path::PathBuf;
+
+    pub fn serialize<S>(value: &Option<PathBuf>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(
+            value
+                .as_deref()
+                .and_then(|path| path.to_str())
+                .unwrap_or("project"),
+        )
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<PathBuf>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok((value != "project").then(|| PathBuf::from(value)))
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct MountSpec {
     pub source: PathBuf,
     pub target: PathBuf,
@@ -90,12 +121,7 @@ pub fn load_profiles() -> Result<BTreeMap<String, Profile>> {
     }
     Ok(profiles)
 }
-pub fn validate_profile(
-    profile: &Profile,
-    home: &Path,
-    workspace: &Path,
-    require_sources: bool,
-) -> Result<()> {
+pub fn validate_profile(profile: &Profile, home: &Path, require_sources: bool) -> Result<()> {
     if !matches!(profile.network.as_str(), "outbound" | "none") {
         bail!("profile network must be 'outbound' or 'none'")
     }
@@ -103,12 +129,8 @@ pub fn validate_profile(
         if !mount.source.is_absolute() || !mount.target.is_absolute() {
             bail!("profile mount source and target must be absolute paths")
         }
-        if mount.target == home
-            || mount.target == workspace
-            || home.starts_with(&mount.target)
-            || workspace.starts_with(&mount.target)
-        {
-            bail!("profile mount target conflicts with Worklane-managed home or workspace")
+        if mount.target == home || home.starts_with(&mount.target) {
+            bail!("profile mount target conflicts with Worklane-managed home")
         }
         if require_sources && !mount.source.exists() {
             bail!(
@@ -128,33 +150,36 @@ pub fn validate_profile(
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct LaneSpec {
-    pub version: u32,
+#[serde(deny_unknown_fields)]
+pub struct LaneManifest {
+    pub schema_version: u32,
     pub id: String,
     pub name: String,
-    pub host: String,
-    #[serde(default = "default_lane_user")]
-    pub user: String,
-    pub project_path: PathBuf,
-    #[serde(default)]
+    pub container_name: String,
+    pub session_name: String,
+    pub container_home: PathBuf,
     pub profile: Profile,
-    #[serde(default = "default_profile_name")]
+    pub profile_name: String,
+    pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub image_digest: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LaneSpec {
+    pub schema_version: u32,
+    pub id: String,
+    pub name: String,
+    pub container_name: String,
+    pub session_name: String,
+    pub container_home: PathBuf,
+    pub host: String,
+    pub project_path: PathBuf,
+    pub profile: Profile,
     pub profile_name: String,
     pub created_at: DateTime<Utc>,
     #[serde(default)]
     pub last_attached: Option<DateTime<Utc>>,
-    /// Stable Podman name assigned when the lane is created. Missing on legacy lanes.
-    #[serde(default, rename = "container_name")]
-    pub container_name_override: Option<String>,
-    /// Project mount destination assigned when the lane is created. Missing on legacy lanes.
-    #[serde(default, rename = "workspace_path")]
-    pub container_workspace_override: Option<PathBuf>,
-    /// Lane-owned data directory name assigned when the lane is created. Missing on legacy lanes.
-    #[serde(default, rename = "lane_dir_name")]
-    pub lane_dir_name_override: Option<String>,
-    /// Stable Herdr session name. Missing on legacy lanes, which used the display name.
-    #[serde(default, rename = "session_name")]
-    pub session_name_override: Option<String>,
     #[serde(default)]
     pub image_digest: Option<String>,
 }
@@ -162,8 +187,13 @@ fn default_profile_name() -> String {
     "default".into()
 }
 pub const CONTAINER_USER: &str = "dev";
-fn default_lane_user() -> String {
-    CONTAINER_USER.into()
+pub fn validate_lane_id(id: &str) -> Result<()> {
+    let parsed =
+        Uuid::parse_str(id).map_err(|_| anyhow::anyhow!("lane ID must be a canonical UUID"))?;
+    if parsed.hyphenated().to_string() != id {
+        bail!("lane ID must be a canonical UUID")
+    }
+    Ok(())
 }
 pub fn validate_lane_name(name: &str) -> Result<()> {
     if !name
@@ -172,6 +202,9 @@ pub fn validate_lane_name(name: &str) -> Result<()> {
         || name.is_empty()
     {
         bail!("lane name must contain only letters, digits, '-' or '_'");
+    }
+    if Uuid::parse_str(name).is_ok_and(|value| value.hyphenated().to_string() == name) {
+        bail!("lane name must not be a UUID because UUIDs are reserved for stable identity")
     }
     Ok(())
 }
@@ -184,17 +217,14 @@ impl LaneSpec {
     ) -> Result<Self> {
         validate_lane_name(&name)?;
         let id = Uuid::new_v4().to_string();
-        let runtime_name = format!("worklane-{id}");
         Ok(Self {
-            version: 2,
-            id: id.clone(),
-            container_name_override: Some(runtime_name.clone()),
-            container_workspace_override: Some(PathBuf::from("/home").join(CONTAINER_USER)),
-            lane_dir_name_override: None,
-            session_name_override: Some(runtime_name),
+            schema_version: MANIFEST_SCHEMA_VERSION,
+            container_name: format!("worklane-{id}"),
+            session_name: name.clone(),
+            container_home: PathBuf::from("/home").join(CONTAINER_USER),
+            id,
             name,
             host,
-            user: default_lane_user(),
             project_path: project_path.canonicalize().unwrap_or(project_path),
             profile,
             profile_name: default_profile_name(),
@@ -204,44 +234,78 @@ impl LaneSpec {
         })
     }
     pub fn container_name(&self) -> String {
-        self.container_name_override
-            .clone()
-            .unwrap_or_else(|| format!("worklane-{}", &self.id[..8]))
-    }
-    pub fn lane_dir(&self) -> PathBuf {
-        data_dir().join("lanes").join(self.lane_dir_name())
-    }
-    pub fn lane_dir_name(&self) -> String {
-        self.lane_dir_name_override
-            .clone()
-            .unwrap_or_else(|| self.id.clone())
-    }
-    pub fn home_dir(&self) -> PathBuf {
-        if self.version >= 2 {
-            self.project_path.clone()
-        } else {
-            self.lane_dir().join("home")
-        }
+        self.container_name.clone()
     }
     pub fn container_home(&self) -> PathBuf {
-        PathBuf::from("/home").join(CONTAINER_USER)
+        self.container_home.clone()
     }
-    pub fn container_workspace(&self) -> PathBuf {
-        self.container_workspace_override
-            .clone()
-            .unwrap_or_else(|| self.container_home().join("workspace"))
-    }
-    pub fn session_name(&self) -> &str {
-        self.session_name_override
-            .as_deref()
-            .unwrap_or(self.name.as_str())
+    pub fn session_name(&self) -> String {
+        self.session_name.clone()
     }
     pub fn manifest_path(&self) -> PathBuf {
-        if self.version >= 2 {
-            self.project_path.join(".worklane").join("lane.toml")
-        } else {
-            lane_toml_path(self)
+        self.project_path.join(".worklane").join("lane.toml")
+    }
+}
+impl LaneManifest {
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != MANIFEST_SCHEMA_VERSION {
+            bail!(
+                "unsupported lane manifest schema {}; this binary requires schema {} and will not modify older or newer manifests",
+                self.schema_version,
+                MANIFEST_SCHEMA_VERSION
+            )
         }
+        validate_lane_id(&self.id)?;
+        validate_lane_name(&self.name)?;
+        validate_lane_name(&self.session_name)?;
+        if self.container_name != format!("worklane-{}", self.id) {
+            bail!("manifest container_name does not match its immutable lane UUID")
+        }
+        if self.container_home != Path::new("/home/dev") {
+            bail!("manifest container_home must be /home/dev for schema v3")
+        }
+        validate_profile(&self.profile, &self.container_home, false)
+    }
+}
+impl From<&LaneSpec> for LaneManifest {
+    fn from(spec: &LaneSpec) -> Self {
+        Self {
+            schema_version: spec.schema_version,
+            id: spec.id.clone(),
+            name: spec.name.clone(),
+            container_name: spec.container_name.clone(),
+            session_name: spec.session_name.clone(),
+            container_home: spec.container_home.clone(),
+            profile: spec.profile.clone(),
+            profile_name: spec.profile_name.clone(),
+            created_at: spec.created_at,
+            image_digest: spec.image_digest.clone(),
+        }
+    }
+}
+impl LaneSpec {
+    pub fn from_manifest(
+        manifest: LaneManifest,
+        host: String,
+        project_path: PathBuf,
+        last_attached: Option<DateTime<Utc>>,
+    ) -> Result<Self> {
+        manifest.validate()?;
+        Ok(Self {
+            schema_version: manifest.schema_version,
+            id: manifest.id,
+            name: manifest.name,
+            container_name: manifest.container_name,
+            session_name: manifest.session_name,
+            container_home: manifest.container_home,
+            host,
+            project_path,
+            profile: manifest.profile,
+            profile_name: manifest.profile_name,
+            created_at: manifest.created_at,
+            last_attached,
+            image_digest: manifest.image_digest,
+        })
     }
 }
 
@@ -254,8 +318,56 @@ pub struct LaneStatus {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutorRequest {
-    pub protocol: u32,
+    pub protocol_version: u32,
+    pub request_id: String,
     pub args: Vec<String>,
+}
+pub fn new_executor_request(args: Vec<String>) -> ExecutorRequest {
+    ExecutorRequest {
+        protocol_version: EXECUTOR_PROTOCOL,
+        request_id: Uuid::new_v4().to_string(),
+        args,
+    }
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutorResponse {
+    pub protocol_version: u32,
+    pub request_id: String,
+    pub success: bool,
+    pub payload: Option<serde_json::Value>,
+    pub error: Option<ErrorReport>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ErrorReport {
+    pub code: String,
+    pub message: String,
+    pub guidance: Option<String>,
+    pub lane_id: Option<String>,
+    pub retryable: bool,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperationEvent {
+    pub operation_id: String,
+    pub lane_id: Option<String>,
+    pub status: String,
+    pub phase: String,
+    pub elapsed_ms: u64,
+    pub message: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReconcileFinding {
+    pub code: String,
+    pub component: String,
+    pub message: String,
+    pub repairable: bool,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReconcileReport {
+    pub lane_id: String,
+    pub applied: bool,
+    pub findings: Vec<ReconcileFinding>,
+    pub changes: Vec<String>,
+    pub unresolved: Vec<String>,
 }
 
 pub fn data_dir() -> PathBuf {
@@ -264,44 +376,89 @@ pub fn data_dir() -> PathBuf {
         .join("worklane")
 }
 pub fn db_path() -> PathBuf {
-    data_dir().join("worklane.db")
+    data_dir().join("worklane-v3.db")
 }
 pub fn containerfile_path() -> PathBuf {
     data_dir().join("Containerfile")
-}
-pub fn lane_toml_path(spec: &LaneSpec) -> PathBuf {
-    spec.lane_dir().join("lane.toml")
 }
 
 pub struct Store {
     conn: Connection,
 }
+#[derive(Debug, Clone)]
+pub struct LaneIndex {
+    pub id: String,
+    pub name: String,
+    pub host: String,
+    pub manifest_path: PathBuf,
+    pub container_name: String,
+    pub session_name: String,
+    pub container_home: PathBuf,
+    pub profile_name: String,
+    pub profile: Profile,
+    pub config_hash: String,
+    pub created_at: DateTime<Utc>,
+    pub image_digest: Option<String>,
+    pub state: String,
+    pub drift: bool,
+    pub config_cached_at: DateTime<Utc>,
+    pub status_cached_at: DateTime<Utc>,
+    pub last_attached: Option<DateTime<Utc>>,
+}
 impl Store {
     pub fn open_default() -> Result<Self> {
+        fs::create_dir_all(data_dir())?;
+        if !db_path().exists()
+            && [
+                data_dir().join("worklane.db"),
+                data_dir().join("worklane-v2.db"),
+            ]
+            .iter()
+            .any(|path| path.exists())
+        {
+            bail!(
+                "older Worklane registry detected; it was left untouched. Run `worklane registry init --fresh` to acknowledge the clean v3 start"
+            )
+        }
+        Self::open(db_path())
+    }
+    pub fn init_fresh_default() -> Result<Self> {
         fs::create_dir_all(data_dir())?;
         Self::open(db_path())
     }
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open(path)?;
         let s = Self { conn };
-        s.migrate()?;
+        s.initialize_or_validate()?;
         Ok(s)
     }
-    fn migrate(&self) -> Result<()> {
-        self.conn.execute_batch("CREATE TABLE IF NOT EXISTS hosts(name TEXT PRIMARY KEY, ssh_target TEXT NOT NULL, local INTEGER NOT NULL, installed_version TEXT, last_seen TEXT); CREATE TABLE IF NOT EXISTS lanes(id TEXT PRIMARY KEY, name TEXT NOT NULL, host TEXT NOT NULL, spec_toml TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'unknown', drift INTEGER NOT NULL DEFAULT 0, cached_at TEXT NOT NULL);")?;
-        let duplicate: Option<String> = self
+    fn initialize_or_validate(&self) -> Result<()> {
+        let version: u32 = self
             .conn
-            .query_row(
-                "SELECT name FROM lanes GROUP BY name HAVING COUNT(*) > 1 LIMIT 1",
-                [],
-                |r| r.get(0),
-            )
-            .ok();
-        if let Some(name) = duplicate {
-            bail!("database contains duplicate lane name '{name}'; resolve it before migrating")
+            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let table_count: u32 = self.conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+            [],
+            |row| row.get(0),
+        )?;
+        if version == 0 && table_count == 0 {
+            self.conn.execute_batch(&format!(
+                "BEGIN;
+                 CREATE TABLE hosts(name TEXT PRIMARY KEY, ssh_target TEXT NOT NULL, local INTEGER NOT NULL, installed_version TEXT, last_seen TEXT);
+                 CREATE TABLE lanes(id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, host TEXT NOT NULL, manifest_path TEXT NOT NULL, container_name TEXT NOT NULL, session_name TEXT NOT NULL, container_home TEXT NOT NULL, profile_name TEXT NOT NULL, profile_json TEXT NOT NULL, config_hash TEXT NOT NULL, created_at TEXT NOT NULL, image_digest TEXT, state TEXT NOT NULL DEFAULT 'unknown', drift INTEGER NOT NULL DEFAULT 0, config_cached_at TEXT NOT NULL, status_cached_at TEXT NOT NULL, last_attached TEXT);
+                 CREATE UNIQUE INDEX lanes_unique_location ON lanes(host, manifest_path);
+                 CREATE TABLE operations(operation_id TEXT PRIMARY KEY, lane_id TEXT NOT NULL, kind TEXT NOT NULL, phase TEXT NOT NULL, request_fingerprint TEXT NOT NULL, updated_at TEXT NOT NULL);
+                 CREATE TABLE tombstones(lane_id TEXT PRIMARY KEY, name TEXT NOT NULL, operation TEXT NOT NULL, completed_at TEXT NOT NULL);
+                 PRAGMA user_version={DATABASE_SCHEMA_VERSION};
+                 COMMIT;"
+            ))?;
+            return Ok(());
         }
-        self.conn
-            .execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS lanes_unique_name ON lanes(name);")?;
+        if version != DATABASE_SCHEMA_VERSION {
+            bail!(
+                "unsupported registry schema {version}; expected {DATABASE_SCHEMA_VERSION}. Worklane will not migrate or modify this database"
+            )
+        }
         Ok(())
     }
     pub fn upsert_host(&self, h: &Host) -> Result<()> {
@@ -325,54 +482,157 @@ impl Store {
         Ok(hosts)
     }
     pub fn save_lane(&self, spec: &LaneSpec, state: &str, drift: bool) -> Result<()> {
-        let body = toml::to_string_pretty(spec)?;
-        self.conn.execute("INSERT INTO lanes(id,name,host,spec_toml,state,drift,cached_at) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(id) DO UPDATE SET name=excluded.name,host=excluded.host,spec_toml=excluded.spec_toml,state=excluded.state,drift=excluded.drift,cached_at=excluded.cached_at",params![spec.id,spec.name,spec.host,body,state,drift,Utc::now().to_rfc3339()])?;
+        LaneManifest::from(spec).validate()?;
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute("INSERT INTO lanes(id,name,host,manifest_path,container_name,session_name,container_home,profile_name,profile_json,config_hash,created_at,image_digest,state,drift,config_cached_at,status_cached_at,last_attached) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?15,?16) ON CONFLICT(id) DO UPDATE SET name=excluded.name,host=excluded.host,manifest_path=excluded.manifest_path,container_name=excluded.container_name,session_name=excluded.session_name,container_home=excluded.container_home,profile_name=excluded.profile_name,profile_json=excluded.profile_json,config_hash=excluded.config_hash,created_at=excluded.created_at,image_digest=excluded.image_digest,state=excluded.state,drift=excluded.drift,config_cached_at=excluded.config_cached_at,status_cached_at=excluded.status_cached_at,last_attached=excluded.last_attached",params![spec.id,spec.name,spec.host,spec.manifest_path().display().to_string(),spec.container_name,spec.session_name,spec.container_home.display().to_string(),spec.profile_name,serde_json::to_string(&spec.profile)?,manifest_sha256(spec)?,spec.created_at.to_rfc3339(),spec.image_digest,state,drift,now,spec.last_attached.map(|value|value.to_rfc3339())])?;
         Ok(())
     }
-    pub fn lane(&self, selector: &str) -> Result<LaneSpec> {
-        let mut st = self.conn.prepare(
-            "SELECT spec_toml FROM lanes WHERE id=?1 OR name=?1 ORDER BY cached_at DESC LIMIT 1",
+    pub fn save_status(&self, id: &str, state: &str, drift: bool) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE lanes SET state=?2,drift=?3,status_cached_at=?4 WHERE id=?1",
+            params![id, state, drift, Utc::now().to_rfc3339()],
         )?;
-        let v: String = st
-            .query_row([selector], |r| r.get(0))
-            .with_context(|| format!("no lane named or identified '{selector}'"))?;
-        Ok(toml::from_str(&v)?)
+        if changed == 0 {
+            bail!("cannot cache status for unregistered lane '{id}'")
+        }
+        Ok(())
+    }
+    pub fn index(&self, selector: &str) -> Result<LaneIndex> {
+        let row = self.conn.query_row("SELECT id,name,host,manifest_path,container_name,session_name,container_home,profile_name,profile_json,config_hash,created_at,image_digest,state,drift,config_cached_at,status_cached_at,last_attached FROM lanes WHERE id=?1 OR name=?1 ORDER BY status_cached_at DESC LIMIT 1",[selector],|r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,String>(7)?,r.get::<_,String>(8)?,r.get::<_,String>(9)?,r.get::<_,String>(10)?,r.get::<_,Option<String>>(11)?,r.get::<_,String>(12)?,r.get::<_,bool>(13)?,r.get::<_,String>(14)?,r.get::<_,String>(15)?,r.get::<_,Option<String>>(16)?))).with_context(||format!("no lane named or identified '{selector}'"))?;
+        validate_lane_id(&row.0).context("registry contains an invalid lane ID; rebuild it")?;
+        validate_lane_name(&row.1).context("registry contains an invalid lane name; rebuild it")?;
+        validate_lane_name(&row.5)
+            .context("registry contains an invalid session name; rebuild it")?;
+        if row.4 != format!("worklane-{}", row.0) || row.6 != "/home/dev" {
+            bail!("registry contains invalid stable lane identity; rebuild it")
+        }
+        let parse_time = |value: &str, field: &str| {
+            value.parse::<DateTime<Utc>>().with_context(|| {
+                format!("registry contains an invalid {field} timestamp; rebuild it")
+            })
+        };
+        let profile: Profile = serde_json::from_str(&row.8)
+            .context("registry contains an invalid cached profile; rebuild it")?;
+        validate_profile(&profile, Path::new(&row.6), false)
+            .context("registry contains an invalid cached profile; rebuild it")?;
+        Ok(LaneIndex {
+            id: row.0,
+            name: row.1,
+            host: row.2,
+            manifest_path: PathBuf::from(row.3),
+            container_name: row.4,
+            session_name: row.5,
+            container_home: PathBuf::from(row.6),
+            profile_name: row.7,
+            profile,
+            config_hash: row.9,
+            created_at: parse_time(&row.10, "created_at")?,
+            image_digest: row.11,
+            state: row.12,
+            drift: row.13,
+            config_cached_at: parse_time(&row.14, "config cache")?,
+            status_cached_at: parse_time(&row.15, "status cache")?,
+            last_attached: row
+                .16
+                .as_deref()
+                .map(|value| parse_time(value, "last_attached"))
+                .transpose()?,
+        })
+    }
+    pub fn lane(&self, selector: &str) -> Result<LaneSpec> {
+        let index = self.index(selector)?;
+        if index.host == "local" {
+            if index.manifest_path.exists() {
+                let spec = read_lane_spec(&index.manifest_path, index.host, index.last_attached)?;
+                if spec.id != index.id {
+                    bail!(
+                        "registry lane '{}' points to a manifest for lane '{}'; run lane reconcile and resolve the locator conflict",
+                        index.id,
+                        spec.id
+                    )
+                }
+                return Ok(spec);
+            }
+            let project = index
+                .manifest_path
+                .parent()
+                .and_then(Path::parent)
+                .context("indexed manifest path has no project parent")?;
+            if let Some(journal) = read_operation_journal_at(project)? {
+                if journal.lane_id != index.id {
+                    bail!("registry and operation journal lane identities differ; resolve the conflict manually")
+                }
+                return LaneSpec::from_manifest(
+                    journal.desired_manifest,
+                    index.host,
+                    project.to_path_buf(),
+                    index.last_attached,
+                );
+            }
+            bail!(
+                "authoritative manifest is missing at {}; run lane reconcile",
+                index.manifest_path.display()
+            )
+        }
+        Ok(cached_spec(&index))
     }
     pub fn lanes(&self) -> Result<Vec<LaneStatus>> {
-        let mut st = self
-            .conn
-            .prepare("SELECT spec_toml,state,drift,cached_at FROM lanes ORDER BY name")?;
-        let rows = st.query_map([], |r| {
-            let body: String = r.get(0)?;
-            Ok(LaneStatus {
-                spec: toml::from_str(&body).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        0,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
-                })?,
-                state: r.get(1)?,
-                drift: r.get(2)?,
-                cached_at: r
-                    .get::<_, String>(3)?
-                    .parse()
-                    .unwrap_or_else(|_| Utc::now()),
+        let mut statement = self.conn.prepare("SELECT id FROM lanes ORDER BY name")?;
+        let ids = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        ids.into_iter()
+            .map(|id| {
+                let index = self.index(&id)?;
+                Ok(LaneStatus {
+                    spec: cached_spec(&index),
+                    state: index.state,
+                    drift: index.drift,
+                    cached_at: index.status_cached_at,
+                })
             })
-        })?;
-        let lanes = rows.collect::<Result<Vec<_>, _>>()?;
-        Ok(lanes)
+            .collect()
     }
     pub fn remove_lane(&self, id: &str) -> Result<()> {
         self.conn.execute("DELETE FROM lanes WHERE id=?1", [id])?;
         Ok(())
     }
-    pub fn rename_lane(&self, id: &str, new_name: &str) -> Result<LaneSpec> {
-        let mut spec = self.lane(id)?;
-        validate_lane_name(new_name)?;
-        spec.name = new_name.into();
-        self.save_lane(&spec, "unknown", false)?;
-        Ok(spec)
+    pub fn record_tombstone(&self, id: &str, name: &str, operation: &str) -> Result<()> {
+        self.conn.execute("INSERT INTO tombstones(lane_id,name,operation,completed_at) VALUES(?1,?2,?3,?4) ON CONFLICT(lane_id) DO UPDATE SET name=excluded.name,operation=excluded.operation,completed_at=excluded.completed_at",params![id,name,operation,Utc::now().to_rfc3339()])?;
+        Ok(())
+    }
+    pub fn tombstone_operation(&self, selector: &str) -> Result<Option<String>> {
+        let mut statement = self.conn.prepare(
+            "SELECT operation FROM tombstones WHERE lane_id=?1 OR name=?1 ORDER BY completed_at DESC LIMIT 1",
+        )?;
+        match statement.query_row([selector], |row| row.get(0)) {
+            Ok(operation) => Ok(Some(operation)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+fn cached_spec(index: &LaneIndex) -> LaneSpec {
+    LaneSpec {
+        schema_version: MANIFEST_SCHEMA_VERSION,
+        id: index.id.clone(),
+        name: index.name.clone(),
+        container_name: index.container_name.clone(),
+        session_name: index.session_name.clone(),
+        container_home: index.container_home.clone(),
+        host: index.host.clone(),
+        project_path: index
+            .manifest_path
+            .parent()
+            .and_then(Path::parent)
+            .unwrap_or(Path::new("."))
+            .to_path_buf(),
+        profile: index.profile.clone(),
+        profile_name: index.profile_name.clone(),
+        created_at: index.created_at,
+        last_attached: index.last_attached,
+        image_digest: index.image_digest.clone(),
     }
 }
 
@@ -385,6 +645,19 @@ pub trait Runner {
     fn run_streaming(&self, program: &str, args: &[String]) -> Result<String> {
         self.run(program, args)
     }
+    fn run_output(&self, program: &str, args: &[String]) -> Result<ProcessOutput> {
+        Ok(ProcessOutput {
+            code: 0,
+            stdout: self.run(program, args)?,
+            stderr: String::new(),
+        })
+    }
+}
+#[derive(Debug, Clone)]
+pub struct ProcessOutput {
+    pub code: i32,
+    pub stdout: String,
+    pub stderr: String,
 }
 pub struct SystemRunner;
 impl Runner for SystemRunner {
@@ -450,6 +723,17 @@ impl Runner for SystemRunner {
         }
         Ok(String::new())
     }
+    fn run_output(&self, program: &str, args: &[String]) -> Result<ProcessOutput> {
+        let output = Command::new(program)
+            .args(args)
+            .output()
+            .with_context(|| format!("run {program}"))?;
+        Ok(ProcessOutput {
+            code: output.status.code().unwrap_or(125),
+            stdout: String::from_utf8_lossy(&output.stdout).trim().into(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().into(),
+        })
+    }
 }
 pub fn podman(
     r: &impl Runner,
@@ -490,29 +774,31 @@ pub fn executor_command(target: &str) -> Vec<String> {
     ]
 }
 pub fn executor_request(args: Vec<String>) -> Result<Vec<u8>> {
-    Ok(serde_json::to_vec(&ExecutorRequest {
-        protocol: EXECUTOR_PROTOCOL,
-        args,
-    })?)
+    Ok(serde_json::to_vec(&new_executor_request(args))?)
 }
 pub fn host_state(r: &impl Runner, spec: &LaneSpec) -> Result<(String, bool)> {
     let name = spec.container_name();
-    let state = host_runtime_state(r, spec);
+    let state = host_runtime_state(r, spec)?;
     let drift = !matches!(state.as_str(), "absent")
         && has_meaningful_drift(&podman(r, ["diff", &name])?, &spec.container_home());
     Ok((state, drift))
 }
-pub fn host_runtime_state(r: &impl Runner, spec: &LaneSpec) -> String {
-    podman(
-        r,
-        [
-            "inspect",
-            "--format",
-            "{{.State.Status}}",
-            &spec.container_name(),
-        ],
-    )
-    .unwrap_or_else(|_| "absent".into())
+pub fn host_runtime_state(r: &impl Runner, spec: &LaneSpec) -> Result<String> {
+    container_runtime_state(r, &spec.container_name())
+}
+pub fn container_runtime_state(r: &impl Runner, name: &str) -> Result<String> {
+    let exists = r.run_output(
+        "podman",
+        &["container".into(), "exists".into(), name.into()],
+    )?;
+    match exists.code {
+        0 => podman(r, ["inspect", "--format", "{{.State.Status}}", name]),
+        1 => Ok("absent".into()),
+        code => bail!(
+            "cannot determine whether container '{name}' exists (podman exit {code}): {}",
+            exists.stderr
+        ),
+    }
 }
 /// Rootless `--userns=keep-id` updates these account files at container start.
 /// They are runtime plumbing, not user changes to the disposable root filesystem.
@@ -544,11 +830,13 @@ pub fn meaningful_drift_lines(diff: &str, container_home: &Path) -> Vec<String> 
         .collect()
 }
 pub fn write_lane_spec(spec: &LaneSpec) -> Result<()> {
+    let manifest = LaneManifest::from(spec);
+    manifest.validate()?;
     let path = spec.manifest_path();
     let parent = path.parent().context("lane manifest has no parent")?;
     fs::create_dir_all(parent)?;
     let tmp = parent.join(format!(".lane.toml.{}.tmp", Uuid::new_v4()));
-    let body = toml::to_string_pretty(spec)?;
+    let body = toml::to_string_pretty(&manifest)?;
     fs::write(&tmp, body)?;
     fs::File::open(&tmp)?.sync_all()?;
     if let Err(error) = fs::rename(&tmp, &path) {
@@ -558,262 +846,204 @@ pub fn write_lane_spec(spec: &LaneSpec) -> Result<()> {
     fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
-
-fn copy_for_migration(spec: &LaneSpec, src: &Path, dst: &Path, relative: &Path) -> Result<()> {
-    if let Err(error) = copy_for_migration_inner(spec, src, dst, relative) {
-        if dst.exists() {
-            let _ = remove_path(dst);
-        }
-        quarantine_path(
-            spec,
-            src,
-            relative,
-            &format!("could not copy and verify legacy entry: {error:#}"),
+pub fn read_lane_spec(
+    path: &Path,
+    host: String,
+    last_attached: Option<DateTime<Utc>>,
+) -> Result<LaneSpec> {
+    let body = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let document: toml::Value =
+        toml::from_str(&body).with_context(|| format!("parse lane manifest {}", path.display()))?;
+    let version = document
+        .get("schema_version")
+        .and_then(toml::Value::as_integer)
+        .context(
+            "unversioned lane manifest is unsupported and was left untouched; create a fresh v3 lane",
         )?;
+    if version != i64::from(MANIFEST_SCHEMA_VERSION) {
+        bail!(
+            "unsupported lane manifest schema {version}; expected {MANIFEST_SCHEMA_VERSION}. The manifest was left untouched"
+        )
     }
-    Ok(())
+    let manifest: LaneManifest = toml::from_str(&body)?;
+    let project_path = path
+        .parent()
+        .and_then(Path::parent)
+        .context("manifest must be located at <directory>/.worklane/lane.toml")?
+        .canonicalize()
+        .unwrap_or_else(|_| {
+            path.parent()
+                .and_then(Path::parent)
+                .expect("validated manifest parent")
+                .to_path_buf()
+        });
+    LaneSpec::from_manifest(manifest, host, project_path, last_attached)
 }
 
-fn copy_for_migration_inner(
-    spec: &LaneSpec,
-    src: &Path,
-    dst: &Path,
-    relative: &Path,
-) -> Result<()> {
-    let metadata = fs::symlink_metadata(src)?;
-    if metadata.file_type().is_symlink() {
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(fs::read_link(src)?, dst)?;
-        #[cfg(not(unix))]
-        bail!("lane migration cannot preserve symlinks on this platform");
-    } else if metadata.is_dir() {
-        fs::create_dir(dst)?;
-        let entries = fs::read_dir(src)?.collect::<Result<Vec<_>, _>>()?;
-        for entry in entries {
-            copy_for_migration(
-                spec,
-                &entry.path(),
-                &dst.join(entry.file_name()),
-                &relative.join(entry.file_name()),
-            )?;
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OperationJournal {
+    pub schema_version: u32,
+    pub operation_id: String,
+    pub lane_id: String,
+    pub kind: String,
+    pub phase: String,
+    pub requested_name: String,
+    pub desired_manifest_sha256: String,
+    pub desired_manifest: LaneManifest,
+    pub updated_at: DateTime<Utc>,
+}
+impl OperationJournal {
+    pub fn new(spec: &LaneSpec, kind: &str, phase: &str) -> Result<Self> {
+        let journal = Self {
+            schema_version: OPERATION_SCHEMA_VERSION,
+            operation_id: Uuid::new_v4().to_string(),
+            lane_id: spec.id.clone(),
+            kind: kind.into(),
+            phase: phase.into(),
+            requested_name: spec.name.clone(),
+            desired_manifest_sha256: manifest_sha256(spec)?,
+            desired_manifest: LaneManifest::from(spec),
+            updated_at: Utc::now(),
+        };
+        journal.validate()?;
+        Ok(journal)
+    }
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != OPERATION_SCHEMA_VERSION {
+            bail!(
+                "unsupported operation journal schema {}",
+                self.schema_version
+            )
         }
-        fs::set_permissions(dst, metadata.permissions())?;
-    } else if metadata.is_file() {
-        fs::copy(src, dst)?;
-        fs::set_permissions(dst, metadata.permissions())?;
-        if sha256_file(src)? != sha256_file(dst)? {
-            bail!("copied file failed verification: {}", src.display())
+        validate_lane_id(&self.operation_id).context("invalid operation journal operation ID")?;
+        validate_lane_id(&self.lane_id).context("invalid operation journal lane ID")?;
+        self.desired_manifest.validate()?;
+        if self.lane_id != self.desired_manifest.id
+            || self.requested_name != self.desired_manifest.name
+        {
+            bail!("operation journal identity does not match its desired manifest")
         }
-    } else {
-        bail!("unsupported file type in legacy home: {}", src.display())
-    }
-    Ok(())
-}
-
-fn paths_equal(left: &Path, right: &Path) -> Result<bool> {
-    let left_meta = fs::symlink_metadata(left)?;
-    let right_meta = fs::symlink_metadata(right)?;
-    if left_meta.file_type().is_symlink() && right_meta.file_type().is_symlink() {
-        return Ok(fs::read_link(left)? == fs::read_link(right)?);
-    }
-    if left_meta.is_file() && right_meta.is_file() {
-        return Ok(sha256_file(left)? == sha256_file(right)?);
-    }
-    if !left_meta.is_dir() || !right_meta.is_dir() {
-        return Ok(false);
-    }
-    let mut left_names = fs::read_dir(left)?
-        .map(|entry| entry.map(|entry| entry.file_name()))
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut right_names = fs::read_dir(right)?
-        .map(|entry| entry.map(|entry| entry.file_name()))
-        .collect::<Result<Vec<_>, _>>()?;
-    left_names.sort();
-    right_names.sort();
-    if left_names != right_names {
-        return Ok(false);
-    }
-    for name in left_names {
-        if !paths_equal(&left.join(&name), &right.join(name))? {
-            return Ok(false);
+        let phase_is_valid = matches!(
+            (self.kind.as_str(), self.phase.as_str()),
+            ("create", "prepared" | "runtime-applied")
+                | ("rename", "prepared" | "manifest-applied")
+                | ("upgrade", "prepared" | "runtime-applied")
+                | (
+                    "delete",
+                    "prepared" | "runtime-removed" | "manifest-removed"
+                )
+        );
+        if !phase_is_valid {
+            bail!(
+                "unknown operation journal kind/phase '{}/{}'",
+                self.kind,
+                self.phase
+            )
         }
+        let actual = manifest_value_sha256(&self.desired_manifest)?;
+        if actual != self.desired_manifest_sha256 {
+            bail!("operation journal desired manifest checksum does not match")
+        }
+        Ok(())
     }
-    Ok(true)
 }
-
-pub fn migration_quarantine_dir(spec: &LaneSpec) -> PathBuf {
-    data_dir().join("quarantine").join(&spec.id)
+pub struct OperationLock {
+    file: fs::File,
 }
-
-fn remove_path(path: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.is_dir() && !metadata.file_type().is_symlink() {
-        fs::remove_dir_all(path)?;
-    } else {
+impl Drop for OperationLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+pub fn lock_lane_operation(spec: &LaneSpec) -> Result<OperationLock> {
+    let control = spec
+        .manifest_path()
+        .parent()
+        .context("lane control directory")?
+        .to_path_buf();
+    fs::create_dir_all(&control)?;
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(control.join("operation.lock"))?;
+    file.try_lock_exclusive().with_context(|| {
+        format!(
+            "another operation is already running for lane '{}'",
+            spec.name
+        )
+    })?;
+    Ok(OperationLock { file })
+}
+pub fn operation_journal_path(spec: &LaneSpec) -> PathBuf {
+    spec.manifest_path()
+        .parent()
+        .expect("lane manifest has control directory")
+        .join("operation.toml")
+}
+pub fn write_operation_journal(spec: &LaneSpec, journal: &OperationJournal) -> Result<()> {
+    journal.validate()?;
+    if journal.lane_id != spec.id {
+        bail!("invalid operation journal identity or schema")
+    }
+    atomic_write(
+        &operation_journal_path(spec),
+        toml::to_string_pretty(journal)?.as_bytes(),
+    )
+}
+pub fn read_operation_journal(spec: &LaneSpec) -> Result<Option<OperationJournal>> {
+    let path = operation_journal_path(spec);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let journal: OperationJournal = toml::from_str(&fs::read_to_string(&path)?)?;
+    journal.validate()?;
+    if journal.lane_id != spec.id {
+        bail!("operation journal is ambiguous; inspect {}", path.display())
+    }
+    Ok(Some(journal))
+}
+pub fn read_operation_journal_at(project_path: &Path) -> Result<Option<OperationJournal>> {
+    let path = project_path.join(".worklane").join("operation.toml");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let journal: OperationJournal = toml::from_str(&fs::read_to_string(&path)?)?;
+    journal
+        .validate()
+        .with_context(|| format!("invalid operation journal at {}", path.display()))?;
+    Ok(Some(journal))
+}
+pub fn clear_operation_journal(spec: &LaneSpec) -> Result<()> {
+    let path = operation_journal_path(spec);
+    if path.exists() {
         fs::remove_file(path)?;
     }
     Ok(())
 }
-
-fn quarantine_path(spec: &LaneSpec, path: &Path, relative: &Path, reason: &str) -> Result<PathBuf> {
-    let root = migration_quarantine_dir(spec);
-    let items = root.join("items");
-    let mut destination = items.join(relative);
-    let parent = destination
-        .parent()
-        .context("migration quarantine path has no parent")?;
+pub fn manifest_sha256(spec: &LaneSpec) -> Result<String> {
+    manifest_value_sha256(&LaneManifest::from(spec))
+}
+fn manifest_value_sha256(manifest: &LaneManifest) -> Result<String> {
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(toml::to_string(manifest)?.as_bytes())
+    ))
+}
+fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
+    let parent = path.parent().context("durable file has no parent")?;
     fs::create_dir_all(parent)?;
-    if destination.exists() {
-        let name = destination
-            .file_name()
-            .context("migration quarantine path has no file name")?;
-        destination =
-            destination.with_file_name(format!("{}.{}", name.to_string_lossy(), Uuid::new_v4()));
-    }
-    fs::rename(path, &destination).with_context(|| {
-        format!(
-            "failed to quarantine migration entry {} at {}",
-            path.display(),
-            destination.display()
-        )
-    })?;
-    let clean_reason = reason.replace(['\n', '\r', '\t'], " ");
-    let mut report = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(root.join("migration.log"))?;
-    writeln!(
-        report,
-        "{}\t{}\t{}\t{}",
-        Utc::now().to_rfc3339(),
-        path.display(),
-        destination.display(),
-        clean_reason
-    )?;
-    report.sync_all()?;
-    Ok(destination)
-}
-
-/// Copy a legacy hidden home into the user-selected directory without removing
-/// the source. Repeated calls resume an interrupted, verified migration.
-pub fn prepare_lane_migration(spec: &LaneSpec) -> Result<LaneSpec> {
-    if spec.version >= 2 {
-        return Ok(spec.clone());
-    }
-    if !spec.project_path.is_dir() {
-        bail!(
-            "lane project directory does not exist: {}",
-            spec.project_path.display()
-        )
-    }
-    let source = spec.home_dir();
-    let control = spec.project_path.join(".worklane");
-    let marker = control.join("migration-v1");
-    let resuming = marker.exists();
-    if control.exists() && !resuming {
-        bail!(
-            "migration target already contains reserved path: {}",
-            control.display()
-        )
-    }
-    let entries = if source.exists() {
-        match fs::read_dir(&source).and_then(|entries| entries.collect::<Result<Vec<_>, _>>()) {
-            Ok(entries) => entries,
-            Err(error) => {
-                quarantine_path(
-                    spec,
-                    &source,
-                    Path::new("legacy-home"),
-                    &format!("could not enumerate legacy home: {error}"),
-                )?;
-                Vec::new()
-            }
-        }
-    } else {
-        Vec::new()
-    };
-    fs::create_dir_all(&control)?;
-    fs::write(&marker, format!("{}\n", spec.id))?;
-    let staging = control.join("migration-staging");
-    fs::create_dir_all(&staging)?;
-    for entry in entries {
-        let source_entry = entry.path();
-        if entry.file_name() == ".worklane" {
-            quarantine_path(
-                spec,
-                &source_entry,
-                Path::new(".worklane"),
-                "reserved legacy path '.worklane'",
-            )?;
-            continue;
-        }
-        let target = spec.project_path.join(entry.file_name());
-        if target.exists() {
-            match paths_equal(&source_entry, &target) {
-                Ok(true) => {}
-                Ok(false) => {
-                    quarantine_path(
-                        spec,
-                        &source_entry,
-                        Path::new(&entry.file_name()),
-                        &format!("migration target already exists: {}", target.display()),
-                    )?;
-                }
-                Err(error) => {
-                    quarantine_path(
-                        spec,
-                        &source_entry,
-                        Path::new(&entry.file_name()),
-                        &format!(
-                            "could not compare with existing migration target {}: {error}",
-                            target.display()
-                        ),
-                    )?;
-                }
-            }
-            continue;
-        }
-        let staged = staging.join(entry.file_name());
-        if staged.exists() {
-            remove_path(&staged)?;
-        }
-        copy_for_migration(spec, &source_entry, &staged, Path::new(&entry.file_name()))?;
-        fs::rename(&staged, &target)?;
-    }
-    let mut migrated = spec.clone();
-    migrated.version = 2;
-    migrated.container_workspace_override = Some(migrated.container_home());
-    migrated.session_name_override = Some(spec.name.clone());
-    Ok(migrated)
-}
-
-/// Remove only Worklane's exact legacy storage after the migrated manifest and
-/// registry record have been committed.
-pub fn finish_lane_migration(old_spec: &LaneSpec, migrated: &mut LaneSpec) -> Result<()> {
-    if old_spec.version >= 2 {
-        return Ok(());
-    }
-    let legacy = old_spec.lane_dir();
-    if legacy.exists() {
-        if let Err(error) = fs::remove_dir_all(&legacy) {
-            quarantine_path(
-                old_spec,
-                &legacy,
-                Path::new(&old_spec.lane_dir_name()),
-                &format!("could not remove legacy lane remainder: {error}"),
-            )?;
-        }
-    }
-    let control = migrated.project_path.join(".worklane");
-    let staging = control.join("migration-staging");
-    if staging.exists() {
-        fs::remove_dir_all(staging)?;
-    }
-    let marker = control.join("migration-v1");
-    if marker.exists() {
-        fs::remove_file(marker)?;
-    }
-    migrated.lane_dir_name_override = None;
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("worklane");
+    let temporary = parent.join(format!(".{name}.{}.tmp", Uuid::new_v4()));
+    fs::write(&temporary, contents)?;
+    fs::File::open(&temporary)?.sync_all()?;
+    fs::rename(&temporary, path)?;
+    fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
 pub fn image_digest(r: &impl Runner, image: &str) -> Result<String> {
@@ -891,7 +1121,7 @@ mod tests {
         )
     }
     #[test]
-    fn spec_roundtrip() {
+    fn manifest_roundtrip_excludes_registry_only_fields() {
         let s = LaneSpec::new(
             "a-1".into(),
             "local".into(),
@@ -899,11 +1129,15 @@ mod tests {
             Profile::default(),
         )
         .unwrap();
-        assert!(toml::from_str::<LaneSpec>(&toml::to_string(&s).unwrap()).is_ok())
+        let body = toml::to_string(&LaneManifest::from(&s)).unwrap();
+        assert!(toml::from_str::<LaneManifest>(&body).is_ok());
+        assert!(!body.contains("host ="));
+        assert!(!body.contains("project_path ="));
+        assert!(!body.contains("last_attached ="));
     }
 
     #[test]
-    fn sqlite_migration_and_cached_lane_roundtrip() {
+    fn sqlite_schema_and_cached_lane_roundtrip() {
         let path = std::env::temp_dir().join(format!("worklane-test-{}.db", Uuid::new_v4()));
         let store = Store::open(&path).unwrap();
         let host = Host {
@@ -921,10 +1155,18 @@ mod tests {
             Profile::default(),
         )
         .unwrap();
+        let mut spec = spec;
+        spec.profile.network = "none".into();
+        spec.profile.mounts.push(MountSpec {
+            source: PathBuf::from("/tmp/cache"),
+            target: PathBuf::from("/opt/cache"),
+            read_only: true,
+        });
         store.save_lane(&spec, "running", true).unwrap();
         assert_eq!(store.hosts().unwrap(), vec![host]);
         let lanes = store.lanes().unwrap();
         assert_eq!(lanes[0].spec.id, spec.id);
+        assert_eq!(lanes[0].spec.profile, spec.profile);
         assert!(lanes[0].drift);
         std::fs::remove_file(path).unwrap();
     }
@@ -938,6 +1180,29 @@ mod tests {
             Profile::default()
         )
         .is_err());
+        assert!(validate_lane_name("00000000-0000-4000-8000-000000000001").is_err());
+    }
+
+    #[test]
+    fn lane_ids_are_canonical_uuids_at_persistence_boundaries() {
+        let canonical = Uuid::new_v4().to_string();
+        assert!(validate_lane_id(&canonical).is_ok());
+        assert!(validate_lane_id(&canonical.to_uppercase()).is_err());
+        assert!(validate_lane_id("not-a-uuid").is_err());
+
+        let path = std::env::temp_dir().join(format!("worklane-id-test-{}.db", Uuid::new_v4()));
+        let store = Store::open(&path).unwrap();
+        let mut spec = LaneSpec::new(
+            "invalid-id".into(),
+            "local".into(),
+            PathBuf::from("/tmp"),
+            Profile::default(),
+        )
+        .unwrap();
+        spec.id = "not-a-uuid".into();
+        assert!(store.save_lane(&spec, "unknown", false).is_err());
+        assert!(write_lane_spec(&spec).is_err());
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -950,33 +1215,45 @@ mod tests {
         )
         .unwrap();
         assert!(spec.container_name().starts_with("worklane-"));
-        assert_eq!(spec.session_name(), spec.container_name());
-        assert_eq!(spec.home_dir(), PathBuf::from("/tmp"));
-        assert_eq!(spec.container_workspace(), PathBuf::from("/home/dev"));
+        assert_eq!(spec.session_name(), "docs");
+        assert_eq!(spec.container_home(), PathBuf::from("/home/dev"));
         assert_eq!(
             spec.manifest_path(),
             PathBuf::from("/tmp/.worklane/lane.toml")
         );
-        let mut legacy = spec.clone();
-        legacy.version = 1;
-        legacy.container_name_override = None;
-        legacy.container_workspace_override = None;
-        legacy.lane_dir_name_override = None;
-        legacy.session_name_override = None;
-        assert_eq!(
-            legacy.container_name(),
-            format!("worklane-{}", &legacy.id[..8])
-        );
-        assert_eq!(spec.lane_dir_name(), spec.id);
-        assert_eq!(
-            legacy.container_workspace(),
-            PathBuf::from("/home/dev/workspace")
-        );
-        assert_eq!(legacy.lane_dir_name(), legacy.id);
+        assert_eq!(spec.container_name(), format!("worklane-{}", spec.id));
     }
 
     #[test]
-    fn profile_defaults_are_backward_compatible() {
+    fn registry_only_and_legacy_manifest_fields_are_rejected() {
+        let spec = LaneSpec::new(
+            "strict".into(),
+            "local".into(),
+            PathBuf::from("/tmp"),
+            Profile::default(),
+        )
+        .unwrap();
+        let removed_fields = [
+            ("version", serde_json::json!(2)),
+            ("user", serde_json::json!("dev")),
+            ("workspace_path", serde_json::json!("/home/dev")),
+            ("lane_dir_name", serde_json::json!("old")),
+            ("host", serde_json::json!("local")),
+            ("project_path", serde_json::json!("/tmp")),
+            ("last_attached", serde_json::json!(null)),
+        ];
+        for (field, value) in removed_fields {
+            let mut document = serde_json::to_value(LaneManifest::from(&spec)).unwrap();
+            document
+                .as_object_mut()
+                .unwrap()
+                .insert(field.into(), value);
+            assert!(serde_json::from_value::<LaneManifest>(document).is_err());
+        }
+    }
+
+    #[test]
+    fn profile_defaults_fill_omitted_settings() {
         let profile: Profile = toml::from_str("image = 'test:latest'").unwrap();
         assert_eq!(profile.network, "outbound");
         assert_eq!(profile.containerfile, PathBuf::from("Containerfile"));
@@ -990,247 +1267,47 @@ mod tests {
             network: "invalid".into(),
             ..Profile::default()
         };
-        assert!(validate_profile(
-            &profile,
-            Path::new("/home/gerald"),
-            Path::new("/home/gerald/workspace"),
-            false
-        )
-        .is_err());
+        assert!(validate_profile(&profile, Path::new("/home/gerald"), false).is_err());
         profile.network = "none".into();
         profile.mounts.push(MountSpec {
             source: PathBuf::from("/tmp"),
             target: PathBuf::from("/home/gerald/workspace/tools"),
             read_only: true,
         });
-        assert!(validate_profile(
-            &profile,
-            Path::new("/home/gerald"),
-            Path::new("/home/gerald/workspace"),
-            false
-        )
-        .is_ok());
+        assert!(validate_profile(&profile, Path::new("/home/gerald"), false).is_ok());
         profile.mounts.push(MountSpec {
             source: PathBuf::from("/var/tmp"),
             target: PathBuf::from("/home/gerald/workspace/tools/nested"),
             read_only: true,
         });
-        assert!(validate_profile(
-            &profile,
-            Path::new("/home/gerald"),
-            Path::new("/home/gerald/workspace"),
-            false
-        )
-        .is_err());
+        assert!(validate_profile(&profile, Path::new("/home/gerald"), false).is_err());
         profile.mounts.clear();
         profile.mounts.push(MountSpec {
             source: PathBuf::from("/tmp"),
             target: PathBuf::from("/home"),
             read_only: true,
         });
-        assert!(validate_profile(
-            &profile,
-            Path::new("/home/gerald"),
-            Path::new("/home/gerald/workspace"),
-            false
-        )
-        .is_err());
+        assert!(validate_profile(&profile, Path::new("/home/gerald"), false).is_err());
         profile.mounts[0].target = PathBuf::from("/");
-        assert!(validate_profile(
-            &profile,
-            Path::new("/home/gerald"),
-            Path::new("/home/gerald/workspace"),
-            false
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn legacy_home_migration_merges_verified_data_and_preserves_source_until_commit() {
-        let token = Uuid::new_v4().to_string();
-        let project = std::env::temp_dir().join(format!("worklane-migration-project-{token}"));
-        fs::create_dir_all(&project).unwrap();
-        fs::write(project.join("project.txt"), b"project").unwrap();
-        let mut legacy = LaneSpec::new(
-            "legacy".into(),
-            "local".into(),
-            project.clone(),
-            Profile::default(),
-        )
-        .unwrap();
-        legacy.version = 1;
-        legacy.lane_dir_name_override = Some(format!("migration-test-{token}"));
-        legacy.container_workspace_override = None;
-        legacy.session_name_override = None;
-        let source = legacy.home_dir();
-        fs::create_dir_all(source.join(".cache/tool")).unwrap();
-        fs::write(source.join(".zshrc"), b"legacy shell").unwrap();
-        fs::write(source.join(".cache/tool/state"), b"cached").unwrap();
-
-        let mut migrated = prepare_lane_migration(&legacy).unwrap();
-        assert_eq!(migrated.version, 2);
-        assert_eq!(migrated.home_dir(), project);
-        assert_eq!(fs::read(project.join(".zshrc")).unwrap(), b"legacy shell");
-        assert_eq!(
-            fs::read(project.join(".cache/tool/state")).unwrap(),
-            b"cached"
-        );
-        assert!(source.exists());
-        assert!(project.join(".worklane/migration-v1").exists());
-
-        write_lane_spec(&migrated).unwrap();
-        finish_lane_migration(&legacy, &mut migrated).unwrap();
-        write_lane_spec(&migrated).unwrap();
-        assert!(!source.exists());
-        assert!(!project.join(".worklane/migration-v1").exists());
-        assert!(project.join(".worklane/lane.toml").exists());
-        fs::remove_dir_all(project).unwrap();
-    }
-
-    #[test]
-    fn legacy_home_migration_quarantines_collisions_without_blocking() {
-        let token = Uuid::new_v4().to_string();
-        let project = std::env::temp_dir().join(format!("worklane-collision-project-{token}"));
-        fs::create_dir_all(&project).unwrap();
-        fs::write(project.join(".zshrc"), b"project shell").unwrap();
-        let mut legacy = LaneSpec::new(
-            "collision".into(),
-            "local".into(),
-            project.clone(),
-            Profile::default(),
-        )
-        .unwrap();
-        legacy.version = 1;
-        legacy.lane_dir_name_override = Some(format!("collision-test-{token}"));
-        let source = legacy.home_dir();
-        fs::create_dir_all(&source).unwrap();
-        fs::write(source.join(".zshrc"), b"legacy shell").unwrap();
-
-        let mut migrated = prepare_lane_migration(&legacy).unwrap();
-        assert_eq!(fs::read(project.join(".zshrc")).unwrap(), b"project shell");
-        let quarantine = migration_quarantine_dir(&legacy);
-        assert_eq!(
-            fs::read(quarantine.join("items/.zshrc")).unwrap(),
-            b"legacy shell"
-        );
-        assert!(fs::read_to_string(quarantine.join("migration.log"))
-            .unwrap()
-            .contains("migration target already exists"));
-        write_lane_spec(&migrated).unwrap();
-        finish_lane_migration(&legacy, &mut migrated).unwrap();
-        assert!(!legacy.lane_dir().exists());
-        fs::remove_dir_all(quarantine).unwrap();
-        fs::remove_dir_all(project).unwrap();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn legacy_home_migration_quarantines_unsupported_entries_and_resumes_staging() {
-        use std::os::unix::net::UnixListener;
-
-        let token = Uuid::new_v4().to_string();
-        let project = std::env::temp_dir().join(format!("worklane-socket-project-{token}"));
-        fs::create_dir_all(project.join(".worklane/migration-staging/.config")).unwrap();
-        fs::write(
-            project.join(".worklane/migration-v1"),
-            format!("{}\n", token),
-        )
-        .unwrap();
-        fs::write(
-            project.join(".worklane/migration-staging/.config/partial"),
-            b"partial",
-        )
-        .unwrap();
-        let mut legacy = LaneSpec::new(
-            "socket".into(),
-            "local".into(),
-            project.clone(),
-            Profile::default(),
-        )
-        .unwrap();
-        legacy.id = token;
-        legacy.version = 1;
-        legacy.lane_dir_name_override = Some(format!("sock-{}", &legacy.id[..8]));
-        let source = legacy.home_dir();
-        fs::create_dir_all(source.join(".config")).unwrap();
-        let listener = UnixListener::bind(source.join(".config/agent.sock")).unwrap();
-
-        let migrated = prepare_lane_migration(&legacy).unwrap();
-        assert_eq!(migrated.version, 2);
-        assert!(source.join(".config").exists());
-        assert!(migration_quarantine_dir(&legacy)
-            .join("items/.config/agent.sock")
-            .exists());
-        assert!(project.join(".config").is_dir());
-        assert!(!project.join(".config/partial").exists());
-        assert!(!project.join(".worklane/migration-staging/.config").exists());
-
-        drop(listener);
-        fs::remove_dir_all(migration_quarantine_dir(&legacy)).unwrap();
-        fs::remove_dir_all(legacy.lane_dir()).unwrap();
-        fs::remove_dir_all(project).unwrap();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn migration_helpers_preserve_links_compare_trees_and_keep_duplicate_quarantine_entries() {
-        use std::os::unix::fs::symlink;
-
-        let token = Uuid::new_v4().to_string();
-        let project = std::env::temp_dir().join(format!("worklane-helper-project-{token}"));
-        fs::create_dir_all(&project).unwrap();
-        let mut lane = LaneSpec::new(
-            "helpers".into(),
-            "local".into(),
-            project.clone(),
-            Profile::default(),
-        )
-        .unwrap();
-        lane.id = token;
-        let scratch = lane.lane_dir().join("helper-test");
-        let left = scratch.join("left");
-        let right = scratch.join("right");
-        fs::create_dir_all(left.join("nested")).unwrap();
-        fs::create_dir_all(right.join("nested")).unwrap();
-        fs::write(left.join("nested/file"), b"same").unwrap();
-        fs::write(right.join("nested/file"), b"same").unwrap();
-        assert!(paths_equal(&left, &right).unwrap());
-        fs::write(right.join("nested/file"), b"different").unwrap();
-        assert!(!paths_equal(&left, &right).unwrap());
-
-        let source_link = scratch.join("source-link");
-        let copied_link = scratch.join("copied-link");
-        symlink("nested/file", &source_link).unwrap();
-        copy_for_migration(&lane, &source_link, &copied_link, Path::new("copied-link")).unwrap();
-        assert_eq!(
-            fs::read_link(&copied_link).unwrap(),
-            PathBuf::from("nested/file")
-        );
-        remove_path(&copied_link).unwrap();
-
-        let first = scratch.join("first");
-        let second = scratch.join("second");
-        fs::write(&first, b"first").unwrap();
-        fs::write(&second, b"second").unwrap();
-        let first_destination =
-            quarantine_path(&lane, &first, Path::new("duplicate"), "first").unwrap();
-        let second_destination =
-            quarantine_path(&lane, &second, Path::new("duplicate"), "second").unwrap();
-        assert_ne!(first_destination, second_destination);
-        assert_eq!(fs::read(first_destination).unwrap(), b"first");
-        assert_eq!(fs::read(second_destination).unwrap(), b"second");
-
-        fs::remove_dir_all(migration_quarantine_dir(&lane)).unwrap();
-        fs::remove_dir_all(lane.lane_dir()).unwrap();
-        fs::remove_dir_all(project).unwrap();
+        assert!(validate_profile(&profile, Path::new("/home/gerald"), false).is_err());
     }
 
     #[test]
     fn executor_requests_are_versioned_json() {
         let body = executor_request(vec!["lane".into(), "list".into()]).unwrap();
         let request: ExecutorRequest = serde_json::from_slice(&body).unwrap();
-        assert_eq!(request.protocol, EXECUTOR_PROTOCOL);
+        assert_eq!(EXECUTOR_PROTOCOL, 3);
+        assert_eq!(request.protocol_version, EXECUTOR_PROTOCOL);
+        assert!(validate_lane_id(&request.request_id).is_ok());
         assert_eq!(request.args, ["lane", "list"]);
+    }
+
+    #[test]
+    fn canonical_registry_uses_a_fresh_database_generation() {
+        assert_eq!(
+            db_path().file_name().and_then(|name| name.to_str()),
+            Some("worklane-v3.db")
+        );
     }
 
     #[test]
@@ -1308,12 +1385,66 @@ mod tests {
         store
             .conn
             .execute(
-                "INSERT INTO lanes(id,name,host,spec_toml,state,drift,cached_at) VALUES('bad','bad','local','not = [valid','unknown',0,'now')",
-                [],
+                "INSERT INTO lanes(id,name,host,manifest_path,container_name,session_name,container_home,profile_name,profile_json,config_hash,created_at,state,drift,config_cached_at,status_cached_at) VALUES(?1,'bad','local','/tmp/.worklane/lane.toml','worklane-bad','bad','/home/dev','default','{}','bad','not-a-time','unknown',0,'not-a-time','not-a-time')",
+                [Uuid::new_v4().to_string()],
             )
             .unwrap();
         assert!(store.lanes().is_err());
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn operation_journal_rejects_checksum_tampering() {
+        let project = std::env::temp_dir().join(format!("worklane-journal-{}", Uuid::new_v4()));
+        fs::create_dir_all(&project).unwrap();
+        let spec = LaneSpec::new(
+            "journal".into(),
+            "local".into(),
+            project.clone(),
+            Profile::default(),
+        )
+        .unwrap();
+        let journal = OperationJournal::new(&spec, "create", "prepared").unwrap();
+        write_operation_journal(&spec, &journal).unwrap();
+        assert_eq!(read_operation_journal(&spec).unwrap(), Some(journal));
+        let path = operation_journal_path(&spec);
+        let body = fs::read_to_string(&path).unwrap();
+        fs::write(
+            &path,
+            body.replace("name = \"journal\"", "name = \"tampered\""),
+        )
+        .unwrap();
+        assert!(read_operation_journal(&spec).is_err());
+        fs::remove_dir_all(project).unwrap();
+    }
+
+    #[test]
+    fn registry_locator_cannot_silently_change_lane_identity() {
+        let root = std::env::temp_dir().join(format!("worklane-locator-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let database = root.join("registry.db");
+        let store = Store::open(&database).unwrap();
+        let indexed = LaneSpec::new(
+            "indexed".into(),
+            "local".into(),
+            root.join("project"),
+            Profile::default(),
+        )
+        .unwrap();
+        fs::create_dir_all(&indexed.project_path).unwrap();
+        store.save_lane(&indexed, "unknown", false).unwrap();
+        let mut different = LaneSpec::new(
+            "different".into(),
+            "local".into(),
+            indexed.project_path.clone(),
+            Profile::default(),
+        )
+        .unwrap();
+        different.project_path = indexed.project_path.clone();
+        write_lane_spec(&different).unwrap();
+        let error = store.lane(&indexed.id).unwrap_err().to_string();
+        assert!(error.contains("points to a manifest for lane"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
