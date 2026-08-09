@@ -52,7 +52,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--codex", default="codex", help="Codex executable")
     parser.add_argument("--model", default="gpt-5.6-luna")
     parser.add_argument("--reasoning-effort", default="low")
-    parser.add_argument("--initial-workers", type=int, default=4)
+    parser.add_argument("--initial-workers", type=int, default=32)
     parser.add_argument("--max-workers", type=int, default=256)
     parser.add_argument("--success-window", type=int, default=32)
     parser.add_argument("--cooldown", type=float, default=60.0)

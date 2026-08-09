@@ -109,7 +109,7 @@ This pattern is especially useful for bulk classification, extraction, or taggin
 input into independent records, invoke bounded `codex exec` jobs with controlled concurrency,
 and aggregate their structured outputs. Treat 256 parallel Codex instances as a hard upper
 ceiling, not a launch target: OpenAI limits vary by organization, project, model, requests per
-minute, and tokens per minute, so no fixed concurrency is universally safe. Start with four
+minute, and tokens per minute, so no fixed concurrency is universally safe. Start with 32
 workers and adapt from observed results. The driver should preserve a stable input ID in every
 result, validate each response against the schema, and route low-confidence or terminal failures
 to a fallback model. Keeping one independent record per invocation makes failures isolated and
