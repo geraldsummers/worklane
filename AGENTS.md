@@ -26,9 +26,37 @@ If SDKMAN is absent, install it as the lane user with its upstream installer; do
 system-wide. SDKMAN-managed tools persist with the lane workspace and can be upgraded by agents
 without rebuilding the immutable image.
 
+Whenever you install or upgrade an SDK, record its name, resolved version, installation method,
+and user-space location in the nearest applicable `AGENTS.md` before handing off. Include any
+activation or reproducibility command another agent will need. Keep this inventory current when
+an SDK is replaced or removed; do not leave essential toolchain state discoverable only from the
+current shell or an agent transcript.
+
 Herdr is the lane session manager. A normal `worklane lane attach` enters the lane through
 a stable lane session, with the lane workspace focused at `/home/dev`.
 Use Herdr-managed sessions unless the user explicitly asks for a plain shell.
+
+## Progress and ETA updates
+
+For work lasting more than a few minutes, send regular progress updates at meaningful phase
+boundaries and at least about every five minutes while work is active. Use real UTC timestamps,
+an honest phase count, concrete completed work, the current decision or blocker, elapsed time,
+and a recalibrated ETA. Do not repeat a stale ETA after new evidence changes the estimate.
+
+Use a compact shape such as:
+
+```text
+2026-08-09 13:45 UTC — Status — phase 1/6: contract audit nearly complete
+Progress: command routing, reachability model, and dirty-worktree ownership verified
+Decision: isolate the implementation in a new analyzer and make only narrow additive edits to the already-dirty CLI/test files
+Elapsed: ~6m
+ETA: ~45–60m to the deterministic proposal checkpoint; recalibrate after the first successful full-graph run
+Tokens: ~18k used / ~55–70k estimated total (best-effort estimate)
+```
+
+Estimate token usage when practical, clearly label it as approximate, and revise the estimate as
+scope changes. Prefer a useful range over false precision. If exact usage is unavailable, say so
+and estimate from elapsed work, tool output, and remaining phases.
 
 ## Programmatic bulk delegation
 
