@@ -23,6 +23,16 @@ Herdr is the lane session manager. A normal `worklane lane attach` enters the la
 a stable lane session, with the lane workspace focused at `/home/dev`.
 Use Herdr-managed sessions unless the user explicitly asks for a plain shell.
 
+## Programmatic bulk delegation
+
+For independent bulk classification, extraction, or tagging, prefer the repository's
+`scripts/codex-bulk` driver when it is available. Feed it JSONL records with stable IDs and a
+JSON output schema. It defaults to `gpt-5.6-luna` with low reasoning, starts with four workers,
+adapts concurrency after successful runs, and coordinates queue-wide backoff after HTTP 429s.
+Its 256-worker setting is a hard ceiling, not a launch target. Preserve its append-only result
+file so completed IDs and retry state survive restarts. Do not replace its shared scheduler with
+unbounded background `codex exec` processes or per-process immediate retry loops.
+
 ## Git and agent coordination
 
 - Before editing repository files, inspect `git status --short`. Treat existing

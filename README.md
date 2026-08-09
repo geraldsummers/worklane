@@ -51,6 +51,67 @@ separate Herdr server. On the first Herdr attach, Worklane installs Herdr's
 Codex integration into the selected directory so supported Codex sessions can
 be restored after a Herdr server restart.
 
+### Programmatic Codex runs
+
+The attached Codex agent is useful for interactive work, but Codex can also be reinvoked
+non-interactively from scripts with `codex exec`. This is a convenient way for an agent or an
+ordinary program to delegate independent, well-bounded jobs without opening another TUI. For
+bulk work, write a small driver that pushes structured JSON or JSONL records into separate Codex
+invocations through standard input. Select the appropriate model with `--model`, and use a JSON
+Schema when the caller needs stable machine-readable results:
+
+```sh
+codex exec --ephemeral --model gpt-5.6-luna \
+  -c 'model_reasoning_effort="low"' \
+  --output-schema ./classification.schema.json \
+  "Classify the supplied record. Return only the schema-defined result." < record.json
+```
+
+The repository includes `scripts/codex-bulk`, a standard-library Python driver that reads one
+JSON object per input line, requires a stable `id` field, and appends durable result events to
+an output JSONL file:
+
+```sh
+scripts/codex-bulk records.jsonl \
+  --output classifications.jsonl \
+  --schema classification.schema.json \
+  --prompt "Classify the supplied record. Return only the schema-defined result."
+```
+
+Successful IDs are skipped when the command is rerun. Rate-limited records produce a persisted
+`retrying` event before they return to the queue; final rows use `ok` or `error`. Override
+`--id-field`, `--initial-workers`, or other limits when required; run
+`scripts/codex-bulk --help` for the complete interface.
+
+This pattern is especially useful for bulk classification, extraction, or tagging: split the
+input into independent records, invoke bounded `codex exec` jobs with controlled concurrency,
+and aggregate their structured outputs. Treat 256 parallel Codex instances as a hard upper
+ceiling, not a launch target: OpenAI limits vary by organization, project, model, requests per
+minute, and tokens per minute, so no fixed concurrency is universally safe. Start with four
+workers and adapt from observed results. The driver should preserve a stable input ID in every
+result, validate each response against the schema, and route low-confidence or terminal failures
+to a fallback model. Keeping one independent record per invocation makes failures isolated and
+results easy to resume or reorder; batch records together only when the classification requires
+cross-record context.
+
+Use one shared scheduler for the entire queue. After 32 consecutive successful completions,
+increase its worker target by one, up to 256. If any invocation exits with `429 Too Many Requests`
+or `exceeded retry limit`, stop launching new work, halve the worker target (with a floor of one),
+and apply a queue-wide 60-second cooldown plus random jitter before retrying the affected record.
+Do not let each subprocess immediately retry independently: unsuccessful requests also consume
+rate-limit capacity, and `codex exec` has already exhausted its own retries when it reports that
+message. Bound outer retries to three attempts and 15 minutes total per record, persist retry
+state for resumability, and distinguish temporary rate limits from quota or billing failures that
+require user action. When using the API directly instead of the CLI, honor `Retry-After` and the
+`x-ratelimit-*` response headers. See OpenAI's
+[rate-limit guidance](https://developers.openai.com/api/docs/guides/rate-limits).
+
+Default to `gpt-5.6-luna` with low reasoning for these simple, high-volume delegations. It offers
+enough capability for structured classification while keeping reasoning latency and token use
+bounded. Reserve a stronger model or the persistent interactive agent for ambiguous cases,
+synthesis, and repository-wide changes. Use `--json` instead when the caller needs the full JSONL
+event stream, and keep the default read-only sandbox unless a job genuinely needs workspace writes.
+
 To build for a managed host, the Containerfile and build context must already exist on that host:
 
 ```sh
