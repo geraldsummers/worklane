@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Drive lane in a real PTY and emit inspectable terminal-frame artifacts."""
-import argparse, fcntl, html, json, os, pty, select, signal, struct, subprocess, termios, time
+import argparse, codecs, fcntl, html, json, os, pty, select, signal, struct, subprocess, termios, time
 from pathlib import Path
 
 CSI = "\x1b["
@@ -10,18 +10,43 @@ class Screen:
         self.rows, self.cols = rows, cols
         self.grid = [[" " for _ in range(cols)] for _ in range(rows)]
         self.primary_grid = None
+        self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        self.pending = ""
         self.r = self.c = 0
     def feed(self, data):
-        text = data.decode("utf-8", "replace")
+        text = self.pending + self.decoder.decode(data)
+        self.pending = ""
         i = 0
         while i < len(text):
             ch = text[i]
-            if ch == "\x1b" and i + 1 < len(text) and text[i + 1] == "[":
+            if ch == "\x1b" and i + 1 == len(text):
+                self.pending = text[i:]
+                break
+            if ch == "\x1b" and text[i + 1] == "[":
                 j = i + 2
                 while j < len(text) and not ("@" <= text[j] <= "~"):
                     j += 1
                 if j < len(text):
                     self.csi(text[i + 2:j], text[j]); i = j + 1; continue
+                self.pending = text[i:]
+                break
+            if ch == "\x1b" and text[i + 1] == "]":
+                j = i + 2
+                while j < len(text):
+                    if text[j] == "\x07":
+                        i = j + 1
+                        break
+                    if text[j] == "\x1b" and j + 1 < len(text) and text[j + 1] == "\\":
+                        i = j + 2
+                        break
+                    j += 1
+                else:
+                    self.pending = text[i:]
+                    break
+                continue
+            if ch == "\x1b" and text[i + 1] == "\\":
+                i += 2
+                continue
             if ch == "\r": self.c = 0
             elif ch == "\n": self.r = min(self.rows - 1, self.r + 1)
             elif ch == "\b": self.c = max(0, self.c - 1)
