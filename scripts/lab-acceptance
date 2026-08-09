@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+CANDIDATE_WORKLANE=${1:?usage: lab-acceptance WORKLANE_BIN LANE_BIN ARTIFACT_DIR}
+CANDIDATE_LANE=${2:?usage: lab-acceptance WORKLANE_BIN LANE_BIN ARTIFACT_DIR}
+ARTIFACT_DIR=${3:?usage: lab-acceptance WORKLANE_BIN LANE_BIN ARTIFACT_DIR}
+LAB_SSH=${WORKLANE_LAB_SSH:-gerald@192.168.0.11}
+RUN_ID=${WORKLANE_ACCEPTANCE_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}
+LOCAL_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/worklane-acceptance-${RUN_ID}.XXXXXX")
+REMOTE_ROOT="/home/gerald/.local/share/worklane/acceptance/$RUN_ID"
+LANE_NAME="accept-${RUN_ID//[^A-Za-z0-9]/-}"; LANE_NAME=${LANE_NAME:0:48}
+SESSION_NAME="$LANE_NAME"
+REMOTE_PROJECT="$REMOTE_ROOT/project"
+REMOTE_DISCOVERY="$REMOTE_ROOT/discovery"
+DISCOVERY_NAME="${LANE_NAME}-discovery"
+IMAGE_TAG="localhost/worklane-acceptance:$RUN_ID"
+PASS_FILE="$ARTIFACT_DIR/passed-features.txt"
+LOG="$ARTIFACT_DIR/commands.log"
+ACCEPTANCE_SUCCEEDED=0
+OLD_DEPLOY_TARGET=
+mkdir -p "$ARTIFACT_DIR" "$LOCAL_ROOT/bin" "$LOCAL_ROOT/data" "$LOCAL_ROOT/config"
+: >"$PASS_FILE"; : >"$LOG"
+
+redact() { sed -E 's/(gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)/<redacted>/g'; }
+run() { printf '$'; printf ' %q' "$@"; printf '\n' | tee -a "$LOG"; "$@" 2>&1 | redact | tee -a "$LOG"; }
+pass() { printf '%s\n' "$1" >>"$PASS_FILE"; }
+remote() { run /usr/bin/ssh -o BatchMode=yes -o StrictHostKeyChecking=yes "$LAB_SSH" "$@"; }
+
+cleanup() {
+  set +e
+  case "$REMOTE_ROOT" in /home/gerald/.local/share/worklane/acceptance/*) ;; *) return 1;; esac
+  remote "for lane in '$LANE_NAME' '$DISCOVERY_NAME'; do env XDG_DATA_HOME='$REMOTE_ROOT/data' XDG_CONFIG_HOME='$REMOTE_ROOT/config' PATH='$REMOTE_ROOT/bin:/usr/local/bin:/usr/bin:/bin' '$REMOTE_ROOT/bin/worklane' --json lane delete \"\$lane\" >/dev/null 2>&1 || true; for container in \$(/usr/bin/podman ps -aq --filter \"label=io.worklane.name=\$lane\"); do /usr/bin/podman rm -f \"\$container\" >/dev/null 2>&1 || true; done; done; /usr/bin/podman rmi '$IMAGE_TAG' >/dev/null 2>&1 || true; if test -d '$REMOTE_ROOT/data/containers/storage'; then XDG_DATA_HOME='$REMOTE_ROOT/data' /usr/bin/podman system reset -f >/dev/null 2>&1 || true; fi; rm -rf -- '$REMOTE_ROOT'" >>"$LOG" 2>&1
+  if [[ $ACCEPTANCE_SUCCEEDED != 1 && -n $OLD_DEPLOY_TARGET ]]; then
+    remote "ln -sfn -- '$OLD_DEPLOY_TARGET' /home/gerald/.local/bin/worklane" >>"$LOG" 2>&1
+  fi
+  if [[ ${WORKLANE_ACCEPTANCE_KEEP:-0} != 1 ]]; then rm -rf "$LOCAL_ROOT"; fi
+}
+trap cleanup EXIT
+
+remote "set -eu; command -v podman; command -v gh; command -v script; test \"\$(df -Pk /home/gerald | awk 'NR==2 {print \$4}')\" -ge 8388608 || { echo 'lab requires at least 8 GiB free' >&2; exit 1; }; mkdir -p '$REMOTE_ROOT/bin' '$REMOTE_PROJECT' '$REMOTE_DISCOVERY' '$REMOTE_ROOT/data' '$REMOTE_ROOT/config/worklane'; ln -sfn /home/gerald/.config/gh '$REMOTE_ROOT/config/gh'; printf '%s\n' '#!/bin/sh' 'unset XDG_DATA_HOME' 'exec /usr/bin/podman \"\$@\"' >'$REMOTE_ROOT/bin/podman'; chmod 755 '$REMOTE_ROOT/bin/podman'; printf '%s\n' '[profiles.acceptance]' 'image = \"$IMAGE_TAG\"' 'embedded_containerfile = false' 'network = \"outbound\"' 'mount_codex_credentials = true' 'mount_gh_credentials = true' >'$REMOTE_ROOT/config/worklane/profiles.toml'"
+run scp -q "$CANDIDATE_WORKLANE" "$CANDIDATE_LANE" "$LAB_SSH:$REMOTE_ROOT/bin/"
+run scp -q "$ROOT/Containerfile" "$LAB_SSH:$REMOTE_PROJECT/Containerfile"
+run scp -q "$ROOT/Containerfile" "$LAB_SSH:$REMOTE_DISCOVERY/Containerfile"
+remote "chmod 755 '$REMOTE_ROOT/bin/worklane' '$REMOTE_ROOT/bin/lane'; '$REMOTE_ROOT/bin/worklane' --help >/dev/null; podman --version; gh --version | head -1"
+
+export XDG_DATA_HOME="$LOCAL_ROOT/data" XDG_CONFIG_HOME="$LOCAL_ROOT/config"
+run "$CANDIDATE_WORKLANE" --json registry init --fresh; pass registry.init
+run "$CANDIDATE_WORKLANE" --json host add lab --ssh "$LAB_SSH"; pass host.add
+run "$CANDIDATE_WORKLANE" --json host list; pass host.list
+run "$CANDIDATE_WORKLANE" --json host status
+"$CANDIDATE_WORKLANE" --json host status | jq -e 'all(.[]; .reachable == true)' >/dev/null
+pass host.status
+run "$CANDIDATE_WORKLANE" --json host bootstrap lab; pass host.bootstrap
+
+# Deploy is tested against the real target, then the isolated copy remains the acceptance executor.
+OLD_DEPLOY_TARGET=$(/usr/bin/ssh -o BatchMode=yes -o StrictHostKeyChecking=yes "$LAB_SSH" "readlink /home/gerald/.local/bin/worklane || true")
+printf '%s\n' "$OLD_DEPLOY_TARGET" >"$ARTIFACT_DIR/previous-deploy-target.txt"
+run "$CANDIDATE_WORKLANE" --json host deploy lab --binary "$CANDIDATE_WORKLANE"; pass host.deploy
+
+R="env XDG_DATA_HOME='$REMOTE_ROOT/data' XDG_CONFIG_HOME='$REMOTE_ROOT/config' PATH='$REMOTE_ROOT/bin:/usr/local/bin:/usr/bin:/bin'"
+remote "$R '$REMOTE_ROOT/bin/worklane' --json registry init --fresh"; pass registry.init
+remote "$R EDITOR=true '$REMOTE_ROOT/bin/worklane' --json image edit"; pass image.edit
+remote "$R '$REMOTE_ROOT/bin/worklane' --json image build --context '$REMOTE_PROJECT' --tag '$IMAGE_TAG'"; pass image.build
+remote "$R '$REMOTE_ROOT/bin/worklane' --json image build --context '$REMOTE_PROJECT' --tag '$IMAGE_TAG' --no-cache"; pass image.build.no_cache
+remote "$R '$REMOTE_ROOT/bin/worklane' --json image inspect '$IMAGE_TAG'"; pass image.inspect
+
+remote "$R '$REMOTE_ROOT/bin/worklane' --json lane create '$LANE_NAME' --project '$REMOTE_PROJECT' --profile acceptance"; pass lane.create
+remote "$R '$REMOTE_ROOT/bin/worklane' --json lane create '$LANE_NAME' --project '$REMOTE_PROJECT' --profile acceptance"; pass lane.create.retry
+for feature in lane.list lane.inspect lane.refresh lane.diff lane.diff.raw lane.stop lane.start lane.reconcile lane.reconcile.apply; do
+  case "$feature" in
+    lane.list) args="lane list";; lane.inspect) args="lane inspect '$LANE_NAME'";; lane.refresh) args="lane refresh '$LANE_NAME'";;
+    lane.diff) args="lane diff '$LANE_NAME'";; lane.diff.raw) args="lane diff '$LANE_NAME' --raw";; lane.stop) args="lane stop '$LANE_NAME'";;
+    lane.start) args="lane start '$LANE_NAME'";; lane.reconcile) args="lane reconcile '$LANE_NAME'";; lane.reconcile.apply) args="lane reconcile '$LANE_NAME' --apply";;
+  esac
+  remote "$R '$REMOTE_ROOT/bin/worklane' --json $args"; pass "$feature"
+done
+remote "$R '$REMOTE_ROOT/bin/worklane' --json lane refresh --all"; pass lane.refresh.all
+remote "$R '$REMOTE_ROOT/bin/worklane' --json lane rename '$LANE_NAME' '${LANE_NAME}-r'"; LANE_NAME="${LANE_NAME}-r"; pass lane.rename
+remote "$R sh -c 'printf \"exit\\n\" | script -qec \"$REMOTE_ROOT/bin/worklane lane attach $LANE_NAME --shell\" /dev/null'"; pass lane.attach.shell
+remote "$R '$REMOTE_ROOT/bin/worklane' --json lane upgrade '$LANE_NAME' --force"; pass lane.upgrade; pass lane.upgrade.force
+remote "$R '$REMOTE_ROOT/bin/worklane' --json lane upgrade --all"; pass lane.upgrade.all
+
+remote "$R sh -c 'printf \"\\002q\" | script -qec \"$REMOTE_ROOT/bin/worklane lane attach $LANE_NAME\" /dev/null'"; pass lane.attach.herdr
+remote "$R sh -c 'printf \"\\002q\" | script -qec \"$REMOTE_ROOT/bin/worklane lane attach $LANE_NAME\" /dev/null'"; pass lane.attach.repeat
+remote "$R sh -c 'container=\$(podman ps --filter \"label=io.worklane.name=$SESSION_NAME\" --format \"{{.Names}}\"); test -n \"\$container\"; host_token=\$(gh auth token); lane_token=\$(podman exec --workdir /home/dev \"\$container\" gh auth token); test -n \"\$host_token\"; test \"\$host_token\" = \"\$lane_token\"'"; pass credentials.github
+remote "$R podman exec --workdir /home/dev \$(podman ps --filter 'label=io.worklane.name=$SESSION_NAME' --format '{{.Names}}') codex login status >/dev/null"; pass credentials.codex
+remote "$R podman inspect --format '{{.State.StartedAt}}' \$(podman ps --filter 'label=io.worklane.name=$SESSION_NAME' --format '{{.Names}}')"; pass runtime.timestamp
+remote "$R podman exec --workdir /home/dev \$(podman ps --filter 'label=io.worklane.name=$SESSION_NAME' --format '{{.Names}}') sh -c 'test -w /home/dev && ! test -w /usr'"; pass runtime.immutable_root; pass runtime.mounts
+remote "$R podman exec --workdir /home/dev \$(podman ps --filter 'label=io.worklane.name=$SESSION_NAME' --format '{{.Names}}') sh -c 'set -e; git --version; node --version; python3 --version; cargo --version; curl -fsSI https://github.com >/dev/null'"; pass runtime.tools; pass runtime.network
+remote "$R podman exec --workdir /home/dev \$(podman ps --filter 'label=io.worklane.name=$SESSION_NAME' --format '{{.Names}}') sh -c 'set -eu; case \"\$(ps -p 1 -o comm= | tr -d \" \" )\" in podman-init|catatonit|tini|dumb-init) ;; *) ps -p 1 -o comm,args; exit 1;; esac; before=\$(cat /sys/fs/cgroup/pids.current); test \"\$(cat /sys/fs/cgroup/pids.max)\" -eq 16384; i=0; while test \"\$i\" -lt 64; do sh -c \"sleep 0.05 &\"; i=\$((i + 1)); done; sleep 1; zombies=\$(ps -eo stat | awk '\"'\"'\$1 ~ /^Z/ {count++} END {print count+0}'\"'\"'); after=\$(cat /sys/fs/cgroup/pids.current); test \"\$zombies\" -le 1; test \"\$after\" -le \$((before + 5))'"; pass runtime.process_reaping
+remote "$R podman exec --workdir /home/dev \$(podman ps --filter 'label=io.worklane.name=$SESSION_NAME' --format '{{.Names}}') sh -c 's=\$(herdr --session \"$SESSION_NAME\" api snapshot); test \"\$(printf %s \"\$s\" | jq \"[.result.snapshot.panes[] | select((.label // \\\"\\\") != \\\"git diff\\\")] | length\")\" -eq 1; test \"\$(printf %s \"\$s\" | jq \"[.result.snapshot.panes[] | select((.label // \\\"\\\") == \\\"git diff\\\")] | length\")\" -eq 1'"; pass herdr.layout.two_panes
+
+# TUI visual capture uses a real PTY and the candidate lane binary on the lab host.
+python3 - "$LOCAL_ROOT/scenario.json" "$LAB_SSH" "$R '$REMOTE_ROOT/bin/worklane' --json lane create '$DISCOVERY_NAME' --project '$REMOTE_ROOT/discovery' --profile acceptance" "$LANE_NAME" <<'PY'
+import json, sys
+path, target, discovery, lane = sys.argv[1:]
+ssh = ["/usr/bin/ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", target, discovery]
+steps = [
+    {"name":"navigation","keys":"jk","wait":1},
+    {"name":"filter","keys":"/accept\r","wait":1},
+    {"name":"registry-discovery","exec":ssh,"keys":"r","wait":4},
+    {"name":"inspect","keys":"i","wait":3}, {"name":"close-inspect","keys":"\u001b","wait":1},
+    {"name":"diff","keys":"d","wait":3}, {"name":"close-diff","keys":"\u001b","wait":1},
+    {"name":"stop","keys":"x","wait":15}, {"name":"start","keys":"s","wait":15},
+    {"name":"refresh","keys":"r","wait":3},
+    {"name":"rename","keys":"n" + lane + "-tui\r","wait":4},
+    {"name":"reconcile","keys":"c","wait":3},
+    {"name":"reconcile-confirm","keys":"C","wait":1}, {"name":"reconcile-cancel","keys":"n","wait":1},
+    {"name":"delete-confirm","keys":"D","wait":1}, {"name":"delete-cancel","keys":"n","wait":1},
+    {"name":"forget-confirm","keys":"F","wait":1}, {"name":"forget-cancel","keys":"n","wait":1},
+    {"name":"editor","keys":"e","wait":2},
+    {"name":"shell-attach","keys":"S","wait":3}, {"name":"shell-exit","keys":"exit\r","wait":4},
+    {"name":"herdr-attach","keys":"a","wait":5},
+    {"name":"herdr-onboarding","keys":"\r","wait":2},
+    {"name":"herdr-close-settings","keys":"\u001b","wait":2},
+    {"name":"herdr-prefix","keys":"\u0002","wait":1}, {"name":"herdr-detach","keys":"q","wait":4},
+    {"name":"upgrade","keys":"u","until":"upgrade: completed","timeout":180},
+    {"name":"upgrade-all","keys":"U","until":"upgrade all: completed","timeout":1800},
+]
+open(path, "w").write(json.dumps({"startup_wait":4,"steps":steps}))
+PY
+python3 "$ROOT/scripts/tui_capture.py" --out "$ARTIFACT_DIR/tui" --scenario "$LOCAL_ROOT/scenario.json" /usr/bin/ssh -tt -o BatchMode=yes -o StrictHostKeyChecking=yes "$LAB_SSH" "$R EDITOR=true '$REMOTE_ROOT/bin/lane'"
+grep -Fq 'Worklane lanes' "$ARTIFACT_DIR/tui/26-herdr-detach.txt"
+grep -Fq 'upgrade: completed' "$ARTIFACT_DIR/tui/27-upgrade.txt"
+grep -Fq 'upgrade all: completed' "$ARTIFACT_DIR/tui/28-upgrade-all.txt"
+LANE_NAME="${LANE_NAME}-tui"
+for f in tui.launch tui.registry_discovery tui.navigation tui.filter tui.inspect tui.diff tui.start_stop tui.rename tui.reconcile tui.confirmations tui.attach tui.upgrade tui.editor; do pass "$f"; done
+
+# Render every captured terminal frame to PNG for mandatory agent inspection.
+for html in "$ARTIFACT_DIR"/tui/*.html; do chromium --headless --no-sandbox --disable-gpu --window-size=1600,900 --screenshot="${html%.html}.png" "file://$html" >/dev/null 2>&1; done
+
+# Exercise forget/import/delete after interactive checks.
+remote "$R '$REMOTE_ROOT/bin/worklane' --json lane forget '$LANE_NAME'"; pass lane.forget
+remote "$R '$REMOTE_ROOT/bin/worklane' --json lane import '$REMOTE_PROJECT'"; pass lane.import
+remote "$R '$REMOTE_ROOT/bin/worklane' --json lane delete '$LANE_NAME'"; pass lane.delete
+
+cleanup
+trap - EXIT
+remote "test ! -e '$REMOTE_ROOT'"
+pass cleanup.complete
+
+sort -u "$ROOT/tests/acceptance-features.txt" | sed '/^#/d;/^$/d;/^tui\.visual_review$/d' >"$ARTIFACT_DIR/expected-features.txt"
+sort -u "$PASS_FILE" >"$ARTIFACT_DIR/actual-features.txt"
+if ! diff -u "$ARTIFACT_DIR/expected-features.txt" "$ARTIFACT_DIR/actual-features.txt" | tee "$ARTIFACT_DIR/coverage.diff"; then
+  echo "acceptance feature inventory incomplete" >&2; exit 1
+fi
+printf '{"run_id":"%s","lab":"%s","lane":"%s","status":"passed"}\n' "$RUN_ID" "$LAB_SSH" "$LANE_NAME" >"$ARTIFACT_DIR/report.json"
+ACCEPTANCE_SUCCEEDED=1

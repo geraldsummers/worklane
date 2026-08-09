@@ -1,2 +1,5 @@
 /target
 /dist/
+/artifacts/
+__pycache__/
+*.py[cod]

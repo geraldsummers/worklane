@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+cd "$ROOT"
+if [[ ${1:-} == --publish ]]; then
+  RUN_ID=${2:?usage: release-check --publish RUN_ID}
+  ARTIFACT_DIR="$ROOT/artifacts/lab-acceptance/$RUN_ID"
+  test -f "$ARTIFACT_DIR/report.json" || { echo "missing passed report for $RUN_ID" >&2; exit 1; }
+  grep -q '"status":"passed"' "$ARTIFACT_DIR/report.json"
+  sha256sum -c "$ARTIFACT_DIR/candidate.sha256"
+  test -f "$ARTIFACT_DIR/visual-review.txt" || { echo "visual review record is required" >&2; exit 1; }
+  printf '%s\n' tui.visual_review >>"$ARTIFACT_DIR/passed-features.txt"
+  sort -u tests/acceptance-features.txt | sed '/^#/d;/^$/d' >"$ARTIFACT_DIR/publish-expected-features.txt"
+  sort -u "$ARTIFACT_DIR/passed-features.txt" >"$ARTIFACT_DIR/publish-actual-features.txt"
+  diff -u "$ARTIFACT_DIR/publish-expected-features.txt" "$ARTIFACT_DIR/publish-actual-features.txt"
+  mkdir -p dist
+  cp target/x86_64-unknown-linux-gnu/release/worklane target/x86_64-unknown-linux-gnu/release/lane dist/
+  sha256sum dist/worklane dist/lane | tee "$ARTIFACT_DIR/dist.sha256"
+  exit 0
+fi
+RUN_ID=${WORKLANE_ACCEPTANCE_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}
+ARTIFACT_DIR="$ROOT/artifacts/lab-acceptance/$RUN_ID"
+mkdir -p "$ARTIFACT_DIR"
+RUSTUP_HOME=${WORKLANE_RUSTUP_HOME:-/home/dev/.rustup-worklane}
+CARGO_HOME=${WORKLANE_CARGO_HOME:-/home/dev/.cargo-worklane}
+export RUSTUP_HOME CARGO_HOME RUSTUP_NO_UPDATE_CHECK=1
+CARGO=(rustup run 1.88.0 cargo)
+
+"${CARGO[@]}" fmt --check
+"${CARGO[@]}" clippy --workspace --all-targets -- -D warnings
+"${CARGO[@]}" test --workspace
+if command -v cargo-llvm-cov >/dev/null 2>&1; then "${CARGO[@]}" llvm-cov --workspace --fail-under-lines 90 -- --test-threads=1; else echo 'cargo-llvm-cov is required' >&2; exit 1; fi
+"${CARGO[@]}" build --release --target x86_64-unknown-linux-gnu
+WORKLANE="$ROOT/target/x86_64-unknown-linux-gnu/release/worklane"
+LANE="$ROOT/target/x86_64-unknown-linux-gnu/release/lane"
+sha256sum "$WORKLANE" "$LANE" >"$ARTIFACT_DIR/candidate.sha256"
+WORKLANE_ACCEPTANCE_RUN_ID="$RUN_ID" "$ROOT/scripts/lab-acceptance" "$WORKLANE" "$LANE" "$ARTIFACT_DIR"
+
+pngs=("$ARTIFACT_DIR"/tui/*.png)
+(( ${#pngs[@]} > 0 )) || { echo 'no TUI PNG artifacts were produced' >&2; exit 1; }
+printf 'Acceptance passed. Visual review is required before publication:\n' >&2
+printf '  %s\n' "${pngs[@]}" >&2
+printf 'After review, record artifacts/lab-acceptance/%s/visual-review.txt and run:\n  scripts/release-check --publish %s\n' "$RUN_ID" "$RUN_ID" >&2

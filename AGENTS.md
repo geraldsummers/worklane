@@ -13,11 +13,18 @@ Use these locations for additions and generated state:
 - Node global packages: `/home/dev/.local`
 - Rust-installed binaries: `/home/dev/.local/bin` (`CARGO_INSTALL_ROOT` is configured there)
 - Go-installed binaries: `/home/dev/.local/bin` (`GOBIN` is configured there)
-- Temporary files: `/tmp` or `/var/tmp`; these are RAM-backed tmpfs mounts, limited to 1 GiB
-  each, and discarded when the container stops
+- Temporary files: Do not use `/tmp` for anything. Store temporary files under
+  `/home/dev/.tmp` (or a project-local temporary directory) instead. `/var/tmp` is also
+  unavailable unless the user explicitly authorizes it.
 
 The base image already provides common build, debugging, search, archive, network, browser, and
 language tooling. Prefer the installed tool before adding a new one.
+
+JVM SDKs are intentionally user-managed rather than installed from Debian packages. Use SDKMAN
+under `$HOME/.sdkman` to install and update Java, Kotlin, Gradle, Maven, and other supported SDKs.
+If SDKMAN is absent, install it as the lane user with its upstream installer; do not install it
+system-wide. SDKMAN-managed tools persist with the lane workspace and can be upgraded by agents
+without rebuilding the immutable image.
 
 Herdr is the lane session manager. A normal `worklane lane attach` enters the lane through
 a stable lane session, with the lane workspace focused at `/home/dev`.
@@ -53,13 +60,19 @@ unbounded background `codex exec` processes or per-process immediate retry loops
 
 ## Fresh dist builds
 
-When asked for a fresh dist, build the release binaries and refresh the ignored `dist/` directory:
+After every user-facing change to `worklane`, `lane`, their shared core, or their
+embedded runtime assets, automatically run the required validation, build the
+release binaries, and refresh the ignored `dist/` directory. Do this before
+handing the change back; the user must not need to ask for a fresh dist
+separately. Also refresh it whenever the user explicitly asks for a fresh dist:
 
 ```sh
-cargo build --release --target x86_64-unknown-linux-gnu
-mkdir -p dist
-cp target/x86_64-unknown-linux-gnu/release/worklane target/x86_64-unknown-linux-gnu/release/lane dist/
-sha256sum dist/worklane dist/lane
+scripts/release-check
+# Inspect every PNG named by the command, record visual-review.txt, then:
+scripts/release-check --publish RUN_ID
 ```
 
-Report the two SHA-256 hashes. Do not commit `dist/` artifacts; `dist/` and `target/` are ignored.
+This gate runs formatting, linting, tests, coverage, the complete isolated acceptance matrix on
+`gerald@192.168.0.11`, and real-PTY TUI capture. Directly copying binaries into `dist/` is not an
+acceptable substitute. Report the two SHA-256 hashes. Do not commit `dist/`, `target/`, or
+`artifacts/`; they are ignored.

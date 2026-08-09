@@ -16,16 +16,19 @@ use worklane_core::*;
 /// The standard lane image recipe travels with every `worklane` binary.
 const EMBEDDED_CONTAINERFILE: &str = include_str!("../../Containerfile");
 const STANDARD_CONTAINERFILE_MARKER: &str = "worklane-standard-containerfile";
+/// High enough for tool-heavy workloads while still bounding runaway process creation.
+const LANE_PIDS_LIMIT: &str = "16384";
 /// Guidance seeded into Codex's global instructions on first lane attach.
 const LANE_AGENTS_MD: &str = include_str!("../../AGENTS.md");
 static OPERATION_CONTEXT: OnceLock<(String, Instant)> = OnceLock::new();
 
-fn report_phase(lane_id: Option<&str>, status: &str, phase: &str, message: &str) {
+fn report_phase(lane: Option<(&str, &str)>, status: &str, phase: &str, message: &str) {
     let (operation_id, started) =
         OPERATION_CONTEXT.get_or_init(|| (uuid::Uuid::new_v4().to_string(), Instant::now()));
     let event = OperationEvent {
         operation_id: operation_id.clone(),
-        lane_id: lane_id.map(str::to_owned),
+        lane_id: lane.map(|(id, _)| id.to_owned()),
+        lane_name: lane.map(|(_, name)| name.to_owned()),
         status: status.into(),
         phase: phase.into(),
         elapsed_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
@@ -71,7 +74,7 @@ struct RegistryCmd {
 }
 #[derive(Subcommand)]
 enum RegistryAction {
-    /// Explicitly acknowledge a clean v3 registry while preserving older databases.
+    /// Explicitly acknowledge a clean v5 registry while preserving older databases.
     Init {
         #[arg(long)]
         fresh: bool,
@@ -394,7 +397,7 @@ fn build_local_image<R: Runner>(r: &R, spec: &LaneSpec, no_cache: bool) -> Resul
         )
     };
     report_phase(
-        Some(&spec.id),
+        Some((&spec.id, &spec.name)),
         "running",
         "building",
         &format!("building image '{}'", spec.profile.image),
@@ -439,7 +442,238 @@ fn host_timezone() -> Option<String> {
         .ok()
         .and_then(|link| timezone_from_localtime_link(&link))
 }
+fn absolute_environment_dir(name: &str) -> Result<Option<PathBuf>> {
+    let Some(value) = std::env::var_os(name) else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(value);
+    if !path.is_absolute() {
+        bail!("{name} must be an absolute path to mount credentials safely")
+    }
+    Ok(Some(path))
+}
+fn host_home() -> Result<PathBuf> {
+    absolute_environment_dir("HOME")?.context("HOME is not set; cannot locate host credentials")
+}
+fn credential_mounts(spec: &LaneSpec) -> Result<Vec<(&'static str, PathBuf, PathBuf)>> {
+    if !spec.profile.mount_codex_credentials && !spec.profile.mount_gh_credentials {
+        return Ok(Vec::new());
+    }
+    let home = host_home()?;
+    let mut mounts = Vec::new();
+    if spec.profile.mount_codex_credentials {
+        let codex_home =
+            absolute_environment_dir("CODEX_HOME")?.unwrap_or_else(|| home.join(".codex"));
+        mounts.push((
+            "Codex",
+            codex_home.join("auth.json"),
+            spec.container_home().join(".codex/auth.json"),
+        ));
+    }
+    if spec.profile.mount_gh_credentials {
+        let gh_config = if let Some(path) = absolute_environment_dir("GH_CONFIG_DIR")? {
+            path
+        } else if let Some(path) = absolute_environment_dir("XDG_CONFIG_HOME")? {
+            path.join("gh")
+        } else {
+            home.join(".config/gh")
+        };
+        mounts.push((
+            "GitHub CLI",
+            gh_config.join("hosts.yml"),
+            spec.container_home().join(".config/gh/hosts.yml"),
+        ));
+    }
+    Ok(mounts)
+}
+fn prepare_credential_mountpoint(
+    spec: &LaneSpec,
+    tool: &str,
+    source: &Path,
+    target: &Path,
+) -> Result<bool> {
+    let relative = target
+        .strip_prefix(spec.container_home())
+        .expect("managed credential target is below lane home");
+    let destination = spec.project_path.join(relative);
+    match fs::symlink_metadata(&destination) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            if destination.canonicalize().ok().as_deref() == Some(source) {
+                return Ok(false);
+            }
+            if metadata.len() != 0 {
+                bail!(
+                    "refusing to hide existing {tool} credential data at {}; move it, use it on the host, or disable the managed credential mount",
+                    destination.display()
+                )
+            }
+            Ok(true)
+        }
+        Ok(_) => bail!(
+            "{tool} credential mountpoint is not a regular file: {}",
+            destination.display()
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir_all(
+                destination
+                    .parent()
+                    .expect("managed credential destination has a parent"),
+            )?;
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&destination)
+                .with_context(|| {
+                    format!(
+                        "create empty {tool} credential mountpoint {}",
+                        destination.display()
+                    )
+                })?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&destination, fs::Permissions::from_mode(0o600))?;
+            }
+            Ok(true)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+fn export_gh_credentials(spec: &LaneSpec, source: &Path) -> Result<PathBuf> {
+    let status: serde_json::Value = serde_yaml::from_str(&fs::read_to_string(source)?)
+        .with_context(|| format!("parse GitHub CLI credentials {}", source.display()))?;
+    let hosts = status
+        .as_object()
+        .context("GitHub CLI credential status did not contain any hosts")?;
+    let mut exported_hosts = serde_json::Map::new();
+    for (hostname, host) in hosts {
+        let login = host["user"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .context("GitHub CLI active credential has no login")?;
+        let embedded_token = host["users"][login]["oauth_token"]
+            .as_str()
+            .or_else(|| host["oauth_token"].as_str())
+            .filter(|value| !value.is_empty());
+        let resolved_token;
+        let token = if let Some(token) = embedded_token {
+            token
+        } else {
+            let output = Command::new("gh")
+                .args(["auth", "token", "--hostname", hostname])
+                .output()
+                .with_context(|| {
+                    format!("read GitHub CLI credentials for {hostname} from the host keyring")
+                })?;
+            if !output.status.success() {
+                bail!(
+                    "GitHub CLI could not export credentials for {hostname} from {}: {}",
+                    source.display(),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )
+            }
+            resolved_token = String::from_utf8(output.stdout)
+                .context("GitHub CLI returned a non-UTF-8 authentication token")?;
+            resolved_token.trim()
+        };
+        if token.is_empty() {
+            bail!("GitHub CLI returned an empty authentication token for {hostname}")
+        }
+        let protocol = host["git_protocol"].as_str().unwrap_or("https");
+        let mut users = serde_json::Map::new();
+        users.insert(login.to_owned(), serde_json::json!({"oauth_token": token}));
+        exported_hosts.insert(
+            hostname.clone(),
+            serde_json::json!({
+                "users": users,
+                "git_protocol": protocol,
+                "oauth_token": token,
+                "user": login,
+            }),
+        );
+    }
+    if exported_hosts.is_empty() {
+        bail!(
+            "GitHub CLI has no active authenticated account to export for lane '{}'",
+            spec.name
+        )
+    }
+
+    let directory = data_dir().join("credentials/gh");
+    fs::create_dir_all(&directory)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+    }
+    let destination = directory.join(format!("{}.hosts.yml", spec.id));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&destination)
+        .with_context(|| {
+            format!(
+                "create managed GitHub CLI credentials {}",
+                destination.display()
+            )
+        })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    serde_json::to_writer(&mut file, &serde_json::Value::Object(exported_hosts))?;
+    file.write_all(b"\n")?;
+    Ok(destination)
+}
+fn append_credential_mounts(args: &mut Vec<String>, spec: &LaneSpec) -> Result<()> {
+    let mounts = credential_mounts(spec)?;
+    if !mounts.is_empty() {
+        report_phase(
+            Some((&spec.id, &spec.name)),
+            "running",
+            "preparing-credentials",
+            "validating host credentials and lane mountpoints",
+        );
+    }
+    for (tool, source, target) in mounts {
+        if !source.exists() {
+            bail!(
+                "{tool} credentials were not found at {}; authenticate on host '{}' or disable the corresponding credential mount in the lane profile",
+                source.display(),
+                spec.host
+            )
+        }
+        let mut source = source
+            .canonicalize()
+            .with_context(|| format!("resolve {tool} credential file {}", source.display()))?;
+        if !source.is_file() {
+            bail!(
+                "{tool} credential source is not a regular file: {}",
+                source.display()
+            )
+        }
+        if tool == "GitHub CLI" {
+            source = export_gh_credentials(spec, &source)?;
+        }
+        if !prepare_credential_mountpoint(spec, tool, &source, &target)? {
+            continue;
+        }
+        args.extend([
+            "--mount".into(),
+            format!(
+                "type=bind,src={},dst={},rw=true",
+                source.display(),
+                target.display()
+            ),
+        ]);
+    }
+    Ok(())
+}
 fn create_local_container<R: Runner>(r: &R, spec: &LaneSpec, name: &str) -> Result<()> {
+    let mut credential_args = Vec::new();
+    append_credential_mounts(&mut credential_args, spec)?;
     if !image_exists(r, &spec.profile.image)? {
         build_local_image(r, spec, false)?;
     }
@@ -449,6 +683,9 @@ fn create_local_container<R: Runner>(r: &R, spec: &LaneSpec, name: &str) -> Resu
         "-d".into(),
         "--name".into(),
         name.into(),
+        "--init".into(),
+        "--pids-limit".into(),
+        LANE_PIDS_LIMIT.into(),
         "--userns=keep-id".into(),
         "--read-only".into(),
         "--tmpfs".into(),
@@ -459,6 +696,10 @@ fn create_local_container<R: Runner>(r: &R, spec: &LaneSpec, name: &str) -> Resu
         "/run:rw,nosuid,nodev,size=64m".into(),
         "--label".into(),
         format!("io.worklane.id={}", spec.id),
+        "--label".into(),
+        format!("io.worklane.name={}", spec.session_name),
+        "--workdir".into(),
+        spec.container_home().display().to_string(),
         "--mount".into(),
         format!(
             "type=bind,src={},dst={}",
@@ -466,6 +707,7 @@ fn create_local_container<R: Runner>(r: &R, spec: &LaneSpec, name: &str) -> Resu
             spec.container_home().display()
         ),
     ];
+    a.extend(credential_args);
     if let Some(timezone) = host_timezone() {
         a.extend(["--env".into(), format!("TZ={timezone}")]);
     }
@@ -512,28 +754,31 @@ fn ensure_local_started<R: Runner>(r: &R, spec: &LaneSpec) -> Result<()> {
     }
     Ok(())
 }
-fn verify_container_owner<R: Runner>(r: &R, name: &str, lane_id: &str) -> Result<()> {
+fn verify_container_owner<R: Runner>(r: &R, name: &str, spec: &LaneSpec) -> Result<()> {
     let owner = podman(
         r,
         [
             "inspect",
             "--format",
-            "{{ index .Config.Labels \"io.worklane.id\" }}",
+            "{{ index .Config.Labels \"io.worklane.id\" }}|{{ index .Config.Labels \"io.worklane.name\" }}",
             name,
         ],
     )?;
-    if owner != lane_id {
+    let expected = format!("{}|{}", spec.id, spec.session_name);
+    if owner != expected {
         bail!(
-            "container '{name}' is not owned by lane '{lane_id}' (label was '{owner}'); refusing to modify it"
+            "container '{name}' is not owned by lane '{}' ({}) (identity labels were '{owner}'); refusing to modify it",
+            spec.name,
+            spec.id
         )
     }
     Ok(())
 }
-fn remove_owned_container<R: Runner>(r: &R, name: &str, lane_id: &str) -> Result<()> {
+fn remove_owned_container<R: Runner>(r: &R, name: &str, spec: &LaneSpec) -> Result<()> {
     if container_runtime_state(r, name)? == "absent" {
         return Ok(());
     }
-    verify_container_owner(r, name, lane_id)?;
+    verify_container_owner(r, name, spec)?;
     podman(r, ["rm", "-f", name])?;
     Ok(())
 }
@@ -543,25 +788,25 @@ fn apply_local_upgrade<R: Runner>(r: &R, spec: &LaneSpec) -> Result<Option<Strin
     let previous = format!("{canonical}.previous");
 
     if container_runtime_state(r, &previous)? != "absent" {
-        verify_container_owner(r, &previous, &spec.id)?;
+        verify_container_owner(r, &previous, spec)?;
         if container_runtime_state(r, &canonical)? == "absent" {
             bail!(
                 "upgrade stopped after preserving the previous container; run lane reconcile before retrying"
             )
         }
-        verify_container_owner(r, &canonical, &spec.id)?;
+        verify_container_owner(r, &canonical, spec)?;
         return Ok(Some(previous));
     }
 
-    remove_owned_container(r, &staging, &spec.id)?;
+    remove_owned_container(r, &staging, spec)?;
     create_local_container(r, spec, &staging)?;
     if container_runtime_state(r, &staging)? != "running" {
         bail!("staged upgrade container did not reach running state")
     }
-    verify_container_owner(r, &staging, &spec.id)?;
+    verify_container_owner(r, &staging, spec)?;
 
     if container_runtime_state(r, &canonical)? != "absent" {
-        verify_container_owner(r, &canonical, &spec.id)?;
+        verify_container_owner(r, &canonical, spec)?;
         podman(r, ["stop", &canonical])?;
         podman(r, ["rename", &canonical, &previous])?;
     }
@@ -580,9 +825,10 @@ fn apply_local_upgrade<R: Runner>(r: &R, spec: &LaneSpec) -> Result<Option<Strin
     Ok((container_runtime_state(r, &previous)? != "absent").then_some(previous))
 }
 fn refresh<R: Runner>(runner: &R, store: &Store, spec: &LaneSpec) -> Result<LaneStatus> {
-    let (resolved, state, drift) = if spec.host == "local" {
+    let (resolved, state, drift, runtime_started_at) = if spec.host == "local" {
         let (state, drift) = host_state(runner, spec)?;
-        (spec.clone(), state, drift)
+        let started_at = host_runtime_started_at(runner, spec, &state)?;
+        (spec.clone(), state, drift, started_at)
     } else {
         let out = remote(
             runner,
@@ -596,7 +842,12 @@ fn refresh<R: Runner>(runner: &R, store: &Store, spec: &LaneSpec) -> Result<Lane
         let mut resolved = remote_status.spec;
         resolved.host = spec.host.clone();
         resolved.project_path = spec.project_path.clone();
-        (resolved, remote_status.state, remote_status.drift)
+        (
+            resolved,
+            remote_status.state,
+            remote_status.drift,
+            remote_status.runtime_started_at,
+        )
     };
     store.save_lane(&resolved, &state, drift)?;
     Ok(LaneStatus {
@@ -604,6 +855,7 @@ fn refresh<R: Runner>(runner: &R, store: &Store, spec: &LaneSpec) -> Result<Lane
         state,
         drift,
         cached_at: Utc::now(),
+        runtime_started_at,
     })
 }
 fn refresh_state_only<R: Runner>(runner: &R, store: &Store, spec: &LaneSpec) -> Result<LaneStatus> {
@@ -612,8 +864,10 @@ fn refresh_state_only<R: Runner>(runner: &R, store: &Store, spec: &LaneSpec) -> 
         .into_iter()
         .find(|status| status.spec.id == spec.id)
         .is_some_and(|status| status.drift);
-    let (resolved, state) = if spec.host == "local" {
-        (spec.clone(), host_runtime_state(runner, spec)?)
+    let (resolved, state, runtime_started_at) = if spec.host == "local" {
+        let state = host_runtime_state(runner, spec)?;
+        let started_at = host_runtime_started_at(runner, spec, &state)?;
+        (spec.clone(), state, started_at)
     } else {
         let out = remote(
             runner,
@@ -632,7 +886,11 @@ fn refresh_state_only<R: Runner>(runner: &R, store: &Store, spec: &LaneSpec) -> 
         let mut resolved = remote_status.spec;
         resolved.host = spec.host.clone();
         resolved.project_path = spec.project_path.clone();
-        (resolved, remote_status.state)
+        (
+            resolved,
+            remote_status.state,
+            remote_status.runtime_started_at,
+        )
     };
     store.save_lane(&resolved, &state, existing_drift)?;
     Ok(LaneStatus {
@@ -640,13 +898,19 @@ fn refresh_state_only<R: Runner>(runner: &R, store: &Store, spec: &LaneSpec) -> 
         state,
         drift: existing_drift,
         cached_at: Utc::now(),
+        runtime_started_at,
     })
 }
 fn validate_lane_registration(store: &Store, candidate: &LaneSpec) -> Result<()> {
     for status in store.lanes()? {
         let existing = status.spec;
         if existing.id == candidate.id {
-            bail!("lane ID '{}' is already registered", candidate.id)
+            bail!(
+                "lane '{}' uses UUID '{}', which is already registered to lane '{}'",
+                candidate.name,
+                candidate.id,
+                existing.name
+            )
         }
         if existing.name == candidate.name {
             bail!("lane name '{}' is already registered", candidate.name)
@@ -694,6 +958,7 @@ fn reconcile_local(
 ) -> Result<ReconcileReport> {
     let mut report = ReconcileReport {
         lane_id: index.id.clone(),
+        lane_name: index.name.clone(),
         applied: apply,
         findings: Vec::new(),
         changes: Vec::new(),
@@ -778,7 +1043,7 @@ fn reconcile_local(
                 repairable: true,
             });
             if apply {
-                store.save_status(&index.id, &state, index.drift)?;
+                store.save_status(&index.id, &index.name, &state, index.drift)?;
                 report
                     .changes
                     .push(format!("cached runtime state as {state}"));
@@ -841,9 +1106,8 @@ fn lane_attach_args(session: &str, shell: bool) -> Vec<String> {
     vec!["herdr".into(), "--session".into(), session.into()]
 }
 
-fn bootstrap_herdr(spec: &LaneSpec) -> Result<()> {
-    let session = spec.session_name();
-    let script = r#"set -eu
+fn bootstrap_herdr_script() -> &'static str {
+    r#"set -eu
 marker="$HOME/.local/share/worklane/herdr-codex-integration-v1"
 if [ ! -e "$marker" ]; then
   mkdir -p "$HOME/.codex" "$(dirname "$marker")"
@@ -863,6 +1127,18 @@ if [ -n "$workspace_id" ]; then
   herdr --session "$WORKLANE_SESSION" workspace focus "$workspace_id"
 else
   herdr --session "$WORKLANE_SESSION" workspace create --cwd "$WORKLANE_WORKSPACE" --label "$WORKLANE_SESSION" --focus
+  workspace_id="$(herdr --session "$WORKLANE_SESSION" workspace list | jq -r --arg label "$WORKLANE_SESSION" '.result.workspaces[] | select(.label == $label) | .workspace_id' | head -n 1)"
+fi
+codex_agent="$(herdr --session "$WORKLANE_SESSION" agent list | jq -r --arg workspace "$workspace_id" '.result.agents[]? | select(.workspace_id == $workspace and .agent == "codex") | .terminal_id' | head -n 1)"
+if [ -n "$codex_agent" ]; then
+  herdr --session "$WORKLANE_SESSION" agent focus "$codex_agent"
+else
+  primary_pane="$(herdr --session "$WORKLANE_SESSION" pane list --workspace "$workspace_id" | jq -r '.result.panes[]? | select((.label // "") != "git diff" and (.agent // "") == "") | .pane_id' | head -n 1)"
+  [ -n "$primary_pane" ] || {
+    printf 'workspace %s has no terminal pane available for Codex\n' "$WORKLANE_SESSION" >&2
+    exit 1
+  }
+  herdr --session "$WORKLANE_SESSION" pane run "$primary_pane" "codex --dangerously-bypass-approvals-and-sandbox" >/dev/null
 fi
 watcher="$HOME/.local/share/worklane/bin/worklane-git-diff-pane"
 manager="$HOME/.local/share/worklane/bin/worklane-git-diff-pane-manager"
@@ -884,10 +1160,17 @@ if [ -x "$manager" ]; then
   manager_pid=$!
   printf '%s\n' "$manager_pid" > "$manager_pid_file"
   disown "$manager_pid" 2>/dev/null || true
-fi"#;
+fi"#
+}
+
+fn bootstrap_herdr(spec: &LaneSpec) -> Result<()> {
+    let session = spec.session_name();
+    let script = bootstrap_herdr_script();
     let output = Command::new("podman")
         .args([
             "exec",
+            "--workdir",
+            &spec.container_home().display().to_string(),
             "--env",
             &format!("WORKLANE_NAME={}", spec.name),
             "--env",
@@ -914,7 +1197,7 @@ fn bootstrap_shell_script() -> String {
 if [ ! -f "$HOME/.zshrc" ]; then
   cat > "$HOME/.zshrc" <<'ZSHRC'
 export EDITOR="${EDITOR:-vim}"
-cd "${WORKLANE_WORKSPACE:-$HOME/${WORKLANE_NAME:-workspace}}" 2>/dev/null || true
+cd "${WORKLANE_WORKSPACE:-$HOME}" 2>/dev/null || true
 ZSHRC
 fi
 touch "$HOME/.zshenv"
@@ -931,7 +1214,20 @@ grep -qxF 'source "$HOME/.config/worklane/prompt.zsh"' "$HOME/.zshrc" || \
   printf '%s\n' 'source "$HOME/.config/worklane/prompt.zsh"' >> "$HOME/.zshrc""#;
     let script = format!(
         r#"{script}
-mkdir -p "$HOME/.local/share/worklane/bin"
+mkdir -p "$HOME/.local/bin" "$HOME/.local/share/worklane/bin"
+bell_player="$HOME/.local/share/worklane/bin/worklane-terminal-bell"
+cat > "$bell_player" <<'WORKLANE_TERMINAL_BELL'
+#!/bin/sh
+# Herdr runs inside the lane, so forward agent alerts through the attached PTY.
+(printf '\007' > /dev/tty) 2>/dev/null || true
+WORKLANE_TERMINAL_BELL
+chmod 755 "$bell_player"
+paplay="$HOME/.local/bin/paplay"
+if [ ! -e "$paplay" ] && [ ! -L "$paplay" ]; then
+  ln -s "$bell_player" "$paplay"
+elif [ -L "$paplay" ] && [ "$(readlink "$paplay")" = "$bell_player" ]; then
+  ln -sfn "$bell_player" "$paplay"
+fi
 cat > "$HOME/.local/share/worklane/bin/worklane-git-diff-pane" <<'WORKLANE_GIT_DIFF_PANE'
 #!/bin/sh
 interval="${{WORKLANE_GIT_DIFF_INTERVAL:-1}}"
@@ -1139,7 +1435,7 @@ ensure_tab_diff_panes() {{
       cwd="$(printf '%s\n' "$state" |
         jq -r --arg pane "$target" '.result.snapshot.panes[]? | select(.pane_id == $pane) | (.foreground_cwd // .cwd // empty)' 2>/dev/null |
         head -n 1)"
-      [ -n "$cwd" ] || cwd="${{WORKLANE_WORKSPACE:-$HOME/$session}}"
+      [ -n "$cwd" ] || cwd="${{WORKLANE_WORKSPACE:-$HOME}}"
       split_output="$(herdr --session "$session" pane split "$target" --direction right --ratio 0.7 --cwd "$cwd" --env "WORKLANE_NAME=$session" --no-focus 2>/dev/null || true)"
       diff_pane="$(printf '%s\n' "$split_output" |
         jq -r '.result.pane.pane_id // .result.pane_id // empty' 2>/dev/null |
@@ -1174,6 +1470,8 @@ fn bootstrap_shell(spec: &LaneSpec) -> Result<()> {
     let status = Command::new("podman")
         .args([
             "exec",
+            "--workdir",
+            &spec.container_home().display().to_string(),
             "--env",
             &format!("WORKLANE_NAME={}", spec.name),
             "--env",
@@ -1230,6 +1528,7 @@ fn run_executor() -> Result<()> {
                 message: String::from_utf8_lossy(&output.stderr).trim().into(),
                 guidance: Some("retry after resolving the reported remote error".into()),
                 lane_id: None,
+                lane_name: None,
                 retryable: true,
             }),
         }
@@ -1298,7 +1597,10 @@ fn main() -> Result<()> {
                         SystemRunner
                             .run(
                                 "ssh",
-                                &ssh_command(&h.ssh_target, &["host".into(), "list".into()]),
+                                &strict_ssh_args(
+                                    &h.ssh_target,
+                                    "~/.local/bin/worklane --help >/dev/null".into(),
+                                ),
                             )
                             .is_ok()
                     };
@@ -1478,7 +1780,12 @@ fn main() -> Result<()> {
                             }
                             if let Some(requested_id) = &id {
                                 if requested_id != &existing.id {
-                                    bail!("existing manifest UUID differs from requested UUID")
+                                    bail!(
+                                        "existing lane '{}' has UUID '{}', not requested UUID '{}'",
+                                        existing.name,
+                                        existing.id,
+                                        requested_id
+                                    )
                                 }
                             }
                             if let Some(journal) = read_operation_journal(&existing)? {
@@ -1534,10 +1841,15 @@ fn main() -> Result<()> {
                     if let Some(id) = id {
                         validate_lane_id(&id)?;
                         if pending.is_some() && spec.id != id {
-                            bail!("pending create UUID differs from requested UUID")
+                            bail!(
+                                "pending lane '{}' has UUID '{}', not requested UUID '{}'",
+                                spec.name,
+                                spec.id,
+                                id
+                            )
                         }
                         spec.id = id.clone();
-                        spec.container_name = format!("worklane-{id}");
+                        spec.container_name = stable_container_name(&spec.session_name, &id);
                     }
                     validate_profile(&spec.profile, &spec.container_home(), spec.host == "local")?;
                     validate_lane_registration(&store, &spec)?;
@@ -1547,7 +1859,7 @@ fn main() -> Result<()> {
                             pending.unwrap_or(OperationJournal::new(&spec, "create", "prepared")?);
                         write_operation_journal(&spec, &journal)?;
                         report_phase(
-                            Some(&spec.id),
+                            Some((&spec.id, &spec.name)),
                             "running",
                             "preparing-container",
                             "ensuring the lane container is running",
@@ -1558,7 +1870,7 @@ fn main() -> Result<()> {
                         write_operation_journal(&spec, &journal)?;
                         write_lane_spec(&spec)?;
                         report_phase(
-                            Some(&spec.id),
+                            Some((&spec.id, &spec.name)),
                             "running",
                             "updating-index",
                             "committing the registry projection",
@@ -1567,7 +1879,7 @@ fn main() -> Result<()> {
                         clear_operation_journal(&spec)?;
                     } else {
                         report_phase(
-                            Some(&spec.id),
+                            Some((&spec.id, &spec.name)),
                             "running",
                             "connecting",
                             &format!("connecting to host '{}'", spec.host),
@@ -1622,8 +1934,10 @@ fn main() -> Result<()> {
                     if let Ok(existing) = store.index(&spec.id) {
                         if existing.host != spec.host || existing.manifest_path != manifest {
                             bail!(
-                                "lane UUID '{}' is already indexed at {}:{}; reconcile the conflict before importing",
+                                "lane '{}' UUID '{}' is already indexed as '{}' at {}:{}; reconcile the conflict before importing",
+                                spec.name,
                                 spec.id,
+                                existing.name,
                                 existing.host,
                                 existing.manifest_path.display()
                             )
@@ -1716,7 +2030,7 @@ fn main() -> Result<()> {
                         };
                         write_operation_journal(&s, &journal)?;
                         report_phase(
-                            Some(&s.id),
+                            Some((&s.id, &s.name)),
                             "running",
                             "committing-manifest",
                             "updating the authoritative display name",
@@ -1757,7 +2071,7 @@ fn main() -> Result<()> {
                         };
                         emit(
                             cli.json,
-                            &serde_json::json!({"lane":s.id,"diff":diff,"raw":raw}),
+                            &serde_json::json!({"lane_id":s.id,"lane_name":s.name,"diff":diff,"raw":raw}),
                         )
                     } else {
                         let mut args = vec!["lane".into(), "diff".into(), s.id.clone()];
@@ -1774,7 +2088,7 @@ fn main() -> Result<()> {
                     let s = store.lane(&lane)?;
                     ensure_no_pending_operation(&s, "start")?;
                     report_phase(
-                        Some(&s.id),
+                        Some((&s.id, &s.name)),
                         "running",
                         "starting",
                         &format!("starting lane '{}'", s.name),
@@ -1795,7 +2109,7 @@ fn main() -> Result<()> {
                     let s = store.lane(&lane)?;
                     ensure_no_pending_operation(&s, "stop")?;
                     report_phase(
-                        Some(&s.id),
+                        Some((&s.id, &s.name)),
                         "running",
                         "stopping",
                         &format!("stopping lane '{}'", s.name),
@@ -1860,6 +2174,8 @@ fn main() -> Result<()> {
                         .args([
                             "exec",
                             "-it",
+                            "--workdir",
+                            &s.container_home().display().to_string(),
                             "--env",
                             &format!("WORKLANE_NAME={}", s.name),
                             "--env",
@@ -1915,7 +2231,7 @@ fn main() -> Result<()> {
                         }
                         let before = refresh(&runner, &store, &s)?;
                         if before.drift && !force {
-                            out.push(serde_json::json!({"lane":s.id,"outcome":"skipped-drift"}));
+                            out.push(serde_json::json!({"lane_id":s.id,"lane_name":s.name,"outcome":"skipped-drift"}));
                             continue;
                         }
                         if s.host == "local" {
@@ -1948,7 +2264,7 @@ fn main() -> Result<()> {
                             };
                             write_operation_journal(&s, &journal)?;
                             report_phase(
-                                Some(&s.id),
+                                Some((&s.id, &s.name)),
                                 "running",
                                 "switching-container",
                                 "validating and swapping the staged container",
@@ -1960,7 +2276,7 @@ fn main() -> Result<()> {
                             write_lane_spec(&s)?;
                             out.push(serde_json::to_value(refresh(&runner, &store, &s)?)?);
                             if let Some(previous) = previous {
-                                remove_owned_container(&runner, &previous, &s.id)?;
+                                remove_owned_container(&runner, &previous, &s)?;
                             }
                             clear_operation_journal(&s)?;
                         } else {
@@ -1984,15 +2300,22 @@ fn main() -> Result<()> {
                 LaneAction::Delete { lane } => {
                     let s = match store.lane(&lane) {
                         Ok(spec) => spec,
-                        Err(_error)
-                            if store.tombstone_operation(&lane)?.as_deref() == Some("delete") =>
-                        {
-                            return emit(
-                                cli.json,
-                                &serde_json::json!({"deleted":lane,"already_complete":true}),
-                            )
+                        Err(error) => {
+                            if let Some(tombstone) = store.tombstone(&lane)? {
+                                if tombstone.operation == "delete" {
+                                    return emit(
+                                        cli.json,
+                                        &serde_json::json!({
+                                            "lane_id": tombstone.lane_id,
+                                            "lane_name": tombstone.lane_name,
+                                            "deleted": true,
+                                            "already_complete": true
+                                        }),
+                                    );
+                                }
+                            }
+                            return Err(error);
                         }
-                        Err(error) => return Err(error),
                     };
                     let status = refresh(&runner, &store, &s)?;
                     if status.drift {
@@ -2020,18 +2343,20 @@ fn main() -> Result<()> {
                         };
                         write_operation_journal(&s, &journal)?;
                         report_phase(
-                            Some(&s.id),
+                            Some((&s.id, &s.name)),
                             "running",
                             "removing-runtime",
                             "removing the verified disposable container",
                         );
-                        remove_owned_container(&runner, &s.container_name(), &s.id)?;
+                        remove_owned_container(&runner, &s.container_name(), &s)?;
                         journal.phase = "runtime-removed".into();
                         journal.updated_at = Utc::now();
                         write_operation_journal(&s, &journal)?;
                         let manifest = s.manifest_path();
-                        let backup = manifest
-                            .with_file_name(format!("lane.toml.deleted-{}", journal.operation_id));
+                        let backup = manifest.with_file_name(format!(
+                            "lane.toml.deleted-{}-{}",
+                            s.session_name, journal.operation_id
+                        ));
                         if manifest.exists() {
                             fs::rename(&manifest, &backup)?;
                         }
@@ -2048,7 +2373,10 @@ fn main() -> Result<()> {
                         store.record_tombstone(&s.id, &s.name, "delete")?;
                         store.remove_lane(&s.id)?;
                     }
-                    emit(cli.json, &serde_json::json!({"deleted":s.name}))
+                    emit(
+                        cli.json,
+                        &serde_json::json!({"lane_id":s.id,"lane_name":s.name,"deleted":true}),
+                    )
                 }
                 LaneAction::Forget { lane } => {
                     let index = store.index(&lane)?;
@@ -2219,13 +2547,16 @@ mod tests {
         (Store::open(&path).unwrap(), path)
     }
     fn spec(host: &str) -> LaneSpec {
-        LaneSpec::new(
+        let mut spec = LaneSpec::new(
             "test".into(),
             host.into(),
             PathBuf::from("/tmp"),
             Profile::default(),
         )
-        .unwrap()
+        .unwrap();
+        spec.profile.mount_codex_credentials = false;
+        spec.profile.mount_gh_credentials = false;
+        spec
     }
 
     #[test]
@@ -2236,6 +2567,61 @@ mod tests {
         );
         assert_eq!(lane_attach_args("alpha", true), vec!["zsh", "-l"]);
         assert_eq!(spec("local").session_name(), "test");
+    }
+
+    #[test]
+    fn herdr_bootstrap_starts_or_focuses_codex() {
+        let script = bootstrap_herdr_script();
+        assert!(script.contains("agent list | jq"));
+        assert!(script.contains(".agent == \"codex\""));
+        assert!(script.contains("agent focus \"$codex_agent\""));
+        assert!(script.contains("pane list --workspace \"$workspace_id\""));
+        assert!(script.contains(
+            "pane run \"$primary_pane\" \"codex --dangerously-bypass-approvals-and-sandbox\""
+        ));
+        assert!(!script.contains("agent start"));
+    }
+
+    #[test]
+    fn herdr_bootstrap_reuses_the_initial_terminal_for_codex() {
+        let home = std::env::temp_dir().join(format!(
+            "worklane-herdr-bootstrap-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let bin = home.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let herdr = bin.join("herdr");
+        fs::write(
+            &herdr,
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> "$HOME/herdr.log"
+case "$*" in
+  *"workspace list"*) printf '%s\n' '{"result":{"workspaces":[{"label":"alpha","workspace_id":"w1"}]}}' ;;
+  *"agent list"*) printf '%s\n' '{"result":{"agents":[]}}' ;;
+  *"pane list --workspace w1"*) printf '%s\n' '{"result":{"panes":[{"pane_id":"w1:p1","workspace_id":"w1"}]}}' ;;
+esac
+exit 0
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&herdr, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let status = Command::new("zsh")
+            .args(["-c", bootstrap_herdr_script()])
+            .env("HOME", &home)
+            .env("WORKLANE_SESSION", "alpha")
+            .env("WORKLANE_WORKSPACE", "/home/dev")
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let log = fs::read_to_string(home.join("herdr.log")).unwrap();
+        assert!(log.contains("pane run w1:p1 codex --dangerously-bypass-approvals-and-sandbox"));
+        assert!(!log.contains("agent start"));
+        fs::remove_dir_all(home).unwrap();
     }
 
     #[test]
@@ -2340,6 +2726,7 @@ mod tests {
         assert!(source.contains("--cwd \"$WORKLANE_WORKSPACE\""));
         assert!(source.contains("WORKLANE_SESSION={session}"));
         assert!(source.contains("WORKLANE_WORKSPACE={}"));
+        assert!(source.contains("\"--workdir\""));
         assert!(source.contains("worklane-git-diff-pane-manager"));
         assert!(source.contains("git-diff-pane-manager.pid"));
         assert!(source.contains("ps -p \"$old_pid\" -o args="));
@@ -2375,6 +2762,37 @@ mod tests {
     }
 
     #[test]
+    fn lane_shell_bootstrap_installs_bell_bridge_without_overwriting_user_player() {
+        let home =
+            std::env::temp_dir().join(format!("worklane-bell-bootstrap-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&home).unwrap();
+        let run_bootstrap = || {
+            Command::new("zsh")
+                .args(["-c", &bootstrap_shell_script()])
+                .env("HOME", &home)
+                .env("WORKLANE_NAME", "test")
+                .env("WORKLANE_SESSION", "test")
+                .env("WORKLANE_WORKSPACE", &home)
+                .status()
+                .unwrap()
+        };
+
+        assert!(run_bootstrap().success());
+        let bell_player = home.join(".local/share/worklane/bin/worklane-terminal-bell");
+        let paplay = home.join(".local/bin/paplay");
+        assert_eq!(fs::read_link(&paplay).unwrap(), bell_player);
+        assert!(fs::read_to_string(&bell_player)
+            .unwrap()
+            .contains("printf '\\007' > /dev/tty"));
+
+        fs::remove_file(&paplay).unwrap();
+        fs::write(&paplay, "#!/bin/sh\nexit 23\n").unwrap();
+        assert!(run_bootstrap().success());
+        assert_eq!(fs::read_to_string(&paplay).unwrap(), "#!/bin/sh\nexit 23\n");
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
     fn standard_containerfile_is_embedded() {
         assert!(EMBEDDED_CONTAINERFILE.starts_with("FROM debian:trixie-slim"));
         assert!(EMBEDDED_CONTAINERFILE.contains("@openai/codex"));
@@ -2391,13 +2809,19 @@ mod tests {
         assert!(EMBEDDED_CONTAINERFILE.contains("ripgrep"));
         assert!(EMBEDDED_CONTAINERFILE.contains("tzdata"));
         assert!(EMBEDDED_CONTAINERFILE.contains("xvfb"));
+        assert!(!EMBEDDED_CONTAINERFILE.contains("openjdk-"));
+        assert!(!EMBEDDED_CONTAINERFILE.contains(" chromium kotlin"));
         assert!(LANE_AGENTS_MD.contains("immutable operating-system root filesystem"));
-        assert!(LANE_AGENTS_MD.contains("RAM-backed tmpfs mounts, limited to 1 GiB"));
+        assert!(LANE_AGENTS_MD.contains("Use SDKMAN"));
+        assert!(LANE_AGENTS_MD.contains("$HOME/.sdkman"));
+        assert!(LANE_AGENTS_MD.contains("Do not use `/tmp` for anything"));
         assert!(LANE_AGENTS_MD.contains("Herdr is the lane session manager"));
         assert!(LANE_AGENTS_MD.contains("Agents may delegate concrete, bounded subtasks"));
         assert!(LANE_AGENTS_MD.contains("agent--root--api.md"));
         assert!(LANE_AGENTS_MD.contains("CI-equivalent tests and validation"));
         let shell = bootstrap_shell_script();
+        assert!(shell.contains("cd \"${WORKLANE_WORKSPACE:-$HOME}\""));
+        assert!(shell.contains("cwd=\"${WORKLANE_WORKSPACE:-$HOME}\""));
         assert!(shell.contains("touch \"$HOME/.zshenv\""));
         assert!(shell.contains("export PATH=\"$HOME/.local/bin:$PATH\""));
         assert!(shell.contains("mkdir -p \"$HOME/.codex\""));
@@ -2409,6 +2833,10 @@ mod tests {
         assert!(!shell.contains("$HOME/AGENTS.md"));
         assert!(shell.contains("$HOME/.local/share/worklane/bin/worklane-git-diff-pane"));
         assert!(shell.contains("$HOME/.local/share/worklane/bin/worklane-git-diff-pane-manager"));
+        assert!(shell.contains("$HOME/.local/share/worklane/bin/worklane-terminal-bell"));
+        assert!(shell.contains("(printf '\\007' > /dev/tty) 2>/dev/null || true"));
+        assert!(shell.contains("[ ! -e \"$paplay\" ] && [ ! -L \"$paplay\" ]"));
+        assert!(shell.contains("ln -s \"$bell_player\" \"$paplay\""));
         assert!(shell.contains("WORKLANE_GIT_DIFF_MANAGER_INTERVAL:-2"));
         assert!(shell.contains("session=\"${WORKLANE_SESSION:-}\""));
         assert!(shell.contains("herdr --session \"$session\" api snapshot"));
@@ -2559,7 +2987,7 @@ CMD ["sleep", "infinity"]
         assert!(validate_lane_registration(&store, &duplicate_id)
             .unwrap_err()
             .to_string()
-            .contains("lane ID"));
+            .contains("uses UUID"));
 
         let mut duplicate_name = lane.clone();
         duplicate_name.id = uuid::Uuid::new_v4().to_string();
@@ -2656,6 +3084,11 @@ CMD ["sleep", "infinity"]
                     *self.exists.lock().unwrap() = true;
                 }
                 Ok(match (program, args.first().map(String::as_str)) {
+                    ("podman", Some("inspect"))
+                        if args.iter().any(|arg| arg.contains("StartedAt")) =>
+                    {
+                        "2026-08-02 10:00:00 +1000 AEST".into()
+                    }
                     ("podman", Some("inspect")) => "running".into(),
                     ("id", Some("-un")) => "gerald".into(),
                     ("id", Some("-u") | Some("-g")) => "1000".into(),
@@ -2695,6 +3128,11 @@ CMD ["sleep", "infinity"]
             })
             .unwrap();
         assert!(run.1.contains(&"--read-only".into()));
+        assert!(run.1.contains(&"--init".into()));
+        assert!(run
+            .1
+            .windows(2)
+            .any(|args| args == [String::from("--pids-limit"), String::from(LANE_PIDS_LIMIT)]));
         assert!(run.1.contains(&"/tmp:rw,nosuid,nodev,size=1g".into()));
         drop(calls);
         let (store, path) = temp_store();

@@ -13,12 +13,19 @@ use ratatui::{
 };
 use std::{
     collections::{HashMap, VecDeque},
-    io::{self, BufRead, BufReader, Read, Write},
+    fs::{self, OpenOptions},
+    io::{self, Read, Write},
+    path::PathBuf,
     process::{Command, Stdio},
-    sync::mpsc::{self, Receiver, Sender, TryRecvError},
-    time::{Duration, Instant},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, Sender, TryRecvError},
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use worklane_core::{LaneStatus, Store};
+
+static FORCE_FULL_REDRAW: AtomicBool = AtomicBool::new(false);
 
 struct App {
     lanes: Vec<LaneStatus>,
@@ -345,8 +352,32 @@ fn restore_selection(app: &mut App, selected_id: Option<&str>) {
 }
 fn replace_lanes(app: &mut App, lanes: Vec<LaneStatus>) {
     let selected_id = selected_lane_id(app);
+    let mut lanes = lanes;
+    for lane in &mut lanes {
+        if lane.state == "running" && lane.runtime_started_at.is_none() {
+            lane.runtime_started_at = app
+                .lanes
+                .iter()
+                .find(|existing| existing.spec.id == lane.spec.id)
+                .and_then(|existing| existing.runtime_started_at);
+        }
+    }
     app.lanes = lanes;
     restore_selection(app, selected_id.as_deref());
+}
+fn sync_registered_lanes(app: &mut App) -> Result<bool> {
+    let lanes = load_registered_lanes()?;
+    let old_ids = app
+        .lanes
+        .iter()
+        .map(|lane| lane.spec.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let changed = lanes.len() != app.lanes.len()
+        || lanes
+            .iter()
+            .any(|lane| !old_ids.contains(lane.spec.id.as_str()));
+    replace_lanes(app, lanes);
+    Ok(changed)
 }
 fn invalidate_lane_refresh(app: &mut App, lane_id: &str) {
     app.next_refresh_generation += 1;
@@ -368,7 +399,7 @@ fn upgrade_detail(output: &[u8]) -> Result<String> {
         .map(|value| {
             let lane = value["spec"]["name"]
                 .as_str()
-                .or_else(|| value["lane"].as_str())
+                .or_else(|| value["lane_name"].as_str())
                 .unwrap_or("unknown lane");
             if let Some(outcome) = value["outcome"].as_str() {
                 format!("{lane}: {outcome}")
@@ -617,59 +648,57 @@ fn run_verbose_command(
     args: &[String],
     sender: &mpsc::Sender<JobEvent>,
 ) -> Result<CommandOutput, String> {
+    let capture_dir = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".tmp");
+    fs::create_dir_all(&capture_dir).map_err(|error| error.to_string())?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_nanos();
+    let capture = capture_dir.join(format!("lane-command-{}-{nonce}", std::process::id()));
+    let stdout_path = capture.with_extension("stdout");
+    let stderr_path = capture.with_extension("stderr");
+    let stdout_file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&stdout_path)
+        .map_err(|error| error.to_string())?;
+    let stderr_file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&stderr_path)
+        .map_err(|error| error.to_string())?;
     let mut child = Command::new(program)
         .args(args)
         .env("WORKLANE_EVENT_STREAM", "1")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file))
         .spawn()
         .map_err(|error| error.to_string())?;
-    let mut stdout = child.stdout.take().ok_or("child stdout unavailable")?;
-    let stderr = child.stderr.take().ok_or("child stderr unavailable")?;
-    let progress_sender = sender.clone();
-    let stderr_thread = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        for line in BufReader::new(stderr).lines() {
-            match line {
-                Ok(line) => {
-                    let display = match serde_json::from_str::<worklane_core::OperationEvent>(&line)
-                    {
-                        Ok(event) => format!(
-                            "{} · {:.1}s — {}",
-                            event.phase,
-                            event.elapsed_ms as f64 / 1000.0,
-                            event.message
-                        ),
-                        Err(_) => {
-                            bytes.extend_from_slice(line.as_bytes());
-                            bytes.push(b'\n');
-                            line
-                        }
-                    };
-                    let _ = progress_sender.send(JobEvent::Progress(display));
-                }
-                Err(error) => {
-                    let line = format!("failed to read progress: {error}");
-                    bytes.extend_from_slice(line.as_bytes());
-                    bytes.push(b'\n');
-                    let _ = progress_sender.send(JobEvent::Progress(line));
-                    break;
-                }
-            }
-        }
-        bytes
-    });
-    let mut stdout_bytes = Vec::new();
-    stdout
-        .read_to_end(&mut stdout_bytes)
-        .map_err(|error| error.to_string())?;
     let status = child.wait().map_err(|error| error.to_string())?;
-    let stderr = stderr_thread
-        .join()
-        .map_err(|_| "progress reader panicked".to_string())?;
+    let stdout = fs::read(&stdout_path).map_err(|error| error.to_string())?;
+    let stderr = fs::read(&stderr_path).map_err(|error| error.to_string())?;
+    let _ = fs::remove_file(&stdout_path);
+    let _ = fs::remove_file(&stderr_path);
+    for line in String::from_utf8_lossy(&stderr).lines() {
+        let display = serde_json::from_str::<worklane_core::OperationEvent>(line).map_or_else(
+            |_| line.to_string(),
+            |event| {
+                format!(
+                    "{} · {:.1}s — {}",
+                    event.phase,
+                    event.elapsed_ms as f64 / 1000.0,
+                    event.message
+                )
+            },
+        );
+        let _ = sender.send(JobEvent::Progress(display));
+    }
     Ok(CommandOutput {
         success: status.success(),
-        stdout: stdout_bytes,
+        stdout,
         stderr,
     })
 }
@@ -977,13 +1006,17 @@ fn update_lane_status(app: &mut App, status: LaneStatus) {
     restore_selection(app, selected_id.as_deref());
 }
 fn refresh_all(app: &mut App) {
-    start_state_poll(app);
+    match sync_registered_lanes(app) {
+        Ok(_) => start_state_poll(app),
+        Err(error) => app.message = format!("registry refresh failed: {error:#}"),
+    }
 }
 fn edit_containerfile(app: &mut App) -> Result<()> {
     restore_terminal_state();
     let result = Command::new("worklane").args(["image", "edit"]).status();
     execute!(io::stdout(), EnterAlternateScreen)?;
     enable_raw_mode()?;
+    FORCE_FULL_REDRAW.store(true, Ordering::Release);
     let status = result?;
     app.message = format!(
         "Containerfile editor: {}",
@@ -1013,6 +1046,7 @@ impl Drop for ResumeTui {
     fn drop(&mut self) {
         let _ = execute!(io::stdout(), EnterAlternateScreen);
         let _ = enable_raw_mode();
+        FORCE_FULL_REDRAW.store(true, Ordering::Release);
     }
 }
 fn main() {
@@ -1046,7 +1080,12 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
     let mut app = App::load()?;
     run_app(
         &mut app,
-        |app| Ok(terminal.draw(|frame| draw(frame, app)).map(|_| ())?),
+        |app| {
+            if FORCE_FULL_REDRAW.swap(false, Ordering::AcqRel) {
+                terminal.clear()?;
+            }
+            Ok(terminal.draw(|frame| draw(frame, app)).map(|_| ())?)
+        },
         || {
             if !event::poll(Duration::from_millis(250))? {
                 return Ok(None);
@@ -1064,9 +1103,18 @@ fn run_app(
     mut redraw: impl FnMut(&App) -> Result<()>,
     mut next_key: impl FnMut() -> Result<Option<KeyCode>>,
 ) -> Result<()> {
+    let mut last_registry_sync = Instant::now();
     loop {
         poll_jobs(app);
         poll_state(app)?;
+        if last_registry_sync.elapsed() >= Duration::from_secs(1) {
+            match sync_registered_lanes(app) {
+                Ok(true) if app.state_poll_pending == 0 => start_state_poll(app),
+                Ok(_) => {}
+                Err(error) => app.message = format!("registry refresh failed: {error:#}"),
+            }
+            last_registry_sync = Instant::now();
+        }
         if let Some(job) = app.jobs.first() {
             app.message = format!(
                 "{}: running {:.1}s ({} active)",
@@ -1164,14 +1212,22 @@ fn lane_style(state: &str, drift: bool) -> Style {
         style
     }
 }
-fn cache_age(cached_at: chrono::DateTime<chrono::Utc>) -> String {
-    let seconds = (chrono::Utc::now() - cached_at).num_seconds().max(0);
+fn live_age(status: &LaneStatus) -> String {
+    if status.state != "running" {
+        return "-".into();
+    }
+    let Some(started_at) = status.runtime_started_at else {
+        return "…".into();
+    };
+    let seconds = (chrono::Utc::now() - started_at).num_seconds().max(0);
     if seconds < 60 {
         format!("{seconds}s")
     } else if seconds < 3600 {
         format!("{}m", seconds / 60)
-    } else {
+    } else if seconds < 86400 {
         format!("{}h", seconds / 3600)
+    } else {
+        format!("{}d", seconds / 86400)
     }
 }
 fn visible_detail(app: &App) -> &str {
@@ -1197,7 +1253,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         column("NAME", 18),
         column("HOST", 14),
         column("STATE", 10),
-        column("AGE", 7),
+        column("ALIVE", 7),
         "IMAGE"
     ))
     .style(Style::default().fg(Color::DarkGray))];
@@ -1208,7 +1264,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             column(&x.spec.name, 18),
             column(&x.spec.host, 14),
             column(&x.state, 10),
-            column(&cache_age(x.cached_at), 7),
+            column(&live_age(x), 7),
             x.spec.profile.image,
             flag
         ))
@@ -1294,6 +1350,7 @@ mod tests {
                 state: "running".into(),
                 drift: false,
                 cached_at: Utc::now(),
+                runtime_started_at: None,
             }],
             selected: 0,
             filter: String::new(),
@@ -1331,6 +1388,46 @@ mod tests {
             started: Instant::now(),
             receiver,
         });
+    }
+    #[test]
+    fn selection_helpers_track_identity_across_registry_updates() {
+        let mut app = app();
+        let started_at = Utc::now() - chrono::Duration::minutes(3);
+        app.lanes[0].state = "running".into();
+        app.lanes[0].runtime_started_at = Some(started_at);
+        let selected_id = app.lanes[0].spec.id.clone();
+        let mut second = app.lanes[0].clone();
+        second.spec = LaneSpec::new(
+            "beta".into(),
+            "lab".into(),
+            PathBuf::from("/tmp/beta"),
+            Profile::default(),
+        )
+        .unwrap();
+        second.spec.last_attached = Some(Utc::now());
+        let mut first = app.lanes[0].clone();
+        first.runtime_started_at = None;
+        replace_lanes(&mut app, vec![first, second]);
+        assert_eq!(
+            selected_lane_id(&app).as_deref(),
+            Some(selected_id.as_str())
+        );
+
+        app.selected = 99;
+        restore_selection(&mut app, Some("missing-id"));
+        assert_eq!(app.selected, app.visible().len() - 1);
+        assert_eq!(
+            app.lanes
+                .iter()
+                .find(|lane| lane.spec.id == selected_id)
+                .and_then(|lane| lane.runtime_started_at),
+            Some(started_at)
+        );
+        assert_eq!(command_error(b"", "fallback"), "fallback");
+        assert_eq!(
+            command_error(b" explicit error \n", "fallback"),
+            "explicit error"
+        );
     }
     #[test]
     fn reducer_covers_navigation_filter_and_actions() {
@@ -1428,6 +1525,7 @@ mod tests {
             UiAction::EditContainerfile
         );
         assert_eq!(app.handle_key(KeyCode::Char('q')), UiAction::Quit);
+        assert_eq!(app.handle_key(KeyCode::Char('?')), UiAction::None);
         app.handle_key(KeyCode::Char('/'));
         app.handle_key(KeyCode::Char('z'));
         assert_eq!(app.filter, "z");
@@ -1458,7 +1556,10 @@ mod tests {
             "No lanes were selected for upgrade."
         );
         assert_eq!(
-            upgrade_detail(br#"[{"lane":"alpha","outcome":"skipped"}]"#).unwrap(),
+            upgrade_detail(
+                br#"[{"lane_id":"00000000-0000-4000-8000-000000000001","lane_name":"alpha","outcome":"skipped"}]"#,
+            )
+            .unwrap(),
             "alpha: skipped"
         );
         assert!(
@@ -1497,15 +1598,29 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         let previous_data = env::var_os("XDG_DATA_HOME");
         env::set_var("XDG_DATA_HOME", root.join("data"));
-        let app = app();
-        Store::open_default()
-            .unwrap()
+        let mut app = app();
+        let store = Store::open_default().unwrap();
+        store
             .save_lane(&app.lanes[0].spec, "running", true)
             .unwrap();
 
         let lanes = load_registered_lanes().unwrap();
         assert_eq!(lanes[0].state, "running");
         assert!(lanes[0].drift);
+
+        let discovered = LaneSpec::new(
+            "created-elsewhere".into(),
+            "local".into(),
+            root.join("created-elsewhere"),
+            Profile::default(),
+        )
+        .unwrap();
+        store.save_lane(&discovered, "running", false).unwrap();
+        assert!(sync_registered_lanes(&mut app).unwrap());
+        assert!(app
+            .lanes
+            .iter()
+            .any(|lane| lane.spec.name == "created-elsewhere"));
 
         if let Some(value) = previous_data {
             env::set_var("XDG_DATA_HOME", value);
@@ -1529,6 +1644,7 @@ mod tests {
             state: "unknown".into(),
             drift: false,
             cached_at: Utc::now(),
+            runtime_started_at: None,
         };
         app.lanes[0].state = "unknown".into();
         app.lanes.push(beta.clone());
@@ -1638,7 +1754,7 @@ mod tests {
         let worklane = bin.join("worklane");
         fs::write(
             &worklane,
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.log\"\nstatus='{\"spec\":{\"schema_version\":3,\"id\":\"00000000-0000-4000-8000-000000000006\",\"name\":\"alpha\",\"container_name\":\"worklane-00000000-0000-4000-8000-000000000006\",\"session_name\":\"alpha\",\"container_home\":\"/home/dev\",\"host\":\"lab\",\"project_path\":\"/tmp\",\"profile\":{\"image\":\"test:latest\",\"build_context\":\"project\",\"containerfile\":\"Containerfile\",\"embedded_containerfile\":true,\"network\":\"outbound\",\"mounts\":[]},\"profile_name\":\"default\",\"created_at\":\"2026-01-01T00:00:00Z\",\"last_attached\":null,\"image_digest\":null},\"state\":\"running\",\"drift\":false,\"cached_at\":\"2026-01-01T00:00:00Z\"}'\ncase \"$*\" in *fail*) printf 'command failed\\n' >&2; exit 1;; *diff*) printf '{\"diff\":[]}\\n';; *inspect*) printf '%s\\n' \"$status\";; *upgrade*) printf 'building alpha\\n' >&2; printf '[%s]\\n' \"$status\";; *refresh*) printf '[%s]\\n' \"$status\";; esac\nexit 0\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.log\"\nstatus='{\"spec\":{\"schema_version\":5,\"id\":\"00000000-0000-4000-8000-000000000006\",\"name\":\"alpha\",\"container_name\":\"worklane-alpha-00000000-0000-4000-8000-000000000006\",\"session_name\":\"alpha\",\"container_home\":\"/home/dev\",\"host\":\"lab\",\"project_path\":\"/tmp\",\"profile\":{\"image\":\"test:latest\",\"build_context\":\"project\",\"containerfile\":\"Containerfile\",\"embedded_containerfile\":true,\"network\":\"outbound\",\"mounts\":[],\"mount_codex_credentials\":true,\"mount_gh_credentials\":true},\"profile_name\":\"default\",\"created_at\":\"2026-01-01T00:00:00Z\",\"last_attached\":null,\"image_digest\":null},\"state\":\"running\",\"drift\":false,\"cached_at\":\"2026-01-01T00:00:00Z\"}'\ncase \"$*\" in *fail*) printf 'command failed\\n' >&2; exit 1;; *diff*) printf '{\"diff\":[]}\\n';; *inspect*) printf '%s\\n' \"$status\";; *upgrade*) printf 'building alpha\\n' >&2; printf '[%s]\\n' \"$status\";; *refresh*) printf '[%s]\\n' \"$status\";; esac\nexit 0\n",
         )
         .unwrap();
         #[cfg(unix)]
@@ -1830,6 +1946,14 @@ mod tests {
             "{}",
             app.message
         );
+        for _ in 0..200 {
+            poll_job(&mut app).unwrap();
+            if app.jobs.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(app.jobs.is_empty());
         let (sender, receiver) = mpsc::channel();
         inject_job(&mut app, receiver, "start");
         let _sender = sender;
@@ -1848,11 +1972,18 @@ mod tests {
         assert!(app.message.contains("queued") || app.message.contains("running"));
         app.jobs.clear();
         app.job_queue.clear();
+        let replacement = worklane.with_extension("replacement");
         fs::write(
-            &worklane,
+            &replacement,
             "#!/bin/sh\nprintf 'attach exploded\\n' >&2\nexit 17\n",
         )
         .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&replacement, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        fs::rename(replacement, &worklane).unwrap();
         let mut attach_keys = vec![Some(KeyCode::Char('a')), Some(KeyCode::Char('q'))].into_iter();
         let mut attach_redraws = 0;
         run_app(
@@ -1911,8 +2042,31 @@ mod tests {
     }
 
     #[test]
+    fn verbose_commands_do_not_wait_for_descendants_holding_standard_streams() {
+        let (sender, _receiver) = mpsc::channel();
+        let started = Instant::now();
+        let output = run_verbose_command(
+            "sh",
+            &["-c".into(), "sleep 1 & printf done".into()],
+            &sender,
+        )
+        .unwrap();
+        assert!(output.success);
+        assert_eq!(output.stdout, b"done");
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
     fn renderer_draws_lane_status() {
         let mut app = app();
+        app.lanes[0].runtime_started_at = Some(Utc::now() - chrono::Duration::seconds(12));
+        assert!(live_age(&app.lanes[0]).ends_with('s'));
+        app.lanes[0].runtime_started_at = Some(Utc::now() - chrono::Duration::minutes(12));
+        assert_eq!(live_age(&app.lanes[0]), "12m");
+        app.lanes[0].runtime_started_at = Some(Utc::now() - chrono::Duration::minutes(61));
+        assert_eq!(live_age(&app.lanes[0]), "1h");
+        app.lanes[0].runtime_started_at = Some(Utc::now() - chrono::Duration::days(2));
+        assert_eq!(live_age(&app.lanes[0]), "2d");
         app.lanes.push(LaneStatus {
             spec: LaneSpec::new(
                 "beta".into(),
@@ -1924,6 +2078,7 @@ mod tests {
             state: "stopped".into(),
             drift: true,
             cached_at: Utc::now(),
+            runtime_started_at: None,
         });
         app.selected = 1;
         app.detail = "C /etc/example".into();

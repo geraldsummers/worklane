@@ -15,6 +15,14 @@ fn temp(name: &str) -> PathBuf {
     let path = env::temp_dir().join(format!("worklane-cli-{name}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&path);
     fs::create_dir_all(&path).unwrap();
+    fs::create_dir_all(path.join("data/credentials/codex")).unwrap();
+    fs::create_dir_all(path.join("data/credentials/gh")).unwrap();
+    fs::write(
+        path.join("data/credentials/codex/auth.json"),
+        "test-codex-auth",
+    )
+    .unwrap();
+    fs::write(path.join("data/credentials/gh/hosts.yml"), "test-gh-auth").unwrap();
     path
 }
 
@@ -22,6 +30,8 @@ fn run(binary: &str, data: &Path, bin: &Path, args: &[&str]) -> String {
     let output = Command::new(binary)
         .args(args)
         .env("XDG_DATA_HOME", data)
+        .env("CODEX_HOME", data.join("credentials/codex"))
+        .env("GH_CONFIG_DIR", data.join("credentials/gh"))
         .env(
             "PATH",
             format!("{}:{}", bin.display(), env::var("PATH").unwrap()),
@@ -40,6 +50,8 @@ fn run_failure(binary: &str, data: &Path, bin: &Path, args: &[&str]) -> String {
     let output = Command::new(binary)
         .args(args)
         .env("XDG_DATA_HOME", data)
+        .env("CODEX_HOME", data.join("credentials/codex"))
+        .env("GH_CONFIG_DIR", data.join("credentials/gh"))
         .env(
             "PATH",
             format!("{}:{}", bin.display(), env::var("PATH").unwrap()),
@@ -60,6 +72,8 @@ fn run_failure_with_input(
     let mut child = Command::new(binary)
         .args(args)
         .env("XDG_DATA_HOME", data)
+        .env("CODEX_HOME", data.join("credentials/codex"))
+        .env("GH_CONFIG_DIR", data.join("credentials/gh"))
         .env(
             "PATH",
             format!("{}:{}", bin.display(), env::var("PATH").unwrap()),
@@ -78,6 +92,8 @@ fn run_with_input(binary: &str, data: &Path, bin: &Path, input: &[u8]) -> std::p
     let mut child = Command::new(binary)
         .arg("executor")
         .env("XDG_DATA_HOME", data)
+        .env("CODEX_HOME", data.join("credentials/codex"))
+        .env("GH_CONFIG_DIR", data.join("credentials/gh"))
         .env(
             "PATH",
             format!("{}:{}", bin.display(), env::var("PATH").unwrap()),
@@ -100,7 +116,7 @@ fn executor_returns_correlated_success_and_error_envelopes() {
     let binary = env!("CARGO_BIN_EXE_worklane");
     let success_id = "00000000-0000-4000-8000-000000000091";
     let success = serde_json::to_vec(&serde_json::json!({
-        "protocol_version": 3,
+        "protocol_version": 5,
         "request_id": success_id,
         "args": ["host", "list"]
     }))
@@ -114,7 +130,7 @@ fn executor_returns_correlated_success_and_error_envelopes() {
 
     let failure_id = "00000000-0000-4000-8000-000000000092";
     let failure = serde_json::to_vec(&serde_json::json!({
-        "protocol_version": 3,
+        "protocol_version": 5,
         "request_id": failure_id,
         "args": ["lane", "inspect", "missing"]
     }))
@@ -131,7 +147,7 @@ fn executor_returns_correlated_success_and_error_envelopes() {
         .contains("no lane"));
 
     let nested = serde_json::to_vec(&serde_json::json!({
-        "protocol_version": 3,
+        "protocol_version": 5,
         "request_id": "00000000-0000-4000-8000-000000000093",
         "args": ["executor"]
     }))
@@ -150,7 +166,7 @@ fn previous_executor_protocol_is_rejected_before_dispatch() {
     fs::create_dir_all(&bin_dir).unwrap();
     let binary = env!("CARGO_BIN_EXE_worklane");
     let payload = serde_json::to_vec(&serde_json::json!({
-        "protocol_version": 2,
+        "protocol_version": 4,
         "request_id": "00000000-0000-4000-8000-000000000099",
         "args": ["host", "add", "should-not-exist", "--ssh", "dev@example.test"]
     }))
@@ -193,7 +209,7 @@ fn canonical_registry_requires_an_explicit_clean_start() {
         fs::read(&old_database).unwrap(),
         b"previous registry remains untouched"
     );
-    assert!(worklane_data.join("worklane-v3.db").exists());
+    assert!(worklane_data.join("worklane-v5.db").exists());
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -232,17 +248,24 @@ case "$1:$2" in
     ;;
   run:-d)
     name=''
-    owner=''
+    lane_id=''
+    lane_name=''
     while test $# -gt 0; do
       case "$1" in
         --name) name=$2; shift 2 ;;
-        --label) owner=${2#io.worklane.id=}; shift 2 ;;
+        --label)
+          case "$2" in
+            io.worklane.id=*) lane_id=${2#io.worklane.id=} ;;
+            io.worklane.name=*) lane_name=${2#io.worklane.name=} ;;
+          esac
+          shift 2
+          ;;
         *) shift ;;
       esac
     done
     touch "$0.container.$name"
     printf 'running\n' > "$0.state.$name"
-    printf '%s\n' "$owner" > "$0.owner.$name"
+    printf '%s|%s\n' "$lane_id" "$lane_name" > "$0.owner.$name"
     exit 0
     ;;
   image:inspect) printf 'sha256:test-image\n'; exit 0 ;;
@@ -251,6 +274,7 @@ case "$1:$2" in
     test -e "$0.container.$name" || exit 1
     case "$3" in
       *Labels*) cat "$0.owner.$name" ;;
+      *StartedAt*) printf '2026-08-02 10:00:00 +1000 AEST\n' ;;
       *) cat "$0.state.$name" ;;
     esac
     exit 0
@@ -266,8 +290,53 @@ esac
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&podman, fs::Permissions::from_mode(0o755)).unwrap();
     }
+    let gh = bin_dir.join("gh");
+    fs::write(
+        &gh,
+        r#"#!/bin/sh
+case "$*" in
+  "auth token --hostname github.com")
+    printf '%s\n' 'gho_lane_test_token'
+    exit 0
+    ;;
+esac
+printf 'unexpected gh invocation: %s\n' "$*" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+    }
     let binary = env!("CARGO_BIN_EXE_worklane");
     let project_arg = project.to_string_lossy().to_string();
+    let gh_credentials = data.join("credentials/gh/hosts.yml");
+    fs::remove_file(&gh_credentials).unwrap();
+    let credential_error = run_failure(
+        binary,
+        &data,
+        &bin_dir,
+        &[
+            "--json",
+            "lane",
+            "create",
+            "smoke",
+            "--project",
+            &project_arg,
+            "--id",
+            SMOKE_ID,
+        ],
+    );
+    assert!(credential_error.contains("GitHub CLI credentials were not found"));
+    assert!(credential_error.contains("authenticate on host 'local'"));
+    assert!(credential_error.contains("disable the corresponding credential mount"));
+    fs::write(
+        &gh_credentials,
+        "github.com:\n    git_protocol: https\n    users:\n        octocat:\n    user: octocat\n",
+    )
+    .unwrap();
     let created = run(
         binary,
         &data,
@@ -301,12 +370,56 @@ esac
     )
     .contains("\"state\":\"running\""));
     let manifest = fs::read_to_string(project.join(".worklane/lane.toml")).unwrap();
-    assert!(manifest.contains("schema_version = 3"));
+    assert!(manifest.contains("schema_version = 5"));
     assert!(manifest.contains(&format!("id = \"{SMOKE_ID}\"")));
-    assert!(manifest.contains(&format!("container_name = \"worklane-{SMOKE_ID}\"")));
+    assert!(manifest.contains(&format!("container_name = \"worklane-smoke-{SMOKE_ID}\"")));
     assert!(manifest.contains("session_name = \"smoke\""));
+    assert!(manifest.contains("mount_codex_credentials = true"));
+    assert!(manifest.contains("mount_gh_credentials = true"));
     assert!(!manifest.contains("host ="));
     assert!(!manifest.contains("project_path ="));
+    let create_log = fs::read_to_string(podman.with_extension("log")).unwrap();
+    assert!(create_log.contains(&format!("--name worklane-smoke-{SMOKE_ID}")));
+    assert!(create_log.contains(&format!("--label io.worklane.id={SMOKE_ID}")));
+    assert!(create_log.contains("--label io.worklane.name=smoke"));
+    assert!(create_log.contains("--workdir /home/dev"));
+    assert!(create_log.contains(&format!(
+        "src={},dst=/home/dev/.codex/auth.json,rw=true",
+        data.join("credentials/codex/auth.json").display()
+    )));
+    assert!(create_log.contains(&format!(
+        "src={},dst=/home/dev/.config/gh/hosts.yml,rw=true",
+        data.join(format!("worklane/credentials/gh/{SMOKE_ID}.hosts.yml"))
+            .display()
+    )));
+    let managed_gh = data.join(format!("worklane/credentials/gh/{SMOKE_ID}.hosts.yml"));
+    let managed_gh_contents = fs::read_to_string(&managed_gh).unwrap();
+    let managed_gh_json: serde_json::Value = serde_json::from_str(&managed_gh_contents).unwrap();
+    assert_eq!(
+        managed_gh_json["github.com"]["users"]["octocat"]["oauth_token"],
+        "gho_lane_test_token"
+    );
+    assert_eq!(managed_gh_json["github.com"]["user"], "octocat");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&managed_gh).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    assert_eq!(
+        fs::metadata(project.join(".codex/auth.json"))
+            .unwrap()
+            .len(),
+        0
+    );
+    assert_eq!(
+        fs::metadata(project.join(".config/gh/hosts.yml"))
+            .unwrap()
+            .len(),
+        0
+    );
     assert!(run(
         binary,
         &data,
@@ -336,6 +449,14 @@ esac
         &["--json", "lane", "diff", "smoke"]
     )
     .contains("diff"));
+    let diff = run(
+        binary,
+        &data,
+        &bin_dir,
+        &["--json", "lane", "diff", "smoke"],
+    );
+    assert!(diff.contains(&format!("\"lane_id\":\"{SMOKE_ID}\"")));
+    assert!(diff.contains("\"lane_name\":\"smoke\""));
     assert!(run(
         binary,
         &data,
@@ -376,6 +497,10 @@ esac
         &["lane", "attach", "smoke", "--shell"]
     )
     .is_empty());
+    let attach_log = fs::read_to_string(podman.with_extension("log")).unwrap();
+    assert!(attach_log
+        .lines()
+        .any(|line| line.starts_with("exec -it --workdir /home/dev ")));
     assert!(run(
         binary,
         &data,
@@ -635,7 +760,13 @@ fn drift_protection_requires_an_explicit_override() {
 case "$1:$2" in
   image:exists|rm:-f|run:-d|build:-f) exit 0 ;;
   image:inspect) printf 'sha256:test-image\n'; exit 0 ;;
-  inspect:--format) printf 'running\n'; exit 0 ;;
+  inspect:--format)
+    case "$3" in
+      *StartedAt*) printf '2026-08-02 10:00:00 +1000 AEST\n' ;;
+      *) printf 'running\n' ;;
+    esac
+    exit 0
+    ;;
   diff:*) printf 'A /etc/worklane-test\n'; exit 0 ;;
   *) exit 0 ;;
 esac
@@ -796,13 +927,13 @@ case "$*" in
 esac
 request_id=$(printf '%s' "$payload" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
 respond() {
-  printf '{"protocol_version":3,"request_id":"%s","success":true,"payload":%s,"error":null}\n' "$request_id" "$1"
+  printf '{"protocol_version":5,"request_id":"%s","success":true,"payload":%s,"error":null}\n' "$request_id" "$1"
 }
 case "$payload" in
   *"upgrade"*) respond '[]'; exit 0;;
-  *"diff"*) respond '{"lane":"00000000-0000-4000-8000-000000000005","diff":["C /etc/example"]}'; exit 0;;
+  *"diff"*) respond '{"lane_id":"00000000-0000-4000-8000-000000000005","lane_name":"remote","diff":["C /etc/example"]}'; exit 0;;
 esac
-respond '{"spec":{"schema_version":3,"id":"00000000-0000-4000-8000-000000000005","name":"remote","container_name":"worklane-00000000-0000-4000-8000-000000000005","session_name":"remote","container_home":"/home/dev","host":"local","project_path":"/tmp/project","profile":{"image":"localhost/test:latest","build_context":"project","containerfile":"Containerfile","embedded_containerfile":true,"network":"outbound","mounts":[]},"profile_name":"default","created_at":"2026-01-01T00:00:00Z","last_attached":null,"image_digest":null},"state":"running","drift":false,"cached_at":"2026-01-01T00:00:00Z"}'
+respond '{"spec":{"schema_version":5,"id":"00000000-0000-4000-8000-000000000005","name":"remote","container_name":"worklane-remote-00000000-0000-4000-8000-000000000005","session_name":"remote","container_home":"/home/dev","host":"local","project_path":"/tmp/project","profile":{"image":"localhost/test:latest","build_context":"project","containerfile":"Containerfile","embedded_containerfile":true,"network":"outbound","mounts":[],"mount_codex_credentials":true,"mount_gh_credentials":true},"profile_name":"default","created_at":"2026-01-01T00:00:00Z","last_attached":null,"image_digest":null},"state":"running","drift":false,"cached_at":"2026-01-01T00:00:00Z"}'
 "#).unwrap();
     #[cfg(unix)]
     {

@@ -9,17 +9,16 @@ use std::collections::BTreeMap;
 use std::{
     fs,
     fs::OpenOptions,
-    io,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
 use uuid::Uuid;
 
 pub const DEFAULT_IMAGE: &str = "worklane:latest";
-pub const MANIFEST_SCHEMA_VERSION: u32 = 3;
-pub const DATABASE_SCHEMA_VERSION: u32 = 3;
-pub const OPERATION_SCHEMA_VERSION: u32 = 1;
-pub const EXECUTOR_PROTOCOL: u32 = 3;
+pub const MANIFEST_SCHEMA_VERSION: u32 = 5;
+pub const DATABASE_SCHEMA_VERSION: u32 = 5;
+pub const OPERATION_SCHEMA_VERSION: u32 = 3;
+pub const EXECUTOR_PROTOCOL: u32 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Host {
@@ -46,6 +45,12 @@ pub struct Profile {
     pub network: String,
     #[serde(default)]
     pub mounts: Vec<MountSpec>,
+    /// Bind the owning host's Codex auth file into the lane at its standard path.
+    #[serde(default = "default_mount_credentials")]
+    pub mount_codex_credentials: bool,
+    /// Bind the owning host's GitHub CLI hosts file into the lane at its standard path.
+    #[serde(default = "default_mount_credentials")]
+    pub mount_gh_credentials: bool,
 }
 mod build_context_serde {
     use serde::{Deserialize, Deserializer, Serializer};
@@ -93,6 +98,9 @@ fn default_embedded_containerfile() -> bool {
 fn default_network() -> String {
     "outbound".into()
 }
+fn default_mount_credentials() -> bool {
+    true
+}
 impl Default for Profile {
     fn default() -> Self {
         Self {
@@ -102,6 +110,8 @@ impl Default for Profile {
             embedded_containerfile: default_embedded_containerfile(),
             network: default_network(),
             mounts: vec![],
+            mount_codex_credentials: default_mount_credentials(),
+            mount_gh_credentials: default_mount_credentials(),
         }
     }
 }
@@ -131,6 +141,21 @@ pub fn validate_profile(profile: &Profile, home: &Path, require_sources: bool) -
         }
         if mount.target == home || home.starts_with(&mount.target) {
             bail!("profile mount target conflicts with Worklane-managed home")
+        }
+        let managed_credentials = [
+            profile
+                .mount_codex_credentials
+                .then(|| home.join(".codex/auth.json")),
+            profile
+                .mount_gh_credentials
+                .then(|| home.join(".config/gh/hosts.yml")),
+        ];
+        if managed_credentials.into_iter().flatten().any(|target| {
+            mount.target == target
+                || mount.target.starts_with(&target)
+                || target.starts_with(&mount.target)
+        }) {
+            bail!("profile mount target overlaps a managed credential mount")
         }
         if require_sources && !mount.source.exists() {
             bail!(
@@ -203,10 +228,16 @@ pub fn validate_lane_name(name: &str) -> Result<()> {
     {
         bail!("lane name must contain only letters, digits, '-' or '_'");
     }
+    if name.len() > 64 {
+        bail!("lane name must be 64 characters or fewer")
+    }
     if Uuid::parse_str(name).is_ok_and(|value| value.hyphenated().to_string() == name) {
         bail!("lane name must not be a UUID because UUIDs are reserved for stable identity")
     }
     Ok(())
+}
+pub fn stable_container_name(session_name: &str, id: &str) -> String {
+    format!("worklane-{session_name}-{id}")
 }
 impl LaneSpec {
     pub fn new(
@@ -219,7 +250,7 @@ impl LaneSpec {
         let id = Uuid::new_v4().to_string();
         Ok(Self {
             schema_version: MANIFEST_SCHEMA_VERSION,
-            container_name: format!("worklane-{id}"),
+            container_name: stable_container_name(&name, &id),
             session_name: name.clone(),
             container_home: PathBuf::from("/home").join(CONTAINER_USER),
             id,
@@ -258,11 +289,13 @@ impl LaneManifest {
         validate_lane_id(&self.id)?;
         validate_lane_name(&self.name)?;
         validate_lane_name(&self.session_name)?;
-        if self.container_name != format!("worklane-{}", self.id) {
-            bail!("manifest container_name does not match its immutable lane UUID")
+        if self.container_name != stable_container_name(&self.session_name, &self.id) {
+            bail!(
+                "manifest container_name does not match its immutable creation name and lane UUID"
+            )
         }
         if self.container_home != Path::new("/home/dev") {
-            bail!("manifest container_home must be /home/dev for schema v3")
+            bail!("manifest container_home must be /home/dev for schema v5")
         }
         validate_profile(&self.profile, &self.container_home, false)
     }
@@ -315,6 +348,8 @@ pub struct LaneStatus {
     pub state: String,
     pub drift: bool,
     pub cached_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_started_at: Option<DateTime<Utc>>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutorRequest {
@@ -343,12 +378,14 @@ pub struct ErrorReport {
     pub message: String,
     pub guidance: Option<String>,
     pub lane_id: Option<String>,
+    pub lane_name: Option<String>,
     pub retryable: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OperationEvent {
     pub operation_id: String,
     pub lane_id: Option<String>,
+    pub lane_name: Option<String>,
     pub status: String,
     pub phase: String,
     pub elapsed_ms: u64,
@@ -364,6 +401,7 @@ pub struct ReconcileFinding {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReconcileReport {
     pub lane_id: String,
+    pub lane_name: String,
     pub applied: bool,
     pub findings: Vec<ReconcileFinding>,
     pub changes: Vec<String>,
@@ -376,7 +414,7 @@ pub fn data_dir() -> PathBuf {
         .join("worklane")
 }
 pub fn db_path() -> PathBuf {
-    data_dir().join("worklane-v3.db")
+    data_dir().join("worklane-v5.db")
 }
 pub fn containerfile_path() -> PathBuf {
     data_dir().join("Containerfile")
@@ -412,12 +450,14 @@ impl Store {
             && [
                 data_dir().join("worklane.db"),
                 data_dir().join("worklane-v2.db"),
+                data_dir().join("worklane-v3.db"),
+                data_dir().join("worklane-v4.db"),
             ]
             .iter()
             .any(|path| path.exists())
         {
             bail!(
-                "older Worklane registry detected; it was left untouched. Run `worklane registry init --fresh` to acknowledge the clean v3 start"
+                "older Worklane registry detected; it was left untouched. Run `worklane registry init --fresh` to acknowledge the clean v5 start"
             )
         }
         Self::open(db_path())
@@ -447,7 +487,7 @@ impl Store {
                  CREATE TABLE hosts(name TEXT PRIMARY KEY, ssh_target TEXT NOT NULL, local INTEGER NOT NULL, installed_version TEXT, last_seen TEXT);
                  CREATE TABLE lanes(id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, host TEXT NOT NULL, manifest_path TEXT NOT NULL, container_name TEXT NOT NULL, session_name TEXT NOT NULL, container_home TEXT NOT NULL, profile_name TEXT NOT NULL, profile_json TEXT NOT NULL, config_hash TEXT NOT NULL, created_at TEXT NOT NULL, image_digest TEXT, state TEXT NOT NULL DEFAULT 'unknown', drift INTEGER NOT NULL DEFAULT 0, config_cached_at TEXT NOT NULL, status_cached_at TEXT NOT NULL, last_attached TEXT);
                  CREATE UNIQUE INDEX lanes_unique_location ON lanes(host, manifest_path);
-                 CREATE TABLE operations(operation_id TEXT PRIMARY KEY, lane_id TEXT NOT NULL, kind TEXT NOT NULL, phase TEXT NOT NULL, request_fingerprint TEXT NOT NULL, updated_at TEXT NOT NULL);
+                 CREATE TABLE operations(operation_id TEXT PRIMARY KEY, lane_id TEXT NOT NULL, lane_name TEXT NOT NULL, kind TEXT NOT NULL, phase TEXT NOT NULL, request_fingerprint TEXT NOT NULL, updated_at TEXT NOT NULL);
                  CREATE TABLE tombstones(lane_id TEXT PRIMARY KEY, name TEXT NOT NULL, operation TEXT NOT NULL, completed_at TEXT NOT NULL);
                  PRAGMA user_version={DATABASE_SCHEMA_VERSION};
                  COMMIT;"
@@ -487,23 +527,28 @@ impl Store {
         self.conn.execute("INSERT INTO lanes(id,name,host,manifest_path,container_name,session_name,container_home,profile_name,profile_json,config_hash,created_at,image_digest,state,drift,config_cached_at,status_cached_at,last_attached) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?15,?16) ON CONFLICT(id) DO UPDATE SET name=excluded.name,host=excluded.host,manifest_path=excluded.manifest_path,container_name=excluded.container_name,session_name=excluded.session_name,container_home=excluded.container_home,profile_name=excluded.profile_name,profile_json=excluded.profile_json,config_hash=excluded.config_hash,created_at=excluded.created_at,image_digest=excluded.image_digest,state=excluded.state,drift=excluded.drift,config_cached_at=excluded.config_cached_at,status_cached_at=excluded.status_cached_at,last_attached=excluded.last_attached",params![spec.id,spec.name,spec.host,spec.manifest_path().display().to_string(),spec.container_name,spec.session_name,spec.container_home.display().to_string(),spec.profile_name,serde_json::to_string(&spec.profile)?,manifest_sha256(spec)?,spec.created_at.to_rfc3339(),spec.image_digest,state,drift,now,spec.last_attached.map(|value|value.to_rfc3339())])?;
         Ok(())
     }
-    pub fn save_status(&self, id: &str, state: &str, drift: bool) -> Result<()> {
+    pub fn save_status(&self, id: &str, name: &str, state: &str, drift: bool) -> Result<()> {
         let changed = self.conn.execute(
             "UPDATE lanes SET state=?2,drift=?3,status_cached_at=?4 WHERE id=?1",
             params![id, state, drift, Utc::now().to_rfc3339()],
         )?;
         if changed == 0 {
-            bail!("cannot cache status for unregistered lane '{id}'")
+            bail!("cannot cache status for unregistered lane '{name}' ({id})")
         }
         Ok(())
     }
     pub fn index(&self, selector: &str) -> Result<LaneIndex> {
         let row = self.conn.query_row("SELECT id,name,host,manifest_path,container_name,session_name,container_home,profile_name,profile_json,config_hash,created_at,image_digest,state,drift,config_cached_at,status_cached_at,last_attached FROM lanes WHERE id=?1 OR name=?1 ORDER BY status_cached_at DESC LIMIT 1",[selector],|r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,String>(7)?,r.get::<_,String>(8)?,r.get::<_,String>(9)?,r.get::<_,String>(10)?,r.get::<_,Option<String>>(11)?,r.get::<_,String>(12)?,r.get::<_,bool>(13)?,r.get::<_,String>(14)?,r.get::<_,String>(15)?,r.get::<_,Option<String>>(16)?))).with_context(||format!("no lane named or identified '{selector}'"))?;
-        validate_lane_id(&row.0).context("registry contains an invalid lane ID; rebuild it")?;
+        validate_lane_id(&row.0).with_context(|| {
+            format!(
+                "registry lane '{}' contains an invalid lane ID; rebuild it",
+                row.1
+            )
+        })?;
         validate_lane_name(&row.1).context("registry contains an invalid lane name; rebuild it")?;
         validate_lane_name(&row.5)
             .context("registry contains an invalid session name; rebuild it")?;
-        if row.4 != format!("worklane-{}", row.0) || row.6 != "/home/dev" {
+        if row.4 != stable_container_name(&row.5, &row.0) || row.6 != "/home/dev" {
             bail!("registry contains invalid stable lane identity; rebuild it")
         }
         let parse_time = |value: &str, field: &str| {
@@ -546,8 +591,10 @@ impl Store {
                 let spec = read_lane_spec(&index.manifest_path, index.host, index.last_attached)?;
                 if spec.id != index.id {
                     bail!(
-                        "registry lane '{}' points to a manifest for lane '{}'; run lane reconcile and resolve the locator conflict",
+                        "registry lane '{}' ({}) points to a manifest for lane '{}' ({}); run lane reconcile and resolve the locator conflict",
+                        index.name,
                         index.id,
+                        spec.name,
                         spec.id
                     )
                 }
@@ -589,6 +636,7 @@ impl Store {
                     state: index.state,
                     drift: index.drift,
                     cached_at: index.status_cached_at,
+                    runtime_started_at: None,
                 })
             })
             .collect()
@@ -601,16 +649,34 @@ impl Store {
         self.conn.execute("INSERT INTO tombstones(lane_id,name,operation,completed_at) VALUES(?1,?2,?3,?4) ON CONFLICT(lane_id) DO UPDATE SET name=excluded.name,operation=excluded.operation,completed_at=excluded.completed_at",params![id,name,operation,Utc::now().to_rfc3339()])?;
         Ok(())
     }
-    pub fn tombstone_operation(&self, selector: &str) -> Result<Option<String>> {
+    pub fn tombstone(&self, selector: &str) -> Result<Option<Tombstone>> {
         let mut statement = self.conn.prepare(
-            "SELECT operation FROM tombstones WHERE lane_id=?1 OR name=?1 ORDER BY completed_at DESC LIMIT 1",
+            "SELECT lane_id,name,operation FROM tombstones WHERE lane_id=?1 OR name=?1 ORDER BY completed_at DESC LIMIT 1",
         )?;
-        match statement.query_row([selector], |row| row.get(0)) {
-            Ok(operation) => Ok(Some(operation)),
+        match statement.query_row([selector], |row| {
+            Ok(Tombstone {
+                lane_id: row.get(0)?,
+                lane_name: row.get(1)?,
+                operation: row.get(2)?,
+            })
+        }) {
+            Ok(tombstone) => Ok(Some(tombstone)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(error) => Err(error.into()),
         }
     }
+    pub fn tombstone_operation(&self, selector: &str) -> Result<Option<String>> {
+        Ok(self
+            .tombstone(selector)?
+            .map(|tombstone| tombstone.operation))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tombstone {
+    pub lane_id: String,
+    pub lane_name: String,
+    pub operation: String,
 }
 
 fn cached_spec(index: &LaneIndex) -> LaneSpec {
@@ -706,15 +772,16 @@ impl Runner for SystemRunner {
         Ok(String::from_utf8_lossy(&output.stdout).trim().into())
     }
     fn run_streaming(&self, program: &str, args: &[String]) -> Result<String> {
+        let progress = OpenOptions::new()
+            .write(true)
+            .open("/dev/stderr")
+            .context("open stderr for build progress")?;
         let mut child = Command::new(program)
             .args(args)
-            .stdout(Stdio::piped())
+            .stdout(Stdio::from(progress))
             .stderr(Stdio::inherit())
             .spawn()
             .with_context(|| format!("run {program}"))?;
-        let mut stdout = child.stdout.take().expect("piped stdout is available");
-        let mut stderr = io::stderr();
-        io::copy(&mut stdout, &mut stderr).with_context(|| format!("stream {program}"))?;
         let status = child
             .wait()
             .with_context(|| format!("wait for {program}"))?;
@@ -785,6 +852,44 @@ pub fn host_state(r: &impl Runner, spec: &LaneSpec) -> Result<(String, bool)> {
 }
 pub fn host_runtime_state(r: &impl Runner, spec: &LaneSpec) -> Result<String> {
     container_runtime_state(r, &spec.container_name())
+}
+pub fn host_runtime_started_at(
+    r: &impl Runner,
+    spec: &LaneSpec,
+    state: &str,
+) -> Result<Option<DateTime<Utc>>> {
+    if state != "running" {
+        return Ok(None);
+    }
+    let value = podman(
+        r,
+        [
+            "inspect",
+            "--format",
+            "{{.State.StartedAt}}",
+            &spec.container_name(),
+        ],
+    )?;
+    Ok(parse_container_started_at(&value).ok())
+}
+pub fn parse_container_started_at(value: &str) -> Result<DateTime<Utc>> {
+    let value = value.trim();
+    if let Ok(parsed) = DateTime::parse_from_rfc3339(value) {
+        return Ok(parsed.with_timezone(&Utc));
+    }
+    if let Some(timestamp) = value.split_whitespace().next() {
+        if let Ok(parsed) = DateTime::parse_from_rfc3339(timestamp) {
+            return Ok(parsed.with_timezone(&Utc));
+        }
+    }
+    let fields = value.split_whitespace().collect::<Vec<_>>();
+    if fields.len() >= 3 {
+        let timestamp = fields[..3].join(" ");
+        if let Ok(parsed) = DateTime::parse_from_str(&timestamp, "%Y-%m-%d %H:%M:%S%.f %z") {
+            return Ok(parsed.with_timezone(&Utc));
+        }
+    }
+    bail!("unsupported Podman timestamp '{value}'")
 }
 pub fn container_runtime_state(r: &impl Runner, name: &str) -> Result<String> {
     let exists = r.run_output(
@@ -858,7 +963,7 @@ pub fn read_lane_spec(
         .get("schema_version")
         .and_then(toml::Value::as_integer)
         .context(
-            "unversioned lane manifest is unsupported and was left untouched; create a fresh v3 lane",
+            "unversioned lane manifest is unsupported and was left untouched; create a fresh v5 lane",
         )?;
     if version != i64::from(MANIFEST_SCHEMA_VERSION) {
         bail!(
@@ -953,7 +1058,7 @@ pub struct OperationLock {
 }
 impl Drop for OperationLock {
     fn drop(&mut self) {
-        let _ = self.file.unlock();
+        let _ = FileExt::unlock(&self.file);
     }
 }
 pub fn lock_lane_operation(spec: &LaneSpec) -> Result<OperationLock> {
@@ -1089,6 +1194,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn runner_defaults_preserve_output_and_delegate_to_run() {
+        let runner = Mock {
+            output: "ok".into(),
+            calls: Mutex::new(Vec::new()),
+        };
+        assert_eq!(runner.run_with_input("tool", &[], b"input").unwrap(), "ok");
+        assert_eq!(runner.run_streaming("tool", &[]).unwrap(), "ok");
+        assert_eq!(runner.run_output("tool", &[]).unwrap().stdout, "ok");
+        assert_eq!(runner.calls.lock().unwrap().len(), 3);
+    }
+
     struct FailingMock;
     impl Runner for FailingMock {
         fn run(&self, _: &str, _: &[String]) -> Result<String> {
@@ -1131,6 +1248,9 @@ mod tests {
         .unwrap();
         let body = toml::to_string(&LaneManifest::from(&s)).unwrap();
         assert!(toml::from_str::<LaneManifest>(&body).is_ok());
+        let mut unsupported = LaneManifest::from(&s);
+        unsupported.schema_version = 4;
+        assert!(unsupported.validate().is_err());
         assert!(!body.contains("host ="));
         assert!(!body.contains("project_path ="));
         assert!(!body.contains("last_attached ="));
@@ -1180,6 +1300,7 @@ mod tests {
             Profile::default()
         )
         .is_err());
+        assert!(validate_lane_name(&"a".repeat(65)).is_err());
         assert!(validate_lane_name("00000000-0000-4000-8000-000000000001").is_err());
     }
 
@@ -1214,14 +1335,20 @@ mod tests {
             Profile::default(),
         )
         .unwrap();
-        assert!(spec.container_name().starts_with("worklane-"));
+        assert!(spec.container_name().starts_with("worklane-docs-"));
         assert_eq!(spec.session_name(), "docs");
         assert_eq!(spec.container_home(), PathBuf::from("/home/dev"));
         assert_eq!(
             spec.manifest_path(),
             PathBuf::from("/tmp/.worklane/lane.toml")
         );
-        assert_eq!(spec.container_name(), format!("worklane-{}", spec.id));
+        assert_eq!(spec.container_name(), format!("worklane-docs-{}", spec.id));
+        let stable_container = spec.container_name();
+        let stable_session = spec.session_name();
+        let mut renamed = spec;
+        renamed.name = "renamed-docs".into();
+        assert_eq!(renamed.container_name(), stable_container);
+        assert_eq!(renamed.session_name(), stable_session);
     }
 
     #[test]
@@ -1259,6 +1386,8 @@ mod tests {
         assert_eq!(profile.containerfile, PathBuf::from("Containerfile"));
         assert!(profile.embedded_containerfile);
         assert!(profile.build_context.is_none());
+        assert!(profile.mount_codex_credentials);
+        assert!(profile.mount_gh_credentials);
     }
 
     #[test]
@@ -1269,6 +1398,8 @@ mod tests {
         };
         assert!(validate_profile(&profile, Path::new("/home/gerald"), false).is_err());
         profile.network = "none".into();
+        profile.mount_codex_credentials = false;
+        profile.mount_gh_credentials = false;
         profile.mounts.push(MountSpec {
             source: PathBuf::from("/tmp"),
             target: PathBuf::from("/home/gerald/workspace/tools"),
@@ -1290,13 +1421,20 @@ mod tests {
         assert!(validate_profile(&profile, Path::new("/home/gerald"), false).is_err());
         profile.mounts[0].target = PathBuf::from("/");
         assert!(validate_profile(&profile, Path::new("/home/gerald"), false).is_err());
+        profile.mounts[0].target = PathBuf::from("/home/gerald/.codex");
+        profile.mount_codex_credentials = true;
+        assert!(validate_profile(&profile, Path::new("/home/gerald"), false).is_err());
+        profile.mounts[0].target = PathBuf::from("/home/gerald/.config/gh/hosts.yml");
+        profile.mount_codex_credentials = false;
+        profile.mount_gh_credentials = true;
+        assert!(validate_profile(&profile, Path::new("/home/gerald"), false).is_err());
     }
 
     #[test]
     fn executor_requests_are_versioned_json() {
         let body = executor_request(vec!["lane".into(), "list".into()]).unwrap();
         let request: ExecutorRequest = serde_json::from_slice(&body).unwrap();
-        assert_eq!(EXECUTOR_PROTOCOL, 3);
+        assert_eq!(EXECUTOR_PROTOCOL, 5);
         assert_eq!(request.protocol_version, EXECUTOR_PROTOCOL);
         assert!(validate_lane_id(&request.request_id).is_ok());
         assert_eq!(request.args, ["lane", "list"]);
@@ -1306,7 +1444,7 @@ mod tests {
     fn canonical_registry_uses_a_fresh_database_generation() {
         assert_eq!(
             db_path().file_name().and_then(|name| name.to_str()),
-            Some("worklane-v3.db")
+            Some("worklane-v5.db")
         );
     }
 
@@ -1324,6 +1462,41 @@ mod tests {
                 home,
             ),
             Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn podman_started_at_accepts_rfc3339_and_go_timezone_suffixes() {
+        assert_eq!(
+            parse_container_started_at("2026-08-02T12:34:56.123456789+10:00").unwrap(),
+            "2026-08-02T02:34:56.123456789Z"
+                .parse::<DateTime<Utc>>()
+                .unwrap()
+        );
+        assert_eq!(
+            parse_container_started_at("2026-08-02 12:34:56.123456789 +1000 AEST").unwrap(),
+            "2026-08-02T02:34:56.123456789Z"
+                .parse::<DateTime<Utc>>()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn unknown_podman_started_at_never_blocks_lane_lifecycle() {
+        let runner = Mock {
+            output: "unknown vendor timestamp".into(),
+            calls: Mutex::new(Vec::new()),
+        };
+        let spec = LaneSpec::new(
+            "timestamp-test".into(),
+            "local".into(),
+            PathBuf::from("/tmp"),
+            Profile::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            host_runtime_started_at(&runner, &spec, "running").unwrap(),
+            None
         );
     }
 
@@ -1461,6 +1634,18 @@ mod tests {
         store.save_lane(&spec, "created", false).unwrap();
         store.remove_lane(&spec.id).unwrap();
         assert!(store.lane(&spec.id).is_err());
+        assert_eq!(store.tombstone("missing").unwrap(), None);
+        store
+            .record_tombstone(&spec.id, &spec.name, "delete")
+            .unwrap();
+        assert_eq!(
+            store.tombstone(&spec.name).unwrap(),
+            Some(Tombstone {
+                lane_id: spec.id.clone(),
+                lane_name: spec.name.clone(),
+                operation: "delete".into(),
+            })
+        );
         let file = std::env::temp_dir().join(format!("worklane-hash-{}", Uuid::new_v4()));
         std::fs::write(&file, b"abc").unwrap();
         assert_eq!(

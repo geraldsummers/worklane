@@ -20,10 +20,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     dbus-x11 diffutils dnsutils fd-find file findutils fonts-liberation \
     fonts-noto-color-emoji fzf gawk gdb git git-lfs gnupg golang-go jq less \
     libffi-dev libsqlite3-dev libssl-dev lsof make man-db nano ncdu \
-    netcat-openbsd ninja-build nodejs npm openjdk-21-jdk openssh-client patch \
+    netcat-openbsd ninja-build nodejs npm openssh-client patch \
     pkg-config procps psmisc python-is-python3 python3 python3-pip python3-venv \
     pipx ripgrep rsync shellcheck socat sqlite3 strace tar tree unzip \
-    tzdata valgrind vim wget xvfb xauth xz-utils yq zip zsh chromium kotlin \
+    tzdata valgrind vim wget xvfb xauth xz-utils yq zip zsh chromium \
  && rm -rf /var/lib/apt/lists/* \
  && ln -s /usr/bin/batcat /usr/local/bin/bat \
  && ln -s /usr/bin/fdfind /usr/local/bin/fd \
@@ -58,8 +58,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && herdr --version \
  && rm -f /tmp/herdr \
  && python3 --version && pip3 --version && node --version && npm --version \
- && tsc --version && prettier --version && rustc --version && cargo --version && rustfmt --version \
- && java --version && kotlinc -version
+ && tsc --version && prettier --version && rustc --version && cargo --version && rustfmt --version
 RUN groupadd --gid "${USER_GID}" "${USERNAME}" && useradd --uid "${USER_UID}" --gid "${USER_GID}" -m -s /usr/bin/zsh "${USERNAME}"
 USER ${USERNAME}
 WORKDIR /home/${USERNAME}
