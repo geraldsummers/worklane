@@ -83,16 +83,30 @@ unbounded background `codex exec` processes or per-process immediate retry loops
   Each agent updates and removes only its own file. Record the agent ID,
   files/area, status, and an updated UTC timestamp. Treat claims as advisory
   soft locks and coordinate before overlapping.
-- Before pushing, run the repository's CI-equivalent tests and validation
-  locally. Do not push while a required local check fails.
+- Follow the repository testing cadence below before pushing. Do not push while
+  a required local check fails.
+
+## Repository testing cadence
+
+The complete Worklane gate is intentionally heavy. Do not rerun the full test, coverage, and
+isolated acceptance suite after every small edit or exploratory iteration. During implementation,
+use the narrowest relevant unit test, compile check, lint, or static validation and batch related
+changes before advancing to another expensive checkpoint.
+
+Coverage is not optional for substantive implementation changes: Worklane is mission-critical
+infrastructure, and its full coverage and acceptance evidence is worth the cost. Run the complete
+CI-equivalent gate at meaningful integration checkpoints, after the implementation stabilizes,
+before publishing a fresh release build, and before pushing substantive runtime or behavior
+changes. Documentation and prompt-only edits may use focused static checks without the complete
+gate unless the user explicitly requests it. Never skip the final full gate merely because it is
+slow, and do not push when a required checkpoint is failing.
 
 ## Fresh dist builds
 
-After every user-facing change to `worklane`, `lane`, their shared core, or their
-embedded runtime assets, automatically run the required validation, build the
-release binaries, and refresh the ignored `dist/` directory. Do this before
-handing the change back; the user must not need to ask for a fresh dist
-separately. Also refresh it whenever the user explicitly asks for a fresh dist:
+After substantive user-facing changes to `worklane`, `lane`, their shared core, or their
+embedded runtime assets, automatically run the required validation, build the release binaries,
+and refresh the ignored `dist/` directory. Do this once the change has stabilized rather than
+after every intermediate edit. Also refresh it whenever the user explicitly asks for a fresh dist:
 
 ```sh
 scripts/release-check
