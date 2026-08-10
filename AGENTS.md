@@ -17,6 +17,16 @@ Use these locations for additions and generated state:
   `/home/dev/.tmp` (or a project-local temporary directory) instead. `/var/tmp` is also
   unavailable unless the user explicitly authorizes it.
 
+Use `$HOME/.local/bin` as the single standard entry point for locally installed executables. It
+is already added to `PATH` by the lane bootstrap and base image; do not create a new PATH fragment
+for each tool. Install a tool there directly, or place an executable symlink or small launcher in
+`$HOME/.local/bin` when the tool must live under another user-space prefix. Launchers must resolve
+their paths relative to `$HOME`, must forward arguments with `"$@"`, and must not depend on the
+installing agent's transient environment. After installation, verify the command from a fresh
+login shell with `zsh -lic 'command -v TOOL && TOOL --version'`. Only add an idempotent export to
+`$HOME/.zshenv` when a tool fundamentally cannot be exposed through `$HOME/.local/bin`; never
+overwrite shell startup files.
+
 The base image already provides common build, debugging, search, archive, network, browser, and
 language tooling. Prefer the installed tool before adding a new one.
 
