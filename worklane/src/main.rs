@@ -678,6 +678,8 @@ fn create_local_container<R: Runner>(r: &R, spec: &LaneSpec, name: &str) -> Resu
         build_local_image(r, spec, false)?;
     }
     fs::create_dir_all(&spec.project_path)?;
+    let scratch_path = spec.project_path.join(".tmp");
+    fs::create_dir_all(&scratch_path)?;
     let mut a = vec![
         "run".into(),
         "-d".into(),
@@ -688,8 +690,8 @@ fn create_local_container<R: Runner>(r: &R, spec: &LaneSpec, name: &str) -> Resu
         LANE_PIDS_LIMIT.into(),
         "--userns=keep-id".into(),
         "--read-only".into(),
-        "--tmpfs".into(),
-        "/tmp:rw,nosuid,nodev,size=1g".into(),
+        "--volume".into(),
+        format!("{}:/tmp:rw,nosuid,nodev", scratch_path.display()),
         "--tmpfs".into(),
         "/var/tmp:rw,nosuid,nodev,size=1g".into(),
         "--tmpfs".into(),
@@ -2818,7 +2820,7 @@ exit 0
         assert!(LANE_AGENTS_MD.contains("Herdr is the lane session manager"));
         assert!(LANE_AGENTS_MD.contains("Agents may delegate concrete, bounded subtasks"));
         assert!(LANE_AGENTS_MD.contains("agent--root--api.md"));
-        assert!(LANE_AGENTS_MD.contains("CI-equivalent tests and validation"));
+        assert!(LANE_AGENTS_MD.contains("Repository testing cadence"));
         let shell = bootstrap_shell_script();
         assert!(shell.contains("cd \"${WORKLANE_WORKSPACE:-$HOME}\""));
         assert!(shell.contains("cwd=\"${WORKLANE_WORKSPACE:-$HOME}\""));
@@ -3133,7 +3135,11 @@ CMD ["sleep", "infinity"]
             .1
             .windows(2)
             .any(|args| args == [String::from("--pids-limit"), String::from(LANE_PIDS_LIMIT)]));
-        assert!(run.1.contains(&"/tmp:rw,nosuid,nodev,size=1g".into()));
+        assert!(run.1.contains(&"/tmp/.tmp:/tmp:rw,nosuid,nodev".into()));
+        assert!(!run
+            .1
+            .iter()
+            .any(|arg| arg.contains(":/tmp:") && arg.contains("size=")));
         drop(calls);
         let (store, path) = temp_store();
         let status = refresh(&runner, &store, &lane).unwrap();

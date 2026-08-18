@@ -1972,7 +1972,9 @@ mod tests {
         assert!(app.message.contains("queued") || app.message.contains("running"));
         app.jobs.clear();
         app.job_queue.clear();
-        let replacement = worklane.with_extension("replacement");
+        let failing_bin = root.join("failing-bin");
+        fs::create_dir_all(&failing_bin).unwrap();
+        let replacement = failing_bin.join("worklane");
         fs::write(
             &replacement,
             "#!/bin/sh\nprintf 'attach exploded\\n' >&2\nexit 17\n",
@@ -1983,7 +1985,14 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&replacement, fs::Permissions::from_mode(0o755)).unwrap();
         }
-        fs::rename(replacement, &worklane).unwrap();
+        env::set_var(
+            "PATH",
+            format!(
+                "{}:{}",
+                failing_bin.display(),
+                env::var_os("PATH").unwrap().to_string_lossy()
+            ),
+        );
         let mut attach_keys = vec![Some(KeyCode::Char('a')), Some(KeyCode::Char('q'))].into_iter();
         let mut attach_redraws = 0;
         run_app(

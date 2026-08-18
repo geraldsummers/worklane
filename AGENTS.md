@@ -46,6 +46,35 @@ Herdr is the lane session manager. A normal `worklane lane attach` enters the la
 a stable lane session, with the lane workspace focused at `/home/dev`.
 Use Herdr-managed sessions unless the user explicitly asks for a plain shell.
 
+## Operating Herdr from an agent
+
+Treat Herdr as a structured control plane for the lane's persistent terminals. Use its CLI
+instead of sending interactive prefix-key sequences. The lane name is the Herdr session name;
+when there could be more than one session, target it explicitly by placing `--session LANE`
+immediately after `herdr` on every command.
+
+- Discover state before acting: use `herdr api snapshot`, `herdr workspace list`,
+  `herdr pane list`, and `herdr agent list`. These commands return JSON; select stable IDs from
+  their output rather than scraping labels or assuming pane order.
+- Inspect work without taking focus using `herdr pane read PANE_ID --source recent-unwrapped
+  --lines N` or `herdr agent read TARGET`. Use `herdr pane process-info PANE_ID` when ownership
+  of a terminal is unclear.
+- Run a command in an existing shell with `herdr pane run PANE_ID 'COMMAND'`. Use
+  `herdr agent send TARGET 'TEXT'` only to deliver literal agent input; it does not mean "run a
+  shell command." Use `herdr pane send-keys` only when an API-level run or send cannot express
+  the required interaction.
+- Create isolated work with `herdr pane split PANE_ID --direction right|down --cwd PATH
+  --no-focus`, or start a detected agent with `herdr agent start NAME --cwd PATH --no-focus --
+  COMMAND [ARG ...]`. Re-list state after creation and retain the returned ID.
+- Observe completion with `herdr agent wait TARGET --status idle|blocked --timeout MS`, then read
+  the agent or pane output. Use bounded timeouts and report timeouts as inconclusive, not success.
+- Do not focus panes merely to inspect them. Do not close panes or workspaces, stop/delete
+  sessions, or restart the Herdr server unless the user requested that lifecycle change and the
+  exact target was resolved first. Those operations can disrupt other agents and persistent work.
+
+Run the relevant subcommand with `--help` for its exact arguments. Prefer Worklane-managed
+session lifecycle; do not manually start a second Herdr server for the lane.
+
 ## Progress and ETA updates
 
 For work lasting more than a few minutes, send regular progress updates at meaningful phase
