@@ -17,6 +17,7 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - run: python3 -m unittest discover -s tests -p 'test_*.py'
       - run: cargo llvm-cov --workspace --fail-under-lines 90
       - run: bash -n scripts/lab-acceptance scripts/release-check
       - run: python3 -c "import ast, pathlib; ast.parse(pathlib.Path('scripts/tui_capture.py').read_text())"

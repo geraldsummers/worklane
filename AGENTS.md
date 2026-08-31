@@ -102,26 +102,18 @@ when targeting a detected agent by name. Read the pane again after input when co
 
 ### Showing images to the human
 
-When the human needs to inspect an image, do not take over an agent's working tab. Create a fresh,
-clearly labeled Herdr workspace and tab for the review, run `timg` in that tab's pane, and focus the
-presentation only when it is ready. For example:
+The target terminal is Ghostty. When the human needs to inspect an image, use Worklane's Herdr
+pane-graphics presenter, which creates a fresh, clearly labeled workspace and tab and focuses the
+presentation only after the native image is ready:
 
 ```sh
-image=/absolute/path/to/image.png
-workspace_result="$(herdr --session "$LANE" workspace create --cwd "$PWD" --label "image review" --no-focus)"
-review_workspace="$(printf '%s\n' "$workspace_result" | jq -r '.result.workspace.workspace_id')"
-review_tab="$(printf '%s\n' "$workspace_result" | jq -r '.result.tab.tab_id')"
-review_pane="$(printf '%s\n' "$workspace_result" | jq -r '.result.root_pane.pane_id')"
-quoted_image="$(jq -Rn --arg path "$image" '$path | @sh')"
-herdr --session "$LANE" pane run "$review_pane" "timg -- $quoted_image"
-herdr --session "$LANE" workspace focus "$review_workspace"
-herdr --session "$LANE" tab focus "$review_tab"
+worklane-show-image --session "$LANE" --label "image review" /absolute/path/to/image.png
 ```
 
-Use absolute image paths. A small project-local script may automate the same sequence when images
-must be refreshed repeatedly or shown as a set; keep the dedicated review workspace and tab rather
-than reusing a development pane. `workspace create` creates the workspace's first tab and root pane,
-so use those returned objects instead of creating an extra empty tab.
+The helper supports PNG directly and uses GraphicsMagick for other common formats. It requires
+Herdr's experimental native pane-graphics API and a connected Ghostty frontend; there is no text or
+external-renderer fallback. Keep image review in its dedicated workspace rather than reusing a
+development pane.
 
 Run the relevant subcommand with `--help` for its exact arguments. Prefer Worklane-managed
 session lifecycle; do not manually start a second Herdr server for the lane.

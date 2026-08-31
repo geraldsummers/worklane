@@ -47,7 +47,7 @@ lane upgrades use this file. Pass `--file PATH` to override it for a single buil
 deliberately has no OCI registry: each host builds and retains its own Podman image.
 
 The standard image includes Python (pip and venv), Node.js/npm, TypeScript,
-Prettier for JS/TS/HTML/CSS, Rust/Cargo, zsh, `timg` for terminal image review,
+Prettier for JS/TS/HTML/CSS, Rust/Cargo, zsh, GraphicsMagick for image conversion,
 and native build tooling, as well as Codex, Herdr, Git, and GitHub CLI. JVM SDKs
 such as Java, Kotlin, Gradle, and Maven are installed and updated by lane users through SDKMAN under
 `$HOME/.sdkman`, rather than being tied to Debian's package versions.
@@ -72,6 +72,11 @@ be restored after a Herdr server restart. Worklane also bridges Herdr agent
 alerts to the outer terminal as a terminal bell, allowing terminal emulators
 such as Konsole to turn background completions into desktop notifications even
 though the lane itself is containerized.
+
+For image review in Ghostty, run `worklane-show-image /absolute/path/to/image` from a managed
+pane. Worklane enables Herdr's experimental Kitty graphics support and the helper opens a dedicated
+review workspace, converts common image formats when necessary, and presents the image through
+Herdr's native pane-graphics API.
 
 ### Programmatic Codex runs
 

@@ -40,7 +40,7 @@ runtime.mounts
 runtime.network
 runtime.process_reaping
 runtime.timestamp
-runtime.timg
+runtime.herdr_graphics
 runtime.tools
 tui.attach
 tui.confirmations

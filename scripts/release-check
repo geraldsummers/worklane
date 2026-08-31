@@ -29,6 +29,7 @@ CARGO=(rustup run 1.88.0 cargo)
 "${CARGO[@]}" fmt --check
 "${CARGO[@]}" clippy --workspace --all-targets -- -D warnings
 "${CARGO[@]}" test --workspace
+python3 -m unittest discover -s tests -p 'test_*.py'
 if command -v cargo-llvm-cov >/dev/null 2>&1; then "${CARGO[@]}" llvm-cov --workspace --fail-under-lines 90 -- --test-threads=1; else echo 'cargo-llvm-cov is required' >&2; exit 1; fi
 "${CARGO[@]}" build --release --target x86_64-unknown-linux-gnu
 WORKLANE="$ROOT/target/x86_64-unknown-linux-gnu/release/worklane"

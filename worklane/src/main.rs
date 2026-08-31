@@ -20,6 +20,8 @@ const STANDARD_CONTAINERFILE_MARKER: &str = "worklane-standard-containerfile";
 const LANE_PIDS_LIMIT: &str = "16384";
 /// Guidance seeded into Codex's global instructions on first lane attach.
 const LANE_AGENTS_MD: &str = include_str!("../../AGENTS.md");
+/// Lane-local presenter for Herdr's experimental pane graphics API.
+const SHOW_IMAGE_SCRIPT: &str = include_str!("../../assets/worklane-show-image");
 static OPERATION_CONTEXT: OnceLock<(String, Instant)> = OnceLock::new();
 
 fn report_phase(lane: Option<(&str, &str)>, status: &str, phase: &str, message: &str) {
@@ -1217,6 +1219,41 @@ grep -qxF 'source "$HOME/.config/worklane/prompt.zsh"' "$HOME/.zshrc" || \
     let script = format!(
         r#"{script}
 mkdir -p "$HOME/.local/bin" "$HOME/.local/share/worklane/bin"
+cat > "$HOME/.local/bin/worklane-show-image" <<'WORKLANE_SHOW_IMAGE'
+{SHOW_IMAGE_SCRIPT}WORKLANE_SHOW_IMAGE
+chmod 755 "$HOME/.local/bin/worklane-show-image"
+mkdir -p "$HOME/.config/herdr"
+herdr_graphics_changed="$(python3 - <<'WORKLANE_HERDR_GRAPHICS_CONFIG'
+import os
+from pathlib import Path
+import tempfile
+
+import tomlkit
+
+path = Path.home() / ".config" / "herdr" / "config.toml"
+document = tomlkit.parse(path.read_text()) if path.exists() else tomlkit.document()
+experimental = document.get("experimental")
+if experimental is None:
+    experimental = tomlkit.table()
+    document["experimental"] = experimental
+elif not hasattr(experimental, "get"):
+    raise SystemExit("Herdr config [experimental] must be a table")
+if experimental.get("kitty_graphics") is True:
+    print("no")
+else:
+    experimental["kitty_graphics"] = True
+    with tempfile.NamedTemporaryFile("w", dir=path.parent, delete=False) as handle:
+        handle.write(tomlkit.dumps(document))
+        temporary = handle.name
+    os.replace(temporary, path)
+    print("yes")
+WORKLANE_HERDR_GRAPHICS_CONFIG
+)"
+herdr config check >/dev/null
+if [ "$herdr_graphics_changed" = yes ] && [ -n "${{WORKLANE_SESSION:-}}" ] && \
+   herdr --session "$WORKLANE_SESSION" workspace list >/dev/null 2>&1; then
+  herdr --session "$WORKLANE_SESSION" server reload-config >/dev/null
+fi
 bell_player="$HOME/.local/share/worklane/bin/worklane-terminal-bell"
 cat > "$bell_player" <<'WORKLANE_TERMINAL_BELL'
 #!/bin/sh
@@ -2764,10 +2801,16 @@ exit 0
     }
 
     #[test]
-    fn lane_shell_bootstrap_installs_bell_bridge_without_overwriting_user_player() {
+    fn lane_shell_bootstrap_installs_helpers_and_preserves_user_configuration() {
         let home =
             std::env::temp_dir().join(format!("worklane-bell-bootstrap-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(home.join(".config/herdr")).unwrap();
+        fs::write(
+            home.join(".config/herdr/config.toml"),
+            "# keep this comment\n[terminal]\nscrollback_limit_bytes = 123456\n",
+        )
+        .unwrap();
         let run_bootstrap = || {
             Command::new("zsh")
                 .args(["-c", &bootstrap_shell_script()])
@@ -2786,11 +2829,19 @@ exit 0
         assert!(fs::read_to_string(&bell_player)
             .unwrap()
             .contains("printf '\\007' > /dev/tty"));
+        let presenter = home.join(".local/bin/worklane-show-image");
+        assert_eq!(fs::read_to_string(&presenter).unwrap(), SHOW_IMAGE_SCRIPT);
+        let herdr_config = fs::read_to_string(home.join(".config/herdr/config.toml")).unwrap();
+        assert!(herdr_config.contains("# keep this comment"));
+        assert!(herdr_config.contains("scrollback_limit_bytes = 123456"));
+        assert!(herdr_config.contains("kitty_graphics = true"));
 
         fs::remove_file(&paplay).unwrap();
         fs::write(&paplay, "#!/bin/sh\nexit 23\n").unwrap();
         assert!(run_bootstrap().success());
         assert_eq!(fs::read_to_string(&paplay).unwrap(), "#!/bin/sh\nexit 23\n");
+        let herdr_config = fs::read_to_string(home.join(".config/herdr/config.toml")).unwrap();
+        assert_eq!(herdr_config.matches("kitty_graphics = true").count(), 1);
         fs::remove_dir_all(home).unwrap();
     }
 
@@ -2809,8 +2860,9 @@ exit 0
         assert!(EMBEDDED_CONTAINERFILE.contains("install -m 755 /tmp/herdr /usr/local/bin/herdr"));
         assert!(!EMBEDDED_CONTAINERFILE.contains("NOPASSWD:ALL"));
         assert!(EMBEDDED_CONTAINERFILE.contains("ripgrep"));
-        assert!(EMBEDDED_CONTAINERFILE.contains("timg"));
-        assert!(EMBEDDED_CONTAINERFILE.contains("timg --version"));
+        assert!(EMBEDDED_CONTAINERFILE.contains("graphicsmagick"));
+        assert!(EMBEDDED_CONTAINERFILE.contains("python3-tomlkit"));
+        assert!(EMBEDDED_CONTAINERFILE.contains("gm version"));
         assert!(EMBEDDED_CONTAINERFILE.contains("tzdata"));
         assert!(EMBEDDED_CONTAINERFILE.contains("xvfb"));
         assert!(!EMBEDDED_CONTAINERFILE.contains("openjdk-"));
@@ -2821,9 +2873,8 @@ exit 0
         assert!(LANE_AGENTS_MD.contains("Do not use `/tmp` for anything"));
         assert!(LANE_AGENTS_MD.contains("Herdr is the lane session manager"));
         assert!(LANE_AGENTS_MD.contains("Showing images to the human"));
-        assert!(LANE_AGENTS_MD.contains("timg -- $quoted_image"));
-        assert!(LANE_AGENTS_MD.contains(".result.tab.tab_id"));
-        assert!(LANE_AGENTS_MD.contains(".result.root_pane.pane_id"));
+        assert!(LANE_AGENTS_MD.contains("worklane-show-image"));
+        assert!(LANE_AGENTS_MD.contains("Ghostty"));
         assert!(LANE_AGENTS_MD.contains("Agents may delegate concrete, bounded subtasks"));
         assert!(LANE_AGENTS_MD.contains("agent--root--api.md"));
         assert!(LANE_AGENTS_MD.contains("Repository testing cadence"));
@@ -2833,6 +2884,11 @@ exit 0
         assert!(shell.contains("touch \"$HOME/.zshenv\""));
         assert!(shell.contains("export PATH=\"$HOME/.local/bin:$PATH\""));
         assert!(shell.contains("mkdir -p \"$HOME/.codex\""));
+        assert!(shell.contains("$HOME/.local/bin/worklane-show-image"));
+        assert!(shell.contains("experimental[\"kitty_graphics\"] = True"));
+        assert!(shell.contains("server reload-config"));
+        assert!(SHOW_IMAGE_SCRIPT.contains("pane.graphics.set"));
+        assert!(SHOW_IMAGE_SCRIPT.contains("pane.graphics.info"));
         assert!(!shell.contains("WORKLANE_CODEX_WRAPPER"));
         assert!(!shell.contains("codex_config=\"$HOME/.codex/config.toml\""));
         assert!(shell.contains("[ ! -f \"$HOME/.codex/AGENTS.md\" ]"));
