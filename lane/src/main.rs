@@ -638,9 +638,39 @@ fn start_queued_jobs(app: &mut App) {
 }
 fn start_upgrade(app: &mut App, all: bool) -> Result<()> {
     if all {
-        start_job(app, "upgrade", &["--no-cache".into()], true)
+        start_job(app, "upgrade", &[], true)
     } else {
         start_job(app, "upgrade", &[], false)
+    }
+}
+fn send_progress_line(sender: &mpsc::Sender<JobEvent>, line: &[u8]) {
+    let line = String::from_utf8_lossy(line);
+    let display = serde_json::from_str::<worklane_core::OperationEvent>(&line).map_or_else(
+        |_| line.into_owned(),
+        |event| {
+            format!(
+                "{} · {:.1}s — {}",
+                event.phase,
+                event.elapsed_ms as f64 / 1000.0,
+                event.message
+            )
+        },
+    );
+    let _ = sender.send(JobEvent::Progress(display));
+}
+fn drain_progress_lines(
+    pending: &mut Vec<u8>,
+    sender: &mpsc::Sender<JobEvent>,
+    flush_partial: bool,
+) {
+    while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
+        let mut line = pending.drain(..=newline).collect::<Vec<_>>();
+        line.pop();
+        send_progress_line(sender, &line);
+    }
+    if flush_partial && !pending.is_empty() {
+        send_progress_line(sender, pending);
+        pending.clear();
     }
 }
 fn run_verbose_command(
@@ -677,25 +707,40 @@ fn run_verbose_command(
         .stderr(Stdio::from(stderr_file))
         .spawn()
         .map_err(|error| error.to_string())?;
-    let status = child.wait().map_err(|error| error.to_string())?;
+    let mut stderr_reader = fs::File::open(&stderr_path).map_err(|error| error.to_string())?;
+    let mut pending_progress = Vec::new();
+    let status = loop {
+        let mut chunk = [0; 8192];
+        loop {
+            match stderr_reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(count) => {
+                    pending_progress.extend_from_slice(&chunk[..count]);
+                    drain_progress_lines(&mut pending_progress, sender, false);
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+            break status;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    loop {
+        let mut chunk = [0; 8192];
+        match stderr_reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(count) => pending_progress.extend_from_slice(&chunk[..count]),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    drain_progress_lines(&mut pending_progress, sender, true);
     let stdout = fs::read(&stdout_path).map_err(|error| error.to_string())?;
     let stderr = fs::read(&stderr_path).map_err(|error| error.to_string())?;
     let _ = fs::remove_file(&stdout_path);
     let _ = fs::remove_file(&stderr_path);
-    for line in String::from_utf8_lossy(&stderr).lines() {
-        let display = serde_json::from_str::<worklane_core::OperationEvent>(line).map_or_else(
-            |_| line.to_string(),
-            |event| {
-                format!(
-                    "{} · {:.1}s — {}",
-                    event.phase,
-                    event.elapsed_ms as f64 / 1000.0,
-                    event.message
-                )
-            },
-        );
-        let _ = sender.send(JobEvent::Progress(display));
-    }
     Ok(CommandOutput {
         success: status.success(),
         stdout,
@@ -1808,7 +1853,7 @@ mod tests {
         assert!(fs::read_to_string(worklane.with_extension("log"))
             .unwrap()
             .lines()
-            .any(|line| line == "lane upgrade --all --no-cache"));
+            .any(|line| line == "lane upgrade --all"));
         start_job(&mut app, "rename", &["renamed".into()], false).unwrap();
         start_job(&mut app, "start", &[], false).unwrap();
         assert_eq!(app.message, "start: already queued or running");
@@ -2063,6 +2108,26 @@ mod tests {
         assert!(output.success);
         assert_eq!(output.stdout, b"done");
         assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn verbose_commands_stream_progress_before_completion() {
+        let (sender, receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            run_verbose_command(
+                "sh",
+                &[
+                    "-c".into(),
+                    "printf 'building now\\n' >&2; sleep 1; printf done".into(),
+                ],
+                &sender,
+            )
+        });
+        match receiver.recv_timeout(Duration::from_millis(500)).unwrap() {
+            JobEvent::Progress(line) => assert_eq!(line, "building now"),
+            JobEvent::Complete(_) => panic!("command completed before progress was observed"),
+        }
+        assert!(worker.join().unwrap().unwrap().success);
     }
 
     #[test]

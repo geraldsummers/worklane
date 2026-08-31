@@ -996,6 +996,10 @@ pub struct OperationJournal {
     pub requested_name: String,
     pub desired_manifest_sha256: String,
     pub desired_manifest: LaneManifest,
+    /// Whether a replacement container should be running after an upgrade.
+    /// Older journals omit this field and retain the historical running behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_was_running: Option<bool>,
     pub updated_at: DateTime<Utc>,
 }
 impl OperationJournal {
@@ -1009,6 +1013,7 @@ impl OperationJournal {
             requested_name: spec.name.clone(),
             desired_manifest_sha256: manifest_sha256(spec)?,
             desired_manifest: LaneManifest::from(spec),
+            runtime_was_running: None,
             updated_at: Utc::now(),
         };
         journal.validate()?;

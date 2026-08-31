@@ -475,6 +475,13 @@ exit 1
         binary,
         &data,
         &bin_dir,
+        &["--json", "lane", "upgrade", "smoke", "--force"]
+    )
+    .contains("\"state\":\"exited\""));
+    assert!(run(
+        binary,
+        &data,
+        &bin_dir,
         &["--json", "lane", "start", "smoke"]
     )
     .contains("running"));

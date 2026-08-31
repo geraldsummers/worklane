@@ -194,9 +194,10 @@ All control commands accept `--json`. `image build` and `image inspect` accept
 by default and accept `--no-cache` explicitly. `lane upgrade --all` builds each
 distinct effective image once per host, then recreates its lanes so their
 immutable root filesystems are fresh. In the TUI, `u` performs a cached upgrade
-of one lane, while `U` performs a fresh `--no-cache` upgrade of all effective
-images and pulls the standard image's base. Custom Containerfiles retain
-control over local-only base images. Run `lane` for the keyboard-first terminal
+of one lane, while `U` performs a cached upgrade of all effective images. Use
+the CLI's explicit `--no-cache` option when a fresh rebuild and base-image pull
+are required. Custom Containerfiles retain control over local-only base images.
+Run `lane` for the keyboard-first terminal
 view. Host operations and bounded state checks run in the background; cached
 state is rendered immediately with its age, navigation remains available, and
 an unreachable host does not hide other lanes. Errors stay attached to the

@@ -786,7 +786,24 @@ fn remove_owned_container<R: Runner>(r: &R, name: &str, spec: &LaneSpec) -> Resu
     podman(r, ["rm", "-f", name])?;
     Ok(())
 }
-fn apply_local_upgrade<R: Runner>(r: &R, spec: &LaneSpec) -> Result<Option<String>> {
+fn stop_owned_container<R: Runner>(r: &R, name: &str, spec: &LaneSpec) -> Result<()> {
+    match container_runtime_state(r, name)?.as_str() {
+        "absent" | "stopped" | "exited" | "created" => Ok(()),
+        "running" | "starting" => {
+            verify_container_owner(r, name, spec)?;
+            podman(r, ["stop", name])?;
+            Ok(())
+        }
+        state => bail!(
+            "container '{name}' is in ambiguous state '{state}'; inspect it before retrying stop"
+        ),
+    }
+}
+fn apply_local_upgrade<R: Runner>(
+    r: &R,
+    spec: &LaneSpec,
+    runtime_was_running: bool,
+) -> Result<Option<String>> {
     let canonical = spec.container_name();
     let staging = format!("{canonical}.next");
     let previous = format!("{canonical}.previous");
@@ -794,24 +811,38 @@ fn apply_local_upgrade<R: Runner>(r: &R, spec: &LaneSpec) -> Result<Option<Strin
     if container_runtime_state(r, &previous)? != "absent" {
         verify_container_owner(r, &previous, spec)?;
         if container_runtime_state(r, &canonical)? == "absent" {
-            bail!(
-                "upgrade stopped after preserving the previous container; run lane reconcile before retrying"
-            )
+            if container_runtime_state(r, &staging)? == "absent" {
+                bail!(
+                    "upgrade has a preserved previous container but no canonical or staged replacement; run lane reconcile"
+                )
+            }
+            verify_container_owner(r, &staging, spec)?;
+            podman(r, ["rename", &staging, &canonical])?;
+        } else {
+            verify_container_owner(r, &canonical, spec)?;
+            remove_owned_container(r, &staging, spec)?;
         }
-        verify_container_owner(r, &canonical, spec)?;
+        if !runtime_was_running {
+            stop_owned_container(r, &canonical, spec)?;
+        }
         return Ok(Some(previous));
     }
 
-    remove_owned_container(r, &staging, spec)?;
-    create_local_container(r, spec, &staging)?;
-    if container_runtime_state(r, &staging)? != "running" {
-        bail!("staged upgrade container did not reach running state")
+    if container_runtime_state(r, &staging)? == "absent" {
+        create_local_container(r, spec, &staging)?;
     }
     verify_container_owner(r, &staging, spec)?;
+    if runtime_was_running {
+        if container_runtime_state(r, &staging)? != "running" {
+            bail!("staged upgrade container did not reach running state")
+        }
+    } else {
+        stop_owned_container(r, &staging, spec)?;
+    }
 
     if container_runtime_state(r, &canonical)? != "absent" {
         verify_container_owner(r, &canonical, spec)?;
-        podman(r, ["stop", &canonical])?;
+        stop_owned_container(r, &canonical, spec)?;
         podman(r, ["rename", &canonical, &previous])?;
     }
     if let Err(error) = podman(r, ["rename", &staging, &canonical]) {
@@ -819,14 +850,44 @@ fn apply_local_upgrade<R: Runner>(r: &R, spec: &LaneSpec) -> Result<Option<Strin
             && container_runtime_state(r, &canonical)? == "absent"
         {
             let _ = podman(r, ["rename", &previous, &canonical]);
-            let _ = podman(r, ["start", &canonical]);
+            if runtime_was_running {
+                let _ = podman(r, ["start", &canonical]);
+            }
         }
         return Err(error);
     }
-    if container_runtime_state(r, &canonical)? != "running" {
-        bail!("upgraded canonical container is not running; run lane reconcile")
+    let expected = if runtime_was_running {
+        "running"
+    } else {
+        "exited"
+    };
+    let actual = container_runtime_state(r, &canonical)?;
+    if runtime_was_running && actual != expected
+        || !runtime_was_running && !matches!(actual.as_str(), "stopped" | "exited" | "created")
+    {
+        bail!("upgraded canonical container is '{actual}', expected {expected}; run lane reconcile")
     }
     Ok((container_runtime_state(r, &previous)? != "absent").then_some(previous))
+}
+fn cleanup_local_upgrade_helpers<R: Runner>(r: &R, spec: &LaneSpec) -> Result<()> {
+    let canonical = spec.container_name();
+    remove_owned_container(r, &format!("{canonical}.next"), spec)?;
+    remove_owned_container(r, &format!("{canonical}.previous"), spec)
+}
+fn finalize_local_upgrade_runtime<R: Runner>(
+    r: &R,
+    spec: &LaneSpec,
+    runtime_was_running: bool,
+) -> Result<()> {
+    let canonical = spec.container_name();
+    if container_runtime_state(r, &canonical)? == "absent" {
+        bail!("upgraded canonical container is absent; run lane reconcile")
+    }
+    verify_container_owner(r, &canonical, spec)?;
+    if !runtime_was_running {
+        stop_owned_container(r, &canonical, spec)?;
+    }
+    cleanup_local_upgrade_helpers(r, spec)
 }
 fn refresh<R: Runner>(runner: &R, store: &Store, spec: &LaneSpec) -> Result<LaneStatus> {
     let (resolved, state, drift, runtime_started_at) = if spec.host == "local" {
@@ -1075,6 +1136,13 @@ fn reconcile_local(
                                 .into(),
                         );
                         return Ok(report);
+                    }
+                    if journal.kind == "upgrade" {
+                        finalize_local_upgrade_runtime(
+                            runner,
+                            &desired,
+                            journal.runtime_was_running.unwrap_or(true),
+                        )?;
                     }
                     write_lane_spec(&desired)?;
                     store.save_lane(&desired, &index.state, index.drift)?;
@@ -2146,6 +2214,11 @@ fn main() -> Result<()> {
                 }
                 LaneAction::Stop { lane } => {
                     let s = store.lane(&lane)?;
+                    let _lock = if s.host == "local" {
+                        Some(lock_lane_operation(&s)?)
+                    } else {
+                        None
+                    };
                     ensure_no_pending_operation(&s, "stop")?;
                     report_phase(
                         Some((&s.id, &s.name)),
@@ -2161,16 +2234,10 @@ fn main() -> Result<()> {
                     )?
                     .is_none()
                     {
-                        match host_runtime_state(&runner, &s)?.as_str() {
-                            "absent" | "stopped" | "exited" => {}
-                            "running" | "starting" => {
-                                podman(&SystemRunner, ["stop", &s.container_name()])?;
-                            }
-                            state => bail!(
-                                "container '{}' is in ambiguous state '{state}'; inspect it before retrying stop",
-                                s.container_name()
-                            ),
-                        }
+                        let canonical = s.container_name();
+                        stop_owned_container(&runner, &canonical, &s)?;
+                        stop_owned_container(&runner, &format!("{canonical}.next"), &s)?;
+                        stop_owned_container(&runner, &format!("{canonical}.previous"), &s)?;
                     };
                     emit(cli.json, &refresh(&runner, &store, &s)?)
                 }
@@ -2292,13 +2359,20 @@ fn main() -> Result<()> {
                                     journal.phase
                                 ),
                                 None => {
+                                    cleanup_local_upgrade_helpers(&r, &s)?;
                                     let build_key = image_build_key(&s)?;
                                     if built_profiles.insert(build_key) {
                                         build_local_image(&r, &s, no_cache)?;
                                     }
                                     s.image_digest =
                                         Some(image_identity(&r, &s.profile.image)?);
-                                    OperationJournal::new(&s, "upgrade", "prepared")?
+                                    let mut journal =
+                                        OperationJournal::new(&s, "upgrade", "prepared")?;
+                                    journal.runtime_was_running = Some(!matches!(
+                                        before.state.as_str(),
+                                        "stopped" | "exited" | "created"
+                                    ));
+                                    journal
                                 }
                             };
                             write_operation_journal(&s, &journal)?;
@@ -2308,15 +2382,16 @@ fn main() -> Result<()> {
                                 "switching-container",
                                 "validating and swapping the staged container",
                             );
-                            let previous = apply_local_upgrade(&runner, &s)?;
-                            journal.phase = "runtime-applied".into();
-                            journal.updated_at = Utc::now();
-                            write_operation_journal(&s, &journal)?;
+                            let runtime_was_running = journal.runtime_was_running.unwrap_or(true);
+                            if journal.phase == "prepared" {
+                                apply_local_upgrade(&runner, &s, runtime_was_running)?;
+                                journal.phase = "runtime-applied".into();
+                                journal.updated_at = Utc::now();
+                                write_operation_journal(&s, &journal)?;
+                            }
                             write_lane_spec(&s)?;
                             out.push(serde_json::to_value(refresh(&runner, &store, &s)?)?);
-                            if let Some(previous) = previous {
-                                remove_owned_container(&runner, &previous, &s)?;
-                            }
+                            finalize_local_upgrade_runtime(&runner, &s, runtime_was_running)?;
                             clear_operation_journal(&s)?;
                         } else {
                             let mut args = vec!["lane".into(), "upgrade".into(), s.id.clone()];
@@ -2496,12 +2571,83 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::sync::Mutex;
 
     struct MockRunner {
         calls: Mutex<Vec<(String, Vec<String>)>>,
     }
     struct RuntimeStateRunner(&'static str);
+
+    struct UpgradeStateRunner {
+        states: Mutex<HashMap<String, String>>,
+        owner: String,
+    }
+    impl UpgradeStateRunner {
+        fn new(spec: &LaneSpec, states: impl IntoIterator<Item = (String, String)>) -> Self {
+            Self {
+                states: Mutex::new(states.into_iter().collect()),
+                owner: format!("{}|{}", spec.id, spec.session_name),
+            }
+        }
+        fn state(&self, name: &str) -> Option<String> {
+            self.states.lock().unwrap().get(name).cloned()
+        }
+    }
+    impl Runner for UpgradeStateRunner {
+        fn run(&self, program: &str, args: &[String]) -> Result<String> {
+            if program != "podman" {
+                return Ok(String::new());
+            }
+            match args.first().map(String::as_str) {
+                Some("inspect") if args.iter().any(|arg| arg.contains("Labels")) => {
+                    Ok(self.owner.clone())
+                }
+                Some("inspect") => Ok(self
+                    .state(args.last().context("inspect target")?)
+                    .context("missing inspected container")?),
+                Some("rename") => {
+                    let mut states = self.states.lock().unwrap();
+                    let state = states.remove(&args[1]).context("rename source")?;
+                    states.insert(args[2].clone(), state);
+                    Ok(String::new())
+                }
+                Some("stop") => {
+                    self.states
+                        .lock()
+                        .unwrap()
+                        .insert(args[1].clone(), "exited".into());
+                    Ok(String::new())
+                }
+                Some("start") => {
+                    self.states
+                        .lock()
+                        .unwrap()
+                        .insert(args[1].clone(), "running".into());
+                    Ok(String::new())
+                }
+                Some("rm") => {
+                    self.states.lock().unwrap().remove(&args[2]);
+                    Ok(String::new())
+                }
+                command => bail!("unexpected podman command {command:?}"),
+            }
+        }
+        fn run_output(&self, program: &str, args: &[String]) -> Result<ProcessOutput> {
+            if program == "podman" && args.first().is_some_and(|arg| arg == "container") {
+                return Ok(ProcessOutput {
+                    code: if self.state(&args[2]).is_some() { 0 } else { 1 },
+                    stdout: String::new(),
+                    stderr: String::new(),
+                });
+            }
+            Ok(ProcessOutput {
+                code: 0,
+                stdout: self.run(program, args)?,
+                stderr: String::new(),
+            })
+        }
+    }
     impl Runner for RuntimeStateRunner {
         fn run(&self, _program: &str, args: &[String]) -> Result<String> {
             if args.first().is_some_and(|arg| arg == "inspect") {
@@ -3237,6 +3383,57 @@ CMD ["sleep", "infinity"]
         assert!(!calls.iter().any(|(_, args)| {
             args.first() == Some(&"run".into()) || args.first() == Some(&"rm".into())
         }));
+    }
+
+    #[test]
+    fn interrupted_upgrade_promotes_staging_and_cleans_helpers() {
+        let lane = spec("local");
+        let canonical = lane.container_name();
+        let staging = format!("{canonical}.next");
+        let previous = format!("{canonical}.previous");
+        let runner = UpgradeStateRunner::new(
+            &lane,
+            [
+                (staging.clone(), "running".into()),
+                (previous.clone(), "exited".into()),
+            ],
+        );
+
+        assert_eq!(
+            apply_local_upgrade(&runner, &lane, true).unwrap(),
+            Some(previous.clone())
+        );
+        assert_eq!(runner.state(&canonical).as_deref(), Some("running"));
+        assert_eq!(runner.state(&staging), None);
+        assert_eq!(runner.state(&previous).as_deref(), Some("exited"));
+
+        finalize_local_upgrade_runtime(&runner, &lane, true).unwrap();
+        assert_eq!(runner.state(&canonical).as_deref(), Some("running"));
+        assert_eq!(runner.state(&previous), None);
+    }
+
+    #[test]
+    fn upgrade_recovery_preserves_stopped_state_and_rejects_missing_replacement() {
+        let lane = spec("local");
+        let canonical = lane.container_name();
+        let previous = format!("{canonical}.previous");
+        let runner = UpgradeStateRunner::new(
+            &lane,
+            [
+                (canonical.clone(), "running".into()),
+                (previous.clone(), "exited".into()),
+            ],
+        );
+        apply_local_upgrade(&runner, &lane, false).unwrap();
+        assert_eq!(runner.state(&canonical).as_deref(), Some("exited"));
+        finalize_local_upgrade_runtime(&runner, &lane, false).unwrap();
+        assert_eq!(runner.state(&previous), None);
+
+        let broken = UpgradeStateRunner::new(&lane, [(previous, "exited".into())]);
+        let error = apply_local_upgrade(&broken, &lane, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no canonical or staged replacement"));
     }
 
     #[test]
