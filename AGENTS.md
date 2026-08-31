@@ -72,6 +72,57 @@ immediately after `herdr` on every command.
   sessions, or restart the Herdr server unless the user requested that lifecycle change and the
   exact target was resolved first. Those operations can disrupt other agents and persistent work.
 
+### Sending keystrokes to a Herdr tab
+
+Herdr sends input to panes, not tabs. Resolve the target tab and then the exact pane within it;
+never assume that a tab has only one pane or that its first pane is the intended recipient.
+
+```sh
+state="$(herdr --session "$LANE" api snapshot)"
+tab_id="$(printf '%s\n' "$state" | jq -r '.result.snapshot.tabs[] | select(.label == "TAB_LABEL") | .tab_id')"
+printf '%s\n' "$state" | jq -r --arg tab "$tab_id" \
+  '.result.snapshot.panes[] | select(.tab_id == $tab) | [.pane_id, (.label // ""), (.agent // "")] | @tsv'
+```
+
+Choose one returned `pane_id`, confirm its contents with `herdr --session "$LANE" pane read
+PANE_ID --source recent-unwrapped --lines 40`, and send logical keys without focusing the tab:
+
+```sh
+herdr --session "$LANE" pane send-keys PANE_ID up up enter
+herdr --session "$LANE" pane send-keys PANE_ID ctrl+c
+herdr --session "$LANE" pane send-keys PANE_ID shift+tab enter
+```
+
+Key names are case-insensitive. Use printable keys such as `a`; special keys such as `enter`,
+`tab`, `esc`, `backspace`, and the arrow names `left`, `right`, `up`, and `down`; modifier chords
+such as `ctrl+h`, `alt+x`, and `shift+tab`; function keys such as `f1`; and named punctuation such
+as `minus`, `plus`, and `backtick`. Each argument is one key event. Prefer `pane run` for a shell
+command, `pane send-text` for literal text without Enter, and `agent prompt` or `agent send-keys`
+when targeting a detected agent by name. Read the pane again after input when confirmation matters.
+
+### Showing images to the human
+
+When the human needs to inspect an image, do not take over an agent's working tab. Create a fresh,
+clearly labeled Herdr workspace and tab for the review, run `timg` in that tab's pane, and focus the
+presentation only when it is ready. For example:
+
+```sh
+image=/absolute/path/to/image.png
+workspace_result="$(herdr --session "$LANE" workspace create --cwd "$PWD" --label "image review" --no-focus)"
+review_workspace="$(printf '%s\n' "$workspace_result" | jq -r '.result.workspace.workspace_id')"
+review_tab="$(printf '%s\n' "$workspace_result" | jq -r '.result.tab.tab_id')"
+review_pane="$(printf '%s\n' "$workspace_result" | jq -r '.result.root_pane.pane_id')"
+quoted_image="$(jq -Rn --arg path "$image" '$path | @sh')"
+herdr --session "$LANE" pane run "$review_pane" "timg -- $quoted_image"
+herdr --session "$LANE" workspace focus "$review_workspace"
+herdr --session "$LANE" tab focus "$review_tab"
+```
+
+Use absolute image paths. A small project-local script may automate the same sequence when images
+must be refreshed repeatedly or shown as a set; keep the dedicated review workspace and tab rather
+than reusing a development pane. `workspace create` creates the workspace's first tab and root pane,
+so use those returned objects instead of creating an extra empty tab.
+
 Run the relevant subcommand with `--help` for its exact arguments. Prefer Worklane-managed
 session lifecycle; do not manually start a second Herdr server for the lane.
 

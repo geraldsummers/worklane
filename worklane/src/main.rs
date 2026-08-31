@@ -2809,6 +2809,8 @@ exit 0
         assert!(EMBEDDED_CONTAINERFILE.contains("install -m 755 /tmp/herdr /usr/local/bin/herdr"));
         assert!(!EMBEDDED_CONTAINERFILE.contains("NOPASSWD:ALL"));
         assert!(EMBEDDED_CONTAINERFILE.contains("ripgrep"));
+        assert!(EMBEDDED_CONTAINERFILE.contains("timg"));
+        assert!(EMBEDDED_CONTAINERFILE.contains("timg --version"));
         assert!(EMBEDDED_CONTAINERFILE.contains("tzdata"));
         assert!(EMBEDDED_CONTAINERFILE.contains("xvfb"));
         assert!(!EMBEDDED_CONTAINERFILE.contains("openjdk-"));
@@ -2818,6 +2820,10 @@ exit 0
         assert!(LANE_AGENTS_MD.contains("$HOME/.sdkman"));
         assert!(LANE_AGENTS_MD.contains("Do not use `/tmp` for anything"));
         assert!(LANE_AGENTS_MD.contains("Herdr is the lane session manager"));
+        assert!(LANE_AGENTS_MD.contains("Showing images to the human"));
+        assert!(LANE_AGENTS_MD.contains("timg -- $quoted_image"));
+        assert!(LANE_AGENTS_MD.contains(".result.tab.tab_id"));
+        assert!(LANE_AGENTS_MD.contains(".result.root_pane.pane_id"));
         assert!(LANE_AGENTS_MD.contains("Agents may delegate concrete, bounded subtasks"));
         assert!(LANE_AGENTS_MD.contains("agent--root--api.md"));
         assert!(LANE_AGENTS_MD.contains("Repository testing cadence"));
