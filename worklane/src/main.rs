@@ -1201,9 +1201,9 @@ else
   herdr --session "$WORKLANE_SESSION" workspace create --cwd "$WORKLANE_WORKSPACE" --label "$WORKLANE_SESSION" --focus
   workspace_id="$(herdr --session "$WORKLANE_SESSION" workspace list | jq -r --arg label "$WORKLANE_SESSION" '.result.workspaces[] | select(.label == $label) | .workspace_id' | head -n 1)"
 fi
-codex_agent="$(herdr --session "$WORKLANE_SESSION" agent list | jq -r --arg workspace "$workspace_id" '.result.agents[]? | select(.workspace_id == $workspace and .agent == "codex") | .terminal_id' | head -n 1)"
-if [ -n "$codex_agent" ]; then
-  herdr --session "$WORKLANE_SESSION" agent focus "$codex_agent"
+codex_pane="$(herdr --session "$WORKLANE_SESSION" agent list | jq -r --arg workspace "$workspace_id" '.result.agents[]? | select(.workspace_id == $workspace and .agent == "codex") | .pane_id' | head -n 1)"
+if [ -n "$codex_pane" ]; then
+  herdr --session "$WORKLANE_SESSION" agent focus "$codex_pane"
 else
   primary_pane="$(herdr --session "$WORKLANE_SESSION" pane list --workspace "$workspace_id" | jq -r '.result.panes[]? | select((.label // "") != "git diff" and (.agent // "") == "") | .pane_id' | head -n 1)"
   [ -n "$primary_pane" ] || {
@@ -1291,7 +1291,7 @@ cat > "$HOME/.local/bin/worklane-show-image" <<'WORKLANE_SHOW_IMAGE'
 {SHOW_IMAGE_SCRIPT}WORKLANE_SHOW_IMAGE
 chmod 755 "$HOME/.local/bin/worklane-show-image"
 mkdir -p "$HOME/.config/herdr"
-herdr_graphics_changed="$(python3 - <<'WORKLANE_HERDR_GRAPHICS_CONFIG'
+herdr_config_changed="$(python3 - <<'WORKLANE_HERDR_CONFIG'
 import os
 from pathlib import Path
 import tempfile
@@ -1300,25 +1300,35 @@ import tomlkit
 
 path = Path.home() / ".config" / "herdr" / "config.toml"
 document = tomlkit.parse(path.read_text()) if path.exists() else tomlkit.document()
+changed = False
 experimental = document.get("experimental")
 if experimental is None:
     experimental = tomlkit.table()
     document["experimental"] = experimental
 elif not hasattr(experimental, "get"):
     raise SystemExit("Herdr config [experimental] must be a table")
-if experimental.get("kitty_graphics") is True:
-    print("no")
-else:
+if experimental.get("kitty_graphics") is not True:
     experimental["kitty_graphics"] = True
+    changed = True
+ui = document.get("ui")
+if ui is None:
+    ui = tomlkit.table()
+    document["ui"] = ui
+elif not hasattr(ui, "get"):
+    raise SystemExit("Herdr config [ui] must be a table")
+if ui.get("window_title") != "{{workspace}}":
+    ui["window_title"] = "{{workspace}}"
+    changed = True
+if changed:
     with tempfile.NamedTemporaryFile("w", dir=path.parent, delete=False) as handle:
         handle.write(tomlkit.dumps(document))
         temporary = handle.name
     os.replace(temporary, path)
-    print("yes")
-WORKLANE_HERDR_GRAPHICS_CONFIG
+print("yes" if changed else "no")
+WORKLANE_HERDR_CONFIG
 )"
 herdr config check >/dev/null
-if [ "$herdr_graphics_changed" = yes ] && [ -n "${{WORKLANE_SESSION:-}}" ] && \
+if [ "$herdr_config_changed" = yes ] && [ -n "${{WORKLANE_SESSION:-}}" ] && \
    herdr --session "$WORKLANE_SESSION" workspace list >/dev/null 2>&1; then
   herdr --session "$WORKLANE_SESSION" server reload-config >/dev/null
 fi
@@ -2759,7 +2769,8 @@ mod tests {
         let script = bootstrap_herdr_script();
         assert!(script.contains("agent list | jq"));
         assert!(script.contains(".agent == \"codex\""));
-        assert!(script.contains("agent focus \"$codex_agent\""));
+        assert!(script.contains("| .pane_id'"));
+        assert!(script.contains("agent focus \"$codex_pane\""));
         assert!(script.contains("pane list --workspace \"$workspace_id\""));
         assert!(script.contains(
             "pane run \"$primary_pane\" \"codex --dangerously-bypass-approvals-and-sandbox\""
@@ -2981,6 +2992,7 @@ exit 0
         assert!(herdr_config.contains("# keep this comment"));
         assert!(herdr_config.contains("scrollback_limit_bytes = 123456"));
         assert!(herdr_config.contains("kitty_graphics = true"));
+        assert!(herdr_config.contains("window_title = \"{workspace}\""));
 
         fs::remove_file(&paplay).unwrap();
         fs::write(&paplay, "#!/bin/sh\nexit 23\n").unwrap();
@@ -2988,6 +3000,12 @@ exit 0
         assert_eq!(fs::read_to_string(&paplay).unwrap(), "#!/bin/sh\nexit 23\n");
         let herdr_config = fs::read_to_string(home.join(".config/herdr/config.toml")).unwrap();
         assert_eq!(herdr_config.matches("kitty_graphics = true").count(), 1);
+        assert_eq!(
+            herdr_config
+                .matches("window_title = \"{workspace}\"")
+                .count(),
+            1
+        );
         fs::remove_dir_all(home).unwrap();
     }
 

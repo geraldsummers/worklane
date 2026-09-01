@@ -56,18 +56,37 @@ immediately after `herdr` on every command.
 - Discover state before acting: use `herdr api snapshot`, `herdr workspace list`,
   `herdr pane list`, and `herdr agent list`. These commands return JSON; select stable IDs from
   their output rather than scraping labels or assuming pane order.
+- Identify where you yourself hail from before interpreting global state. Herdr injects
+  `HERDR_SESSION`, `HERDR_WORKSPACE_ID`, `HERDR_TAB_ID`, and `HERDR_PANE_ID`; record those exact
+  values and match `HERDR_PANE_ID` against `agent list` or the snapshot. Do not use the currently
+  focused pane as a proxy for your identity because another client or agent may hold focus. If the
+  variables are unset, explicitly record that the agent is outside a Herdr pane.
+- At the start of every turn, pair the collaboration claims described below with live Herdr agent
+  state. `herdr --session "$HERDR_SESSION" agent list` reports recognized agents and their
+  `agent_status` (`working`, `blocked`, `idle`, `done`, or `unknown`); the claim files explain what
+  those agents intend to change. Use `.pane_id` as the unambiguous live target when an agent has
+  no name.
+- Treat the two views as complementary rather than interchangeable. A live agent without a claim
+  may still own in-progress work, while a claim without a live agent may be stale. Never delete or
+  rewrite another agent's claim to reconcile them. When ownership or overlap is unclear, inspect
+  the live pane with `herdr agent read PANE_ID --lines 60`, then coordinate with
+  `herdr agent prompt PANE_ID 'TEXT'` before editing the same area.
 - Inspect work without taking focus using `herdr pane read PANE_ID --source recent-unwrapped
   --lines N` or `herdr agent read TARGET`. Use `herdr pane process-info PANE_ID` when ownership
   of a terminal is unclear.
-- Run a command in an existing shell with `herdr pane run PANE_ID 'COMMAND'`. Use
-  `herdr agent send TARGET 'TEXT'` only to deliver literal agent input; it does not mean "run a
-  shell command." Use `herdr pane send-keys` only when an API-level run or send cannot express
-  the required interaction.
+- Run a command in an existing shell with `herdr pane run PANE_ID 'COMMAND'`. To send a message to
+  Codex or another detected agent, use `herdr agent prompt TARGET 'TEXT'`; it submits the text with
+  Enter. `herdr pane send-text PANE_ID 'TEXT'` only types into the terminal and does not press
+  Enter, so follow it with `herdr agent send-keys TARGET enter` or `herdr pane send-keys PANE_ID
+  enter` when submission is intended. Never assume visible typed text was sent. Use raw key input
+  only when the higher-level prompt or run commands cannot express the interaction.
 - Create isolated work with `herdr pane split PANE_ID --direction right|down --cwd PATH
-  --no-focus`, or start a detected agent with `herdr agent start NAME --cwd PATH --no-focus --
-  COMMAND [ARG ...]`. Re-list state after creation and retain the returned ID.
-- Observe completion with `herdr agent wait TARGET --status idle|blocked --timeout MS`, then read
-  the agent or pane output. Use bounded timeouts and report timeouts as inconclusive, not success.
+  --no-focus`, or start a detected agent in an available shell pane with `herdr agent start NAME
+  --kind KIND --pane PANE_ID -- [ARG ...]`. Re-list state after creation and retain the returned
+  IDs.
+- Observe completion with `herdr agent wait TARGET --until idle --until blocked --timeout MS`, then
+  read the agent or pane output. Use bounded timeouts and report timeouts as inconclusive, not
+  success.
 - Do not focus panes merely to inspect them. Do not close panes or workspaces, stop/delete
   sessions, or restart the Herdr server unless the user requested that lifecycle change and the
   exact target was resolved first. Those operations can disrupt other agents and persistent work.
@@ -161,10 +180,13 @@ unbounded background `codex exec` processes or per-process immediate retry loops
   Markdown claim per agent named `agent--<id>.md`, where the canonical agent ID
   loses its leading `/` and every remaining `/` becomes `--`. For example,
   `/root/api` uses `agent--root--api.md`.
-- Read all claims at the start of every turn and immediately before editing.
-  Each agent updates and removes only its own file. Record the agent ID,
-  files/area, status, and an updated UTC timestamp. Treat claims as advisory
-  soft locks and coordinate before overlapping.
+- Read all claims at the start of every turn and immediately before editing, and correlate them
+  with `herdr agent list` as described above so both declared ownership and current activity inform
+  coordination.
+  Each agent updates and removes only its own file. Record the agent ID; files/area; status; exact
+  Herdr session, workspace, tab, and pane IDs from the injected environment; and an updated UTC
+  timestamp. If the agent is outside Herdr, record that instead of inventing IDs. Treat claims as
+  advisory soft locks and coordinate before overlapping.
 - Follow the repository testing cadence below before pushing. Do not push while
   a required local check fails.
 
