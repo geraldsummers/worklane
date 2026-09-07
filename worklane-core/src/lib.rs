@@ -884,7 +884,12 @@ pub fn host_state(r: &impl Runner, spec: &LaneSpec) -> Result<(String, bool)> {
     let name = spec.container_name();
     let state = host_runtime_state(r, spec)?;
     let drift = !matches!(state.as_str(), "absent")
-        && has_meaningful_drift(&podman(r, ["diff", &name])?, &spec.container_home());
+        && !meaningful_drift_lines_for_profile(
+            &podman(r, ["diff", &name])?,
+            &spec.container_home(),
+            &spec.profile,
+        )
+        .is_empty();
     Ok((state, drift))
 }
 pub fn host_runtime_state(r: &impl Runner, spec: &LaneSpec) -> Result<String> {
@@ -948,6 +953,20 @@ pub fn has_meaningful_drift(diff: &str, container_home: &Path) -> bool {
     !meaningful_drift_lines(diff, container_home).is_empty()
 }
 pub fn meaningful_drift_lines(diff: &str, container_home: &Path) -> Vec<String> {
+    meaningful_drift_lines_with_devices(diff, container_home, false)
+}
+fn meaningful_drift_lines_for_profile(
+    diff: &str,
+    container_home: &Path,
+    profile: &Profile,
+) -> Vec<String> {
+    meaningful_drift_lines_with_devices(diff, container_home, !profile.devices.is_empty())
+}
+fn meaningful_drift_lines_with_devices(
+    diff: &str,
+    container_home: &Path,
+    has_cdi_devices: bool,
+) -> Vec<String> {
     let mounted_home = container_home.display().to_string();
     let mounted_home_contents = format!("{mounted_home}/");
     diff.lines()
@@ -962,11 +981,47 @@ pub fn meaningful_drift_lines(diff: &str, container_home: &Path) -> Vec<String> 
                 .any(|tmp| path == *tmp || path.starts_with(&format!("{tmp}/")));
             let mounted_home_change =
                 path == mounted_home || path.starts_with(&mounted_home_contents);
+            let cdi_runtime_change = has_cdi_devices
+                && ([
+                    "/etc/ld.so.cache",
+                    "/etc/ld.so.conf.d",
+                    "/etc/nvidia",
+                    "/etc/vulkan",
+                    "/usr",
+                    "/usr/bin",
+                    "/usr/lib",
+                    "/usr/lib/firmware",
+                    "/usr/lib/x86_64-linux-gnu",
+                    "/usr/lib/xorg",
+                    "/usr/lib/xorg/modules",
+                    "/usr/lib/xorg/modules/drivers",
+                    "/usr/share",
+                    "/usr/share/X11",
+                    "/usr/share/X11/xorg.conf.d",
+                    "/usr/share/egl",
+                    "/usr/share/egl/egl_external_platform.d",
+                    "/usr/share/glvnd",
+                    "/usr/share/glvnd/egl_vendor.d",
+                    "/var/cache/ldconfig",
+                ]
+                .contains(&path)
+                    || path.starts_with("/etc/ld.so.conf.d/")
+                    || path.starts_with("/etc/nvidia/")
+                    || path.starts_with("/etc/vulkan/")
+                    || path.starts_with("/usr/bin/nvidia-")
+                    || path.starts_with("/usr/lib/firmware/nvidia/")
+                    || path.starts_with("/usr/lib/x86_64-linux-gnu/libnvidia-")
+                    || path.starts_with("/usr/lib/x86_64-linux-gnu/nvidia/")
+                    || path.starts_with("/usr/lib/xorg/modules/drivers/nvidia_")
+                    || path.starts_with("/usr/share/X11/xorg.conf.d/nvidia-")
+                    || path.starts_with("/usr/share/egl/")
+                    || path.starts_with("/usr/share/glvnd/"));
             !matches!(
                 *line,
                 "C /etc" | "C /etc/passwd" | "C /etc/group" | "C /home"
             ) && !mounted_home_change
                 && !transient_tmp
+                && !cdi_runtime_change
         })
         .map(str::to_owned)
         .collect()
@@ -1532,6 +1587,26 @@ mod tests {
             ),
             Vec::<String>::new()
         );
+    }
+
+    #[test]
+    fn cdi_runtime_injection_is_not_drift_but_other_root_changes_are() {
+        let home = Path::new("/home/dev");
+        let profile = Profile {
+            devices: vec!["nvidia.com/gpu=all".into()],
+            ..Profile::default()
+        };
+        let injected = "C /etc/ld.so.cache\nC /usr\nC /usr/bin\nA /usr/bin/nvidia-smi\nC /usr/lib\nA /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1\nC /usr/share\nA /usr/share/glvnd/egl_vendor.d/10_nvidia.json\n";
+        assert!(meaningful_drift_lines_for_profile(injected, home, &profile).is_empty());
+        assert_eq!(
+            meaningful_drift_lines_for_profile(
+                &format!("{injected}A /opt/unexpected.txt\n"),
+                home,
+                &profile,
+            ),
+            ["A /opt/unexpected.txt"]
+        );
+        assert!(has_meaningful_drift(injected, home));
     }
 
     #[test]
