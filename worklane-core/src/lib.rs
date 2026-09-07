@@ -884,12 +884,7 @@ pub fn host_state(r: &impl Runner, spec: &LaneSpec) -> Result<(String, bool)> {
     let name = spec.container_name();
     let state = host_runtime_state(r, spec)?;
     let drift = !matches!(state.as_str(), "absent")
-        && !meaningful_drift_lines_for_profile(
-            &podman(r, ["diff", &name])?,
-            &spec.container_home(),
-            &spec.profile,
-        )
-        .is_empty();
+        && !meaningful_drift_lines(&podman(r, ["diff", &name])?, &spec.container_home()).is_empty();
     Ok((state, drift))
 }
 pub fn host_runtime_state(r: &impl Runner, spec: &LaneSpec) -> Result<String> {
@@ -953,14 +948,7 @@ pub fn has_meaningful_drift(diff: &str, container_home: &Path) -> bool {
     !meaningful_drift_lines(diff, container_home).is_empty()
 }
 pub fn meaningful_drift_lines(diff: &str, container_home: &Path) -> Vec<String> {
-    meaningful_drift_lines_with_devices(diff, container_home, false)
-}
-fn meaningful_drift_lines_for_profile(
-    diff: &str,
-    container_home: &Path,
-    profile: &Profile,
-) -> Vec<String> {
-    meaningful_drift_lines_with_devices(diff, container_home, !profile.devices.is_empty())
+    meaningful_drift_lines_with_devices(diff, container_home, true)
 }
 fn meaningful_drift_lines_with_devices(
     diff: &str,
@@ -1593,21 +1581,13 @@ mod tests {
     #[test]
     fn cdi_runtime_injection_is_not_drift_but_other_root_changes_are() {
         let home = Path::new("/home/dev");
-        let profile = Profile {
-            devices: vec!["nvidia.com/gpu=all".into()],
-            ..Profile::default()
-        };
         let injected = "C /etc/ld.so.cache\nC /usr\nC /usr/bin\nA /usr/bin/nvidia-smi\nC /usr/lib\nA /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1\nC /usr/share\nA /usr/share/glvnd/egl_vendor.d/10_nvidia.json\nC /var/cache/ldconfig\nC /var/cache/ldconfig/aux-cache\n";
-        assert!(meaningful_drift_lines_for_profile(injected, home, &profile).is_empty());
+        assert!(meaningful_drift_lines(injected, home).is_empty());
         assert_eq!(
-            meaningful_drift_lines_for_profile(
-                &format!("{injected}A /opt/unexpected.txt\n"),
-                home,
-                &profile,
-            ),
+            meaningful_drift_lines(&format!("{injected}A /opt/unexpected.txt\n"), home),
             ["A /opt/unexpected.txt"]
         );
-        assert!(has_meaningful_drift(injected, home));
+        assert!(!has_meaningful_drift(injected, home));
     }
 
     #[test]
