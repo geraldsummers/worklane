@@ -45,6 +45,9 @@ pub struct Profile {
     pub network: String,
     #[serde(default)]
     pub mounts: Vec<MountSpec>,
+    /// CDI-qualified devices exposed to the lane by Podman.
+    #[serde(default)]
+    pub devices: Vec<String>,
     /// Bind the owning host's Codex auth file into the lane at its standard path.
     #[serde(default = "default_mount_credentials")]
     pub mount_codex_credentials: bool,
@@ -110,6 +113,7 @@ impl Default for Profile {
             embedded_containerfile: default_embedded_containerfile(),
             network: default_network(),
             mounts: vec![],
+            devices: vec![],
             mount_codex_credentials: default_mount_credentials(),
             mount_gh_credentials: default_mount_credentials(),
         }
@@ -134,6 +138,16 @@ pub fn load_profiles() -> Result<BTreeMap<String, Profile>> {
 pub fn validate_profile(profile: &Profile, home: &Path, require_sources: bool) -> Result<()> {
     if !matches!(profile.network.as_str(), "outbound" | "none") {
         bail!("profile network must be 'outbound' or 'none'")
+    }
+    for (index, device) in profile.devices.iter().enumerate() {
+        if !is_cdi_device_name(device) {
+            bail!(
+                "profile device must be a CDI qualified name such as 'nvidia.com/gpu=all': {device}"
+            )
+        }
+        if profile.devices[..index].contains(device) {
+            bail!("profile devices must not contain duplicates: {device}")
+        }
     }
     for (index, mount) in profile.mounts.iter().enumerate() {
         if !mount.source.is_absolute() || !mount.target.is_absolute() {
@@ -172,6 +186,29 @@ pub fn validate_profile(profile: &Profile, home: &Path, require_sources: bool) -
         }
     }
     Ok(())
+}
+
+fn is_cdi_device_name(value: &str) -> bool {
+    let Some((kind, name)) = value.split_once('=') else {
+        return false;
+    };
+    let Some((vendor, class)) = kind.split_once('/') else {
+        return false;
+    };
+    !vendor.is_empty()
+        && vendor.contains('.')
+        && vendor
+            .split('.')
+            .all(|part| is_cdi_component(part) && !part.starts_with('-') && !part.ends_with('-'))
+        && is_cdi_component(class)
+        && is_cdi_component(name)
+}
+
+fn is_cdi_component(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1282,6 +1319,7 @@ mod tests {
         .unwrap();
         let mut spec = spec;
         spec.profile.network = "none".into();
+        spec.profile.devices.push("nvidia.com/gpu=all".into());
         spec.profile.mounts.push(MountSpec {
             source: PathBuf::from("/tmp/cache"),
             target: PathBuf::from("/opt/cache"),
@@ -1393,6 +1431,32 @@ mod tests {
         assert!(profile.build_context.is_none());
         assert!(profile.mount_codex_credentials);
         assert!(profile.mount_gh_credentials);
+        assert!(profile.devices.is_empty());
+    }
+
+    #[test]
+    fn profiles_validate_cdi_devices() {
+        let mut profile = Profile {
+            devices: vec!["nvidia.com/gpu=all".into()],
+            ..Profile::default()
+        };
+        assert!(validate_profile(&profile, Path::new("/home/dev"), false).is_ok());
+
+        for invalid in [
+            "",
+            "all",
+            "gpu=all",
+            "nvidia/gpu=all",
+            "nvidia.com/gpu",
+            "nvidia.com/gpu=",
+            "nvidia.com/gpu=all other",
+        ] {
+            profile.devices = vec![invalid.into()];
+            assert!(validate_profile(&profile, Path::new("/home/dev"), false).is_err());
+        }
+
+        profile.devices = vec!["nvidia.com/gpu=all".into(), "nvidia.com/gpu=all".into()];
+        assert!(validate_profile(&profile, Path::new("/home/dev"), false).is_err());
     }
 
     #[test]

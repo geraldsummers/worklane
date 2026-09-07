@@ -730,6 +730,7 @@ fn create_local_container<R: Runner>(r: &R, spec: &LaneSpec, name: &str) -> Resu
             ),
         ]);
     }
+    append_profile_devices(&mut a, &spec.profile);
     if spec.profile.network == "outbound" {
         a.extend(["--network".into(), "slirp4netns".into()]);
     } else if spec.profile.network == "none" {
@@ -743,6 +744,11 @@ fn create_local_container<R: Runner>(r: &R, spec: &LaneSpec, name: &str) -> Resu
     a.extend(["sleep".into(), "infinity".into()]);
     podman(r, a)?;
     Ok(())
+}
+fn append_profile_devices(args: &mut Vec<String>, profile: &Profile) {
+    for device in &profile.devices {
+        args.extend(["--device".into(), device.clone()]);
+    }
 }
 fn ensure_local_started<R: Runner>(r: &R, spec: &LaneSpec) -> Result<()> {
     match host_runtime_state(r, spec)?.as_str() {
@@ -3578,6 +3584,34 @@ CMD ["sleep", "infinity"]
             })
             .unwrap();
         assert_eq!(build.1.last().unwrap(), "/var/tmp/moved-lane");
+    }
+
+    #[test]
+    fn profile_devices_are_forwarded_as_separate_podman_arguments() {
+        let mut profile = Profile {
+            devices: vec![
+                "nvidia.com/gpu=all".into(),
+                "vendor.example/fpga=board-0".into(),
+            ],
+            ..Profile::default()
+        };
+        let mut args = vec!["run".into()];
+        append_profile_devices(&mut args, &profile);
+        assert_eq!(
+            args,
+            [
+                "run",
+                "--device",
+                "nvidia.com/gpu=all",
+                "--device",
+                "vendor.example/fpga=board-0"
+            ]
+        );
+
+        profile.devices.clear();
+        let mut legacy_args = vec!["run".into()];
+        append_profile_devices(&mut legacy_args, &profile);
+        assert_eq!(legacy_args, ["run"]);
     }
 
     struct FailingRunner;

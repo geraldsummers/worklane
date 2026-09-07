@@ -234,6 +234,7 @@ moved or imported; an explicit path remains fixed.
 [profiles.docs]
 image = "worklane:latest"
 network = "outbound"
+devices = ["nvidia.com/gpu=all"]
 mount_codex_credentials = true
 mount_gh_credentials = true
 
@@ -245,4 +246,8 @@ read_only = false
 
 Create with `worklane lane create docs --profile docs`. Mount sources and
 targets must be absolute. Targets may live below `/home/dev`, but they may not
-replace `/home/dev`, contain it, or overlap another custom target.
+replace `/home/dev`, contain it, or overlap another custom target. `devices`
+contains CDI qualified device names; Worklane passes each entry to Podman as a
+separate `--device` argument. For example, `nvidia.com/gpu=all` exposes every
+GPU described by the host's NVIDIA CDI configuration. The host must already
+provide the named CDI devices and grant the lane-owning account access to them.
