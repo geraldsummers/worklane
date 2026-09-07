@@ -1015,7 +1015,8 @@ fn meaningful_drift_lines_with_devices(
                     || path.starts_with("/usr/lib/xorg/modules/drivers/nvidia_")
                     || path.starts_with("/usr/share/X11/xorg.conf.d/nvidia-")
                     || path.starts_with("/usr/share/egl/")
-                    || path.starts_with("/usr/share/glvnd/"));
+                    || path.starts_with("/usr/share/glvnd/")
+                    || path.starts_with("/var/cache/ldconfig/"));
             !matches!(
                 *line,
                 "C /etc" | "C /etc/passwd" | "C /etc/group" | "C /home"
@@ -1596,7 +1597,7 @@ mod tests {
             devices: vec!["nvidia.com/gpu=all".into()],
             ..Profile::default()
         };
-        let injected = "C /etc/ld.so.cache\nC /usr\nC /usr/bin\nA /usr/bin/nvidia-smi\nC /usr/lib\nA /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1\nC /usr/share\nA /usr/share/glvnd/egl_vendor.d/10_nvidia.json\n";
+        let injected = "C /etc/ld.so.cache\nC /usr\nC /usr/bin\nA /usr/bin/nvidia-smi\nC /usr/lib\nA /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1\nC /usr/share\nA /usr/share/glvnd/egl_vendor.d/10_nvidia.json\nC /var/cache/ldconfig\nC /var/cache/ldconfig/aux-cache\n";
         assert!(meaningful_drift_lines_for_profile(injected, home, &profile).is_empty());
         assert_eq!(
             meaningful_drift_lines_for_profile(
