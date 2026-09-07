@@ -979,7 +979,9 @@ fn meaningful_drift_lines_with_devices(
                     "/usr/bin",
                     "/usr/lib",
                     "/usr/lib/firmware",
+                    "/usr/lib/firmware/nvidia",
                     "/usr/lib/x86_64-linux-gnu",
+                    "/usr/lib/x86_64-linux-gnu/nvidia",
                     "/usr/lib/xorg",
                     "/usr/lib/xorg/modules",
                     "/usr/lib/xorg/modules/drivers",
@@ -1581,7 +1583,7 @@ mod tests {
     #[test]
     fn cdi_runtime_injection_is_not_drift_but_other_root_changes_are() {
         let home = Path::new("/home/dev");
-        let injected = "C /etc/ld.so.cache\nC /usr\nC /usr/bin\nA /usr/bin/nvidia-smi\nC /usr/lib\nA /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1\nC /usr/share\nA /usr/share/glvnd/egl_vendor.d/10_nvidia.json\nC /var/cache/ldconfig\nC /var/cache/ldconfig/aux-cache\n";
+        let injected = "C /etc/ld.so.cache\nC /usr\nC /usr/bin\nA /usr/bin/nvidia-smi\nC /usr/lib\nA /usr/lib/firmware/nvidia\nA /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1\nA /usr/lib/x86_64-linux-gnu/nvidia\nC /usr/share\nA /usr/share/glvnd/egl_vendor.d/10_nvidia.json\nC /var/cache/ldconfig\nC /var/cache/ldconfig/aux-cache\n";
         assert!(meaningful_drift_lines(injected, home).is_empty());
         assert_eq!(
             meaningful_drift_lines(&format!("{injected}A /opt/unexpected.txt\n"), home),
