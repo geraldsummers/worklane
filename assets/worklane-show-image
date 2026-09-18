@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+"""Present an image in a dedicated Herdr workspace using native pane graphics."""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import math
+import os
+from pathlib import Path
+import socket
+import struct
+import subprocess
+import sys
+from typing import Any
+
+
+class ShowImageError(RuntimeError):
+    pass
+
+
+def run_herdr(session: str, *args: str) -> dict[str, Any]:
+    command = ["herdr", "--session", session, *args]
+    try:
+        completed = subprocess.run(command, check=False, capture_output=True, text=True)
+    except FileNotFoundError as error:
+        raise ShowImageError("herdr is not installed or is not on PATH") from error
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip() or "unknown error"
+        raise ShowImageError(f"{' '.join(command)} failed: {detail}")
+    try:
+        return json.loads(completed.stdout)
+    except json.JSONDecodeError as error:
+        raise ShowImageError(f"herdr returned invalid JSON for {' '.join(args)}") from error
+
+
+def api_call(socket_path: Path, method: str, params: dict[str, Any]) -> dict[str, Any]:
+    request_id = f"worklane-show-image-{os.getpid()}"
+    request = json.dumps({"id": request_id, "method": method, "params": params}) + "\n"
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(10)
+            connection.connect(str(socket_path))
+            connection.sendall(request.encode())
+            response_line = connection.makefile("rb").readline()
+    except (OSError, TimeoutError) as error:
+        raise ShowImageError(f"cannot reach Herdr API socket {socket_path}: {error}") from error
+    if not response_line:
+        raise ShowImageError(f"Herdr closed {socket_path} without replying to {method}")
+    try:
+        response = json.loads(response_line)
+    except json.JSONDecodeError as error:
+        raise ShowImageError(f"Herdr returned invalid JSON for {method}") from error
+    if "error" in response:
+        error = response["error"]
+        code = error.get("code", "api_error")
+        message = error.get("message", "unknown Herdr API error")
+        hint = ""
+        if code in {"feature_disabled", "cell_size_unavailable", "not_implemented"}:
+            hint = (
+                "; native image review requires experimental.kitty_graphics=true "
+                "and a connected Ghostty frontend"
+            )
+        raise ShowImageError(f"Herdr {method} failed ({code}): {message}{hint}")
+    return response.get("result", {})
+
+
+def png_dimensions(data: bytes) -> tuple[int, int]:
+    if len(data) < 24 or data[:8] != b"\x89PNG\r\n\x1a\n" or data[12:16] != b"IHDR":
+        raise ShowImageError("image conversion did not produce a valid PNG")
+    width, height = struct.unpack(">II", data[16:24])
+    if width == 0 or height == 0:
+        raise ShowImageError("image dimensions must be non-zero")
+    return width, height
+
+
+def load_png(path: Path) -> tuple[bytes, int, int]:
+    try:
+        source = path.read_bytes()
+    except OSError as error:
+        raise ShowImageError(f"cannot read image {path}: {error}") from error
+    if source.startswith(b"\x89PNG\r\n\x1a\n"):
+        width, height = png_dimensions(source)
+        return source, width, height
+    try:
+        converted = subprocess.run(
+            ["gm", "convert", str(path), "png:-"], check=False, capture_output=True
+        )
+    except FileNotFoundError as error:
+        raise ShowImageError(
+            "GraphicsMagick is required to display non-PNG images (missing gm)"
+        ) from error
+    if converted.returncode != 0:
+        detail = converted.stderr.decode(errors="replace").strip() or "unsupported image"
+        raise ShowImageError(f"cannot convert {path} to PNG: {detail}")
+    width, height = png_dimensions(converted.stdout)
+    return converted.stdout, width, height
+
+
+def placement(
+    image_width: int,
+    image_height: int,
+    pane_cols: int,
+    pane_rows: int,
+    cell_width: int,
+    cell_height: int,
+) -> dict[str, int]:
+    if min(pane_cols, pane_rows, cell_width, cell_height) <= 0:
+        raise ShowImageError("Herdr reported unusable pane or terminal-cell dimensions")
+    scale = min(
+        1.0,
+        (pane_cols * cell_width) / image_width,
+        (pane_rows * cell_height) / image_height,
+    )
+    grid_cols = min(pane_cols, max(1, math.ceil(image_width * scale / cell_width)))
+    grid_rows = min(pane_rows, max(1, math.ceil(image_height * scale / cell_height)))
+    return {
+        "viewport_col": (pane_cols - grid_cols) // 2,
+        "viewport_row": (pane_rows - grid_rows) // 2,
+        "grid_cols": grid_cols,
+        "grid_rows": grid_rows,
+    }
+
+
+def socket_for_session(session: str, explicit_session: bool) -> Path:
+    inherited = os.environ.get("HERDR_SOCKET_PATH", "").strip()
+    inherited_session = os.environ.get("HERDR_SESSION", "").strip()
+    if inherited and (not explicit_session or not inherited_session or inherited_session == session):
+        return Path(inherited)
+    config_home = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    return config_home / "herdr" / "sessions" / session / "herdr.sock"
+
+
+def parse_create(response: dict[str, Any]) -> tuple[str, str, str]:
+    try:
+        result = response["result"]
+        return (
+            result["workspace"]["workspace_id"],
+            result["tab"]["tab_id"],
+            result["root_pane"]["pane_id"],
+        )
+    except (KeyError, TypeError) as error:
+        raise ShowImageError("Herdr workspace create response omitted workspace, tab, or pane IDs") from error
+
+
+def parse_layout(response: dict[str, Any], pane_id: str) -> tuple[int, int]:
+    try:
+        layout = response["result"]["layout"]
+        pane = next(item for item in layout["panes"] if item["pane_id"] == pane_id)
+        return int(pane["rect"]["width"]), int(pane["rect"]["height"])
+    except (KeyError, TypeError, StopIteration, ValueError) as error:
+        raise ShowImageError("Herdr pane layout response omitted the review pane dimensions") from error
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Show an image in a new Herdr workspace using Ghostty-native graphics"
+    )
+    parser.add_argument("--session", help="Herdr session (defaults to the current Worklane session)")
+    parser.add_argument("--label", default="image review", help="review workspace label")
+    parser.add_argument("image", help="image file to display")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    explicit_session = args.session is not None
+    session = args.session or os.environ.get("WORKLANE_SESSION") or os.environ.get("HERDR_SESSION")
+    if not session:
+        raise ShowImageError("no Herdr session; pass --session NAME or run inside a Worklane pane")
+    image_path = Path(args.image).expanduser().resolve()
+    if not image_path.is_file():
+        raise ShowImageError(f"image is not a regular file: {image_path}")
+    png, image_width, image_height = load_png(image_path)
+    socket_path = socket_for_session(session, explicit_session)
+    created = run_herdr(
+        session,
+        "workspace",
+        "create",
+        "--cwd",
+        str(image_path.parent),
+        "--label",
+        args.label,
+        "--no-focus",
+    )
+    workspace_id, tab_id, pane_id = parse_create(created)
+    try:
+        info = api_call(socket_path, "pane.graphics.info", {"pane_id": pane_id})
+        layout_response = run_herdr(session, "pane", "layout", "--pane", pane_id)
+        pane_cols, pane_rows = parse_layout(layout_response, pane_id)
+        target = placement(
+            image_width,
+            image_height,
+            pane_cols,
+            pane_rows,
+            int(info["cell_width_px"]),
+            int(info["cell_height_px"]),
+        )
+        api_call(
+            socket_path,
+            "pane.graphics.set",
+            {
+                "pane_id": pane_id,
+                "format": "png",
+                "data_base64": base64.b64encode(png).decode("ascii"),
+                "image_width": image_width,
+                "image_height": image_height,
+                "placement": target,
+            },
+        )
+        run_herdr(session, "workspace", "focus", workspace_id)
+        run_herdr(session, "tab", "focus", tab_id)
+    except (KeyError, TypeError, ValueError) as error:
+        run_herdr(session, "workspace", "close", workspace_id)
+        raise ShowImageError(f"Herdr graphics response is missing required dimensions: {error}") from error
+    except Exception:
+        try:
+            run_herdr(session, "workspace", "close", workspace_id)
+        except ShowImageError:
+            pass
+        raise
+    print(f"showing {image_path} in Herdr workspace {workspace_id} (Ghostty native graphics)")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except ShowImageError as error:
+        print(f"worklane-show-image: {error}", file=sys.stderr)
+        raise SystemExit(1)

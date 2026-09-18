@@ -9,4 +9,5 @@ chrono.workspace = true
 crossterm.workspace = true
 ratatui.workspace = true
 serde_json.workspace = true
+signal-hook.workspace = true
 worklane-core = { path = "../worklane-core" }

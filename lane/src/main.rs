@@ -1,7 +1,12 @@
 use anyhow::{Context, Result};
 use crossterm::{
-    event::{self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, Event, KeyCode},
+    cursor::Show,
+    event::{
+        self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, Event, KeyCode,
+        KeyEvent, KeyModifiers, PopKeyboardEnhancementFlags,
+    },
     execute,
+    style::{Attribute, ResetColor, SetAttribute},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
@@ -11,14 +16,25 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Paragraph},
     Terminal,
 };
+use signal_hook::{
+    consts::{SIGHUP, SIGINT, SIGTERM},
+    iterator::Signals,
+};
 use std::{
     collections::{HashMap, VecDeque},
-    io::{self, BufRead, BufReader, Read, Write},
+    fs::{self, OpenOptions},
+    io::{self, IsTerminal, Read, Write},
+    path::PathBuf,
     process::{Command, Stdio},
-    sync::mpsc::{self, Receiver, Sender, TryRecvError},
-    time::{Duration, Instant},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, Sender, TryRecvError},
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use worklane_core::{LaneStatus, Store};
+
+static FORCE_FULL_REDRAW: AtomicBool = AtomicBool::new(false);
 
 struct App {
     lanes: Vec<LaneStatus>,
@@ -94,6 +110,11 @@ enum UiAction {
     Reload,
     EditContainerfile,
     Reconcile(bool),
+}
+#[derive(Debug, PartialEq, Eq)]
+enum RunExit {
+    Quit,
+    Signal(i32),
 }
 impl App {
     fn load() -> Result<Self> {
@@ -345,8 +366,32 @@ fn restore_selection(app: &mut App, selected_id: Option<&str>) {
 }
 fn replace_lanes(app: &mut App, lanes: Vec<LaneStatus>) {
     let selected_id = selected_lane_id(app);
+    let mut lanes = lanes;
+    for lane in &mut lanes {
+        if lane.state == "running" && lane.runtime_started_at.is_none() {
+            lane.runtime_started_at = app
+                .lanes
+                .iter()
+                .find(|existing| existing.spec.id == lane.spec.id)
+                .and_then(|existing| existing.runtime_started_at);
+        }
+    }
     app.lanes = lanes;
     restore_selection(app, selected_id.as_deref());
+}
+fn sync_registered_lanes(app: &mut App) -> Result<bool> {
+    let lanes = load_registered_lanes()?;
+    let old_ids = app
+        .lanes
+        .iter()
+        .map(|lane| lane.spec.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let changed = lanes.len() != app.lanes.len()
+        || lanes
+            .iter()
+            .any(|lane| !old_ids.contains(lane.spec.id.as_str()));
+    replace_lanes(app, lanes);
+    Ok(changed)
 }
 fn invalidate_lane_refresh(app: &mut App, lane_id: &str) {
     app.next_refresh_generation += 1;
@@ -363,12 +408,12 @@ fn upgrade_detail(output: &[u8]) -> Result<String> {
     if values.is_empty() {
         return Ok("No lanes were selected for upgrade.".into());
     }
-    Ok(values
+    let outcomes = values
         .iter()
         .map(|value| {
             let lane = value["spec"]["name"]
                 .as_str()
-                .or_else(|| value["lane"].as_str())
+                .or_else(|| value["lane_name"].as_str())
                 .unwrap_or("unknown lane");
             if let Some(outcome) = value["outcome"].as_str() {
                 format!("{lane}: {outcome}")
@@ -384,8 +429,13 @@ fn upgrade_detail(output: &[u8]) -> Result<String> {
                 )
             }
         })
-        .collect::<Vec<_>>()
-        .join("\n"))
+        .collect::<Vec<_>>();
+    Ok(format!(
+        "Upgrade finished for {} lane{}.\n{}\nPersistent home and project data were preserved.",
+        outcomes.len(),
+        if outcomes.len() == 1 { "" } else { "s" },
+        outcomes.join("\n")
+    ))
 }
 fn inspect_detail(output: &[u8]) -> Result<String> {
     let value: serde_json::Value = serde_json::from_slice(output)?;
@@ -542,8 +592,18 @@ fn start_job(app: &mut App, verb: &str, extra: &[String], all: bool) -> Result<(
         verb: verb.into(),
         args,
     });
-    app.message = format!("{label}: queued");
-    app.detail = format!("{label}: queued");
+    app.message = if verb == "upgrade" {
+        format!("{label}: queued — preparing image rebuild")
+    } else {
+        format!("{label}: queued")
+    };
+    app.detail = if verb == "upgrade" {
+        format!(
+            "{label}: queued\nNext: rebuild the image, recreate the container, restore its prior running/stopped state, then report each lane outcome.\nPersistent home and project data will be preserved."
+        )
+    } else {
+        format!("{label}: queued")
+    };
     start_queued_jobs(app);
     Ok(())
 }
@@ -569,6 +629,7 @@ fn start_queued_jobs(app: &mut App) {
         };
         let worker_label = request.label.clone();
         let worker_verb = request.verb.clone();
+        let is_upgrade = request.verb == "upgrade";
         let args = request.args;
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
@@ -602,14 +663,57 @@ fn start_queued_jobs(app: &mut App) {
             receiver,
         });
         app.message = format!("{}: running", request.label);
-        app.detail = format!("{}: starting", request.label);
+        app.detail = if is_upgrade {
+            format!(
+                "{}: starting\nRebuilding the image, recreating the container, and restoring its prior running/stopped state.\nStandard images use a fresh build so bundled tools such as Codex are updated. Persistent home and project data are preserved.",
+                request.label
+            )
+        } else {
+            format!("{}: starting", request.label)
+        };
     }
 }
 fn start_upgrade(app: &mut App, all: bool) -> Result<()> {
     if all {
-        start_job(app, "upgrade", &["--no-cache".into()], true)
+        start_job(app, "upgrade", &[], true)
     } else {
         start_job(app, "upgrade", &[], false)
+    }
+}
+fn send_progress_line(sender: &mpsc::Sender<JobEvent>, line: &[u8]) {
+    let line = String::from_utf8_lossy(line);
+    let display = serde_json::from_str::<worklane_core::OperationEvent>(&line).map_or_else(
+        |_| line.into_owned(),
+        |event| {
+            let subject = event
+                .lane_name
+                .as_deref()
+                .map(|name| format!("{name}: "))
+                .unwrap_or_default();
+            format!(
+                "{}{:<20} · {:>6.1}s — {}",
+                subject,
+                event.phase,
+                event.elapsed_ms as f64 / 1000.0,
+                event.message
+            )
+        },
+    );
+    let _ = sender.send(JobEvent::Progress(display));
+}
+fn drain_progress_lines(
+    pending: &mut Vec<u8>,
+    sender: &mpsc::Sender<JobEvent>,
+    flush_partial: bool,
+) {
+    while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
+        let mut line = pending.drain(..=newline).collect::<Vec<_>>();
+        line.pop();
+        send_progress_line(sender, &line);
+    }
+    if flush_partial && !pending.is_empty() {
+        send_progress_line(sender, pending);
+        pending.clear();
     }
 }
 fn run_verbose_command(
@@ -617,59 +721,72 @@ fn run_verbose_command(
     args: &[String],
     sender: &mpsc::Sender<JobEvent>,
 ) -> Result<CommandOutput, String> {
+    let capture_dir = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".tmp");
+    fs::create_dir_all(&capture_dir).map_err(|error| error.to_string())?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_nanos();
+    let capture = capture_dir.join(format!("lane-command-{}-{nonce}", std::process::id()));
+    let stdout_path = capture.with_extension("stdout");
+    let stderr_path = capture.with_extension("stderr");
+    let stdout_file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&stdout_path)
+        .map_err(|error| error.to_string())?;
+    let stderr_file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&stderr_path)
+        .map_err(|error| error.to_string())?;
     let mut child = Command::new(program)
         .args(args)
         .env("WORKLANE_EVENT_STREAM", "1")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file))
         .spawn()
         .map_err(|error| error.to_string())?;
-    let mut stdout = child.stdout.take().ok_or("child stdout unavailable")?;
-    let stderr = child.stderr.take().ok_or("child stderr unavailable")?;
-    let progress_sender = sender.clone();
-    let stderr_thread = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        for line in BufReader::new(stderr).lines() {
-            match line {
-                Ok(line) => {
-                    let display = match serde_json::from_str::<worklane_core::OperationEvent>(&line)
-                    {
-                        Ok(event) => format!(
-                            "{} · {:.1}s — {}",
-                            event.phase,
-                            event.elapsed_ms as f64 / 1000.0,
-                            event.message
-                        ),
-                        Err(_) => {
-                            bytes.extend_from_slice(line.as_bytes());
-                            bytes.push(b'\n');
-                            line
-                        }
-                    };
-                    let _ = progress_sender.send(JobEvent::Progress(display));
+    let mut stderr_reader = fs::File::open(&stderr_path).map_err(|error| error.to_string())?;
+    let mut pending_progress = Vec::new();
+    let status = loop {
+        let mut chunk = [0; 8192];
+        loop {
+            match stderr_reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(count) => {
+                    pending_progress.extend_from_slice(&chunk[..count]);
+                    drain_progress_lines(&mut pending_progress, sender, false);
                 }
-                Err(error) => {
-                    let line = format!("failed to read progress: {error}");
-                    bytes.extend_from_slice(line.as_bytes());
-                    bytes.push(b'\n');
-                    let _ = progress_sender.send(JobEvent::Progress(line));
-                    break;
-                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error.to_string()),
             }
         }
-        bytes
-    });
-    let mut stdout_bytes = Vec::new();
-    stdout
-        .read_to_end(&mut stdout_bytes)
-        .map_err(|error| error.to_string())?;
-    let status = child.wait().map_err(|error| error.to_string())?;
-    let stderr = stderr_thread
-        .join()
-        .map_err(|_| "progress reader panicked".to_string())?;
+        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+            break status;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    loop {
+        let mut chunk = [0; 8192];
+        match stderr_reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(count) => pending_progress.extend_from_slice(&chunk[..count]),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    drain_progress_lines(&mut pending_progress, sender, true);
+    let stdout = fs::read(&stdout_path).map_err(|error| error.to_string())?;
+    let stderr = fs::read(&stderr_path).map_err(|error| error.to_string())?;
+    let _ = fs::remove_file(&stdout_path);
+    let _ = fs::remove_file(&stderr_path);
     Ok(CommandOutput {
         success: status.success(),
-        stdout: stdout_bytes,
+        stdout,
         stderr,
     })
 }
@@ -717,7 +834,21 @@ fn poll_jobs(app: &mut App) {
                                     }
                                     _ => String::new(),
                                 };
-                                app.message = format!("{}: completed", result.label);
+                                let lane_count = serde_json::from_slice::<Vec<serde_json::Value>>(
+                                    &output.stdout,
+                                )
+                                .map(|values| values.len())
+                                .unwrap_or(0);
+                                app.message = if result.verb == "upgrade" {
+                                    format!(
+                                        "{}: finished — {} lane outcome{}; details below",
+                                        result.label,
+                                        lane_count,
+                                        if lane_count == 1 { "" } else { "s" }
+                                    )
+                                } else {
+                                    format!("{}: completed", result.label)
+                                };
                                 if let Some(lanes) = cached_lanes {
                                     replace_lanes(app, lanes);
                                 }
@@ -977,13 +1108,16 @@ fn update_lane_status(app: &mut App, status: LaneStatus) {
     restore_selection(app, selected_id.as_deref());
 }
 fn refresh_all(app: &mut App) {
-    start_state_poll(app);
+    match sync_registered_lanes(app) {
+        Ok(_) => start_state_poll(app),
+        Err(error) => app.message = format!("registry refresh failed: {error:#}"),
+    }
 }
 fn edit_containerfile(app: &mut App) -> Result<()> {
     restore_terminal_state();
     let result = Command::new("worklane").args(["image", "edit"]).status();
-    execute!(io::stdout(), EnterAlternateScreen)?;
-    enable_raw_mode()?;
+    enter_terminal_state()?;
+    FORCE_FULL_REDRAW.store(true, Ordering::Release);
     let status = result?;
     app.message = format!(
         "Containerfile editor: {}",
@@ -991,16 +1125,30 @@ fn edit_containerfile(app: &mut App) -> Result<()> {
     );
     Ok(())
 }
+fn enter_terminal_state() -> Result<()> {
+    restore_terminal_state();
+    enable_raw_mode()?;
+    execute!(io::stdout(), EnterAlternateScreen)?;
+    Ok(())
+}
 fn restore_terminal_state() {
     let _ = disable_raw_mode();
+    if !io::stdout().is_terminal() {
+        return;
+    }
     let mut stdout = io::stdout();
     let _ = execute!(
         stdout,
-        DisableBracketedPaste,
-        DisableFocusChange,
         DisableMouseCapture,
-        LeaveAlternateScreen
+        DisableFocusChange,
+        DisableBracketedPaste,
+        PopKeyboardEnhancementFlags,
+        LeaveAlternateScreen,
+        ResetColor,
+        SetAttribute(Attribute::Reset),
+        Show
     );
+    let _ = stdout.flush();
 }
 struct TerminalGuard;
 impl Drop for TerminalGuard {
@@ -1011,16 +1159,24 @@ impl Drop for TerminalGuard {
 struct ResumeTui;
 impl Drop for ResumeTui {
     fn drop(&mut self) {
-        let _ = execute!(io::stdout(), EnterAlternateScreen);
-        let _ = enable_raw_mode();
+        if enter_terminal_state().is_ok() {
+            FORCE_FULL_REDRAW.store(true, Ordering::Release);
+        }
     }
 }
 fn main() {
     install_panic_hook();
-    if let Err(error) = run_tui() {
-        restore_terminal_state();
-        eprintln!("lane: {error:#}");
-        std::process::exit(1);
+    match run_tui() {
+        Ok(RunExit::Quit) => {}
+        Ok(RunExit::Signal(signal)) => {
+            restore_terminal_state();
+            std::process::exit(128 + signal);
+        }
+        Err(error) => {
+            restore_terminal_state();
+            eprintln!("lane: {error:#}");
+            std::process::exit(1);
+        }
     }
 }
 fn install_panic_hook() {
@@ -1030,32 +1186,44 @@ fn install_panic_hook() {
         previous(info);
     }));
 }
-fn run_tui() -> Result<()> {
-    restore_terminal_state();
-    enable_raw_mode()?;
-    let _guard = TerminalGuard;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-    let result = run(&mut terminal);
-    terminal.show_cursor()?;
-    result
+fn is_interrupt_key(key: &KeyEvent) -> bool {
+    key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
 }
-fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+fn run_tui() -> Result<RunExit> {
+    let mut signals = Signals::new([SIGINT, SIGTERM, SIGHUP])?;
+    let _guard = TerminalGuard;
+    enter_terminal_state()?;
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = Terminal::new(backend)?;
+    run(&mut terminal, &mut signals)
+}
+fn run(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    signals: &mut Signals,
+) -> Result<RunExit> {
     let mut app = App::load()?;
     run_app(
         &mut app,
-        |app| Ok(terminal.draw(|frame| draw(frame, app)).map(|_| ())?),
+        |app| {
+            if FORCE_FULL_REDRAW.swap(false, Ordering::AcqRel) {
+                terminal.clear()?;
+            }
+            Ok(terminal.draw(|frame| draw(frame, app)).map(|_| ())?)
+        },
         || {
             if !event::poll(Duration::from_millis(250))? {
                 return Ok(None);
             }
             Ok(match event::read()? {
+                Event::Key(key) if is_interrupt_key(&key) => {
+                    signal_hook::low_level::raise(SIGINT)?;
+                    None
+                }
                 Event::Key(key) => Some(key.code),
                 _ => None,
             })
         },
+        || signals.pending().next(),
     )
 }
 
@@ -1063,10 +1231,23 @@ fn run_app(
     app: &mut App,
     mut redraw: impl FnMut(&App) -> Result<()>,
     mut next_key: impl FnMut() -> Result<Option<KeyCode>>,
-) -> Result<()> {
+    mut pending_signal: impl FnMut() -> Option<i32>,
+) -> Result<RunExit> {
+    let mut last_registry_sync = Instant::now();
     loop {
+        if let Some(signal) = pending_signal() {
+            return Ok(RunExit::Signal(signal));
+        }
         poll_jobs(app);
         poll_state(app)?;
+        if last_registry_sync.elapsed() >= Duration::from_secs(1) {
+            match sync_registered_lanes(app) {
+                Ok(true) if app.state_poll_pending == 0 => start_state_poll(app),
+                Ok(_) => {}
+                Err(error) => app.message = format!("registry refresh failed: {error:#}"),
+            }
+            last_registry_sync = Instant::now();
+        }
         if let Some(job) = app.jobs.first() {
             app.message = format!(
                 "{}: running {:.1}s ({} active)",
@@ -1076,11 +1257,20 @@ fn run_app(
             );
         }
         redraw(app)?;
-        let Some(key) = next_key()? else {
+        let key = match next_key() {
+            Ok(key) => key,
+            Err(error) => {
+                if let Some(signal) = pending_signal() {
+                    return Ok(RunExit::Signal(signal));
+                }
+                return Err(error);
+            }
+        };
+        let Some(key) = key else {
             continue;
         };
         match app.handle_key(key) {
-            UiAction::Quit => break,
+            UiAction::Quit => return Ok(RunExit::Quit),
             UiAction::Command(verb, true) => {
                 app.message = format!("{verb}: connecting");
                 redraw(app)?;
@@ -1121,7 +1311,6 @@ fn run_app(
             UiAction::None => {}
         }
     }
-    Ok(())
 }
 fn column(value: &str, width: usize) -> String {
     if value.chars().count() > width {
@@ -1164,14 +1353,22 @@ fn lane_style(state: &str, drift: bool) -> Style {
         style
     }
 }
-fn cache_age(cached_at: chrono::DateTime<chrono::Utc>) -> String {
-    let seconds = (chrono::Utc::now() - cached_at).num_seconds().max(0);
+fn live_age(status: &LaneStatus) -> String {
+    if status.state != "running" {
+        return "-".into();
+    }
+    let Some(started_at) = status.runtime_started_at else {
+        return "…".into();
+    };
+    let seconds = (chrono::Utc::now() - started_at).num_seconds().max(0);
     if seconds < 60 {
         format!("{seconds}s")
     } else if seconds < 3600 {
         format!("{}m", seconds / 60)
-    } else {
+    } else if seconds < 86400 {
         format!("{}h", seconds / 3600)
+    } else {
+        format!("{}d", seconds / 86400)
     }
 }
 fn visible_detail(app: &App) -> &str {
@@ -1197,7 +1394,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         column("NAME", 18),
         column("HOST", 14),
         column("STATE", 10),
-        column("AGE", 7),
+        column("ALIVE", 7),
         "IMAGE"
     ))
     .style(Style::default().fg(Color::DarkGray))];
@@ -1208,7 +1405,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             column(&x.spec.name, 18),
             column(&x.spec.host, 14),
             column(&x.state, 10),
-            column(&cache_age(x.cached_at), 7),
+            column(&live_age(x), 7),
             x.spec.profile.image,
             flag
         ))
@@ -1290,10 +1487,12 @@ mod tests {
         .unwrap();
         App {
             lanes: vec![LaneStatus {
+                runtime: Default::default(),
                 spec,
                 state: "running".into(),
                 drift: false,
                 cached_at: Utc::now(),
+                runtime_started_at: None,
             }],
             selected: 0,
             filter: String::new(),
@@ -1331,6 +1530,46 @@ mod tests {
             started: Instant::now(),
             receiver,
         });
+    }
+    #[test]
+    fn selection_helpers_track_identity_across_registry_updates() {
+        let mut app = app();
+        let started_at = Utc::now() - chrono::Duration::minutes(3);
+        app.lanes[0].state = "running".into();
+        app.lanes[0].runtime_started_at = Some(started_at);
+        let selected_id = app.lanes[0].spec.id.clone();
+        let mut second = app.lanes[0].clone();
+        second.spec = LaneSpec::new(
+            "beta".into(),
+            "lab".into(),
+            PathBuf::from("/tmp/beta"),
+            Profile::default(),
+        )
+        .unwrap();
+        second.spec.last_attached = Some(Utc::now());
+        let mut first = app.lanes[0].clone();
+        first.runtime_started_at = None;
+        replace_lanes(&mut app, vec![first, second]);
+        assert_eq!(
+            selected_lane_id(&app).as_deref(),
+            Some(selected_id.as_str())
+        );
+
+        app.selected = 99;
+        restore_selection(&mut app, Some("missing-id"));
+        assert_eq!(app.selected, app.visible().len() - 1);
+        assert_eq!(
+            app.lanes
+                .iter()
+                .find(|lane| lane.spec.id == selected_id)
+                .and_then(|lane| lane.runtime_started_at),
+            Some(started_at)
+        );
+        assert_eq!(command_error(b"", "fallback"), "fallback");
+        assert_eq!(
+            command_error(b" explicit error \n", "fallback"),
+            "explicit error"
+        );
     }
     #[test]
     fn reducer_covers_navigation_filter_and_actions() {
@@ -1428,6 +1667,7 @@ mod tests {
             UiAction::EditContainerfile
         );
         assert_eq!(app.handle_key(KeyCode::Char('q')), UiAction::Quit);
+        assert_eq!(app.handle_key(KeyCode::Char('?')), UiAction::None);
         app.handle_key(KeyCode::Char('/'));
         app.handle_key(KeyCode::Char('z'));
         assert_eq!(app.filter, "z");
@@ -1458,14 +1698,71 @@ mod tests {
             "No lanes were selected for upgrade."
         );
         assert_eq!(
-            upgrade_detail(br#"[{"lane":"alpha","outcome":"skipped"}]"#).unwrap(),
-            "alpha: skipped"
+            upgrade_detail(
+                br#"[{"lane_id":"00000000-0000-4000-8000-000000000001","lane_name":"alpha","outcome":"skipped"}]"#,
+            )
+            .unwrap(),
+            "Upgrade finished for 1 lane.\nalpha: skipped\nPersistent home and project data were preserved."
         );
         assert!(
             upgrade_detail(br#"[{"spec":{"name":"alpha"},"state":"running","drift":true}]"#)
                 .unwrap()
                 .contains("(drift)")
         );
+        assert_eq!(column("abcdefgh", 4), "abc~");
+    }
+
+    #[test]
+    fn run_loop_reports_a_pending_signal_before_redrawing() {
+        let mut app = app();
+        let mut redraws = 0;
+        let exit = run_app(
+            &mut app,
+            |_| {
+                redraws += 1;
+                Ok(())
+            },
+            || panic!("input must not be read after a termination signal"),
+            || Some(SIGTERM),
+        )
+        .unwrap();
+        assert_eq!(exit, RunExit::Signal(SIGTERM));
+        assert_eq!(redraws, 0);
+    }
+
+    #[test]
+    fn run_loop_checks_signals_when_terminal_input_fails() {
+        let mut app = app();
+        let mut signal_checks = 0;
+        let exit = run_app(
+            &mut app,
+            |_| Ok(()),
+            || Err(anyhow::anyhow!("interrupted terminal read")),
+            || {
+                signal_checks += 1;
+                (signal_checks == 2).then_some(SIGTERM)
+            },
+        )
+        .unwrap();
+        assert_eq!(exit, RunExit::Signal(SIGTERM));
+
+        let error = run_app(
+            &mut app,
+            |_| Ok(()),
+            || Err(anyhow::anyhow!("broken terminal read")),
+            || None,
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "broken terminal read");
+    }
+
+    #[test]
+    fn control_c_is_an_interrupt_but_plain_c_remains_an_action() {
+        let control_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let plain_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE);
+        assert!(is_interrupt_key(&control_c));
+        assert!(!is_interrupt_key(&plain_c));
+        assert_eq!(app().handle_key(plain_c.code), UiAction::Reconcile(false));
     }
 
     #[test]
@@ -1497,15 +1794,29 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         let previous_data = env::var_os("XDG_DATA_HOME");
         env::set_var("XDG_DATA_HOME", root.join("data"));
-        let app = app();
-        Store::open_default()
-            .unwrap()
+        let mut app = app();
+        let store = Store::open_default().unwrap();
+        store
             .save_lane(&app.lanes[0].spec, "running", true)
             .unwrap();
 
         let lanes = load_registered_lanes().unwrap();
         assert_eq!(lanes[0].state, "running");
         assert!(lanes[0].drift);
+
+        let discovered = LaneSpec::new(
+            "created-elsewhere".into(),
+            "local".into(),
+            root.join("created-elsewhere"),
+            Profile::default(),
+        )
+        .unwrap();
+        store.save_lane(&discovered, "running", false).unwrap();
+        assert!(sync_registered_lanes(&mut app).unwrap());
+        assert!(app
+            .lanes
+            .iter()
+            .any(|lane| lane.spec.name == "created-elsewhere"));
 
         if let Some(value) = previous_data {
             env::set_var("XDG_DATA_HOME", value);
@@ -1519,6 +1830,7 @@ mod tests {
     fn state_poll_updates_lanes_individually() {
         let mut app = app();
         let beta = LaneStatus {
+            runtime: Default::default(),
             spec: LaneSpec::new(
                 "beta".into(),
                 "lab".into(),
@@ -1529,6 +1841,7 @@ mod tests {
             state: "unknown".into(),
             drift: false,
             cached_at: Utc::now(),
+            runtime_started_at: None,
         };
         app.lanes[0].state = "unknown".into();
         app.lanes.push(beta.clone());
@@ -1638,7 +1951,7 @@ mod tests {
         let worklane = bin.join("worklane");
         fs::write(
             &worklane,
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.log\"\nstatus='{\"spec\":{\"schema_version\":3,\"id\":\"00000000-0000-4000-8000-000000000006\",\"name\":\"alpha\",\"container_name\":\"worklane-00000000-0000-4000-8000-000000000006\",\"session_name\":\"alpha\",\"container_home\":\"/home/dev\",\"host\":\"lab\",\"project_path\":\"/tmp\",\"profile\":{\"image\":\"test:latest\",\"build_context\":\"project\",\"containerfile\":\"Containerfile\",\"embedded_containerfile\":true,\"network\":\"outbound\",\"mounts\":[]},\"profile_name\":\"default\",\"created_at\":\"2026-01-01T00:00:00Z\",\"last_attached\":null,\"image_digest\":null},\"state\":\"running\",\"drift\":false,\"cached_at\":\"2026-01-01T00:00:00Z\"}'\ncase \"$*\" in *fail*) printf 'command failed\\n' >&2; exit 1;; *diff*) printf '{\"diff\":[]}\\n';; *inspect*) printf '%s\\n' \"$status\";; *upgrade*) printf 'building alpha\\n' >&2; printf '[%s]\\n' \"$status\";; *refresh*) printf '[%s]\\n' \"$status\";; esac\nexit 0\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.log\"\nstatus='{\"spec\":{\"schema_version\":5,\"id\":\"00000000-0000-4000-8000-000000000006\",\"name\":\"alpha\",\"container_name\":\"worklane-alpha-00000000-0000-4000-8000-000000000006\",\"session_name\":\"alpha\",\"container_home\":\"/home/dev\",\"host\":\"lab\",\"project_path\":\"/tmp\",\"profile\":{\"image\":\"test:latest\",\"build_context\":\"project\",\"containerfile\":\"Containerfile\",\"embedded_containerfile\":true,\"network\":\"outbound\",\"mounts\":[],\"mount_codex_credentials\":true,\"mount_gh_credentials\":true},\"profile_name\":\"default\",\"created_at\":\"2026-01-01T00:00:00Z\",\"last_attached\":null,\"image_digest\":null},\"state\":\"running\",\"drift\":false,\"cached_at\":\"2026-01-01T00:00:00Z\"}'\ncase \"$*\" in *fail*) printf 'command failed\\n' >&2; exit 1;; *diff*) printf '{\"diff\":[]}\\n';; *inspect*) printf '%s\\n' \"$status\";; *upgrade*) printf 'building alpha\\n' >&2; printf '[%s]\\n' \"$status\";; *refresh*) printf '[%s]\\n' \"$status\";; esac\nexit 0\n",
         )
         .unwrap();
         #[cfg(unix)]
@@ -1675,7 +1988,10 @@ mod tests {
         action(&mut app, "inspect").unwrap();
         assert!(app.detail.contains("State: running"));
         action(&mut app, "upgrade").unwrap();
-        assert_eq!(app.detail, "alpha: running");
+        assert_eq!(
+            app.detail,
+            "Upgrade finished for 1 lane.\nalpha: running\nPersistent home and project data were preserved."
+        );
         assert!(!action(&mut app, "fail").unwrap());
         assert_eq!(app.message, "fail: failed");
         assert_eq!(app.detail, "command failed");
@@ -1687,12 +2003,15 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert_eq!(app.message, "upgrade all: completed");
+        assert_eq!(
+            app.message,
+            "upgrade all: finished — 1 lane outcome; details below"
+        );
         assert!(app.detail.contains("alpha: running"));
         assert!(fs::read_to_string(worklane.with_extension("log"))
             .unwrap()
             .lines()
-            .any(|line| line == "lane upgrade --all --no-cache"));
+            .any(|line| line == "lane upgrade --all"));
         start_job(&mut app, "rename", &["renamed".into()], false).unwrap();
         start_job(&mut app, "start", &[], false).unwrap();
         assert_eq!(app.message, "start: already queued or running");
@@ -1821,6 +2140,7 @@ mod tests {
                 Ok(())
             },
             || Ok(keys.next().expect("test has a key for every redraw")),
+            || None,
         )
         .unwrap();
         assert_eq!(redraws, 4);
@@ -1830,6 +2150,14 @@ mod tests {
             "{}",
             app.message
         );
+        for _ in 0..200 {
+            poll_job(&mut app).unwrap();
+            if app.jobs.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(app.jobs.is_empty());
         let (sender, receiver) = mpsc::channel();
         inject_job(&mut app, receiver, "start");
         let _sender = sender;
@@ -1842,17 +2170,34 @@ mod tests {
                 Ok(())
             },
             || Ok(locked_keys.next().expect("test has a key for every redraw")),
+            || None,
         )
         .unwrap();
         assert_eq!(locked_redraws, 2);
         assert!(app.message.contains("queued") || app.message.contains("running"));
         app.jobs.clear();
         app.job_queue.clear();
+        let failing_bin = root.join("failing-bin");
+        fs::create_dir_all(&failing_bin).unwrap();
+        let replacement = failing_bin.join("worklane");
         fs::write(
-            &worklane,
+            &replacement,
             "#!/bin/sh\nprintf 'attach exploded\\n' >&2\nexit 17\n",
         )
         .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&replacement, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        env::set_var(
+            "PATH",
+            format!(
+                "{}:{}",
+                failing_bin.display(),
+                env::var_os("PATH").unwrap().to_string_lossy()
+            ),
+        );
         let mut attach_keys = vec![Some(KeyCode::Char('a')), Some(KeyCode::Char('q'))].into_iter();
         let mut attach_redraws = 0;
         run_app(
@@ -1866,6 +2211,7 @@ mod tests {
                     .next()
                     .expect("failed attach must redraw before quit"))
             },
+            || None,
         )
         .unwrap();
         assert_eq!(attach_redraws, 3);
@@ -1911,9 +2257,53 @@ mod tests {
     }
 
     #[test]
+    fn verbose_commands_do_not_wait_for_descendants_holding_standard_streams() {
+        let (sender, _receiver) = mpsc::channel();
+        let started = Instant::now();
+        let output = run_verbose_command(
+            "sh",
+            &["-c".into(), "sleep 1 & printf done".into()],
+            &sender,
+        )
+        .unwrap();
+        assert!(output.success);
+        assert_eq!(output.stdout, b"done");
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn verbose_commands_stream_progress_before_completion() {
+        let (sender, receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            run_verbose_command(
+                "sh",
+                &[
+                    "-c".into(),
+                    "printf 'building now\\n' >&2; sleep 1; printf done".into(),
+                ],
+                &sender,
+            )
+        });
+        match receiver.recv_timeout(Duration::from_millis(500)).unwrap() {
+            JobEvent::Progress(line) => assert_eq!(line, "building now"),
+            JobEvent::Complete(_) => panic!("command completed before progress was observed"),
+        }
+        assert!(worker.join().unwrap().unwrap().success);
+    }
+
+    #[test]
     fn renderer_draws_lane_status() {
         let mut app = app();
+        app.lanes[0].runtime_started_at = Some(Utc::now() - chrono::Duration::seconds(12));
+        assert!(live_age(&app.lanes[0]).ends_with('s'));
+        app.lanes[0].runtime_started_at = Some(Utc::now() - chrono::Duration::minutes(12));
+        assert_eq!(live_age(&app.lanes[0]), "12m");
+        app.lanes[0].runtime_started_at = Some(Utc::now() - chrono::Duration::minutes(61));
+        assert_eq!(live_age(&app.lanes[0]), "1h");
+        app.lanes[0].runtime_started_at = Some(Utc::now() - chrono::Duration::days(2));
+        assert_eq!(live_age(&app.lanes[0]), "2d");
         app.lanes.push(LaneStatus {
+            runtime: Default::default(),
             spec: LaneSpec::new(
                 "beta".into(),
                 "other".into(),
@@ -1924,6 +2314,7 @@ mod tests {
             state: "stopped".into(),
             drift: true,
             cached_at: Utc::now(),
+            runtime_started_at: None,
         });
         app.selected = 1;
         app.detail = "C /etc/example".into();

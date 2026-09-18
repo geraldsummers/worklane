@@ -42,23 +42,25 @@ class RunResult:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Bulk-delegate JSONL records to Codex with adaptive 429 backoff."
+        description="Run independent JSONL records through Codex with shared rate-limit backoff.",
+        epilog="Use one writer per output file. Resume the same task with the same IDs, prompt, and schema.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("input", help="Input JSONL path, or - for stdin")
     parser.add_argument("--output", required=True, help="Append-only result JSONL path")
     parser.add_argument("--schema", required=True, help="JSON Schema for each Codex result")
     parser.add_argument("--prompt", required=True, help="Instruction applied to every record")
-    parser.add_argument("--id-field", default="id")
+    parser.add_argument("--id-field", default="id", help="Unique stable ID field in each input object")
     parser.add_argument("--codex", default="codex", help="Codex executable")
-    parser.add_argument("--model", default="gpt-5.6-luna")
-    parser.add_argument("--reasoning-effort", default="low")
-    parser.add_argument("--initial-workers", type=int, default=4)
-    parser.add_argument("--max-workers", type=int, default=256)
-    parser.add_argument("--success-window", type=int, default=32)
-    parser.add_argument("--cooldown", type=float, default=60.0)
-    parser.add_argument("--jitter", type=float, default=10.0)
-    parser.add_argument("--max-attempts", type=int, default=3)
-    parser.add_argument("--max-retry-seconds", type=float, default=900.0)
+    parser.add_argument("--model", default="gpt-5.6-luna", help="Codex model for every record")
+    parser.add_argument("--reasoning-effort", default="low", help="Reasoning effort passed to Codex")
+    parser.add_argument("--initial-workers", type=int, default=32, help="Initial number of concurrent jobs")
+    parser.add_argument("--max-workers", type=int, default=256, help="Maximum workers, with a hard ceiling of 256")
+    parser.add_argument("--success-window", type=int, default=32, help="Consecutive successes before adding one worker")
+    parser.add_argument("--cooldown", type=float, default=60.0, help="Queue-wide rate-limit cooldown in seconds")
+    parser.add_argument("--jitter", type=float, default=10.0, help="Maximum additional random cooldown in seconds")
+    parser.add_argument("--max-attempts", type=int, default=3, help="Total attempts per record, including the first")
+    parser.add_argument("--max-retry-seconds", type=float, default=900.0, help="Total elapsed budget per record in seconds")
     return parser.parse_args()
 
 

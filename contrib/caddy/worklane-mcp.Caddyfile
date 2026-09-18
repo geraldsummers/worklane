@@ -1,0 +1,9 @@
+# Merge this route into the Platform Zero Caddy configuration. TLS remains at Caddy;
+# worklane-mcp deliberately listens only on loopback.
+lanes.example.internal {
+    reverse_proxy 127.0.0.1:47831 {
+        # Flush MCP SSE events immediately. Caddy forwards Authorization,
+        # MCP-Session-Id, Last-Event-ID, and response headers by default.
+        flush_interval -1
+    }
+}
