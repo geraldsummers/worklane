@@ -1,0 +1,98 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="420" viewBox="0 0 1200 420" role="img" aria-labelledby="title desc">
+  <title id="title">Worklane</title>
+  <desc id="desc">Disposable development environments with persistent projects and agent sessions, shown beside a terminal lane dashboard.</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b1018"/>
+      <stop offset="1" stop-color="#141b26"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#58a6ff"/>
+      <stop offset="1" stop-color="#56d364"/>
+    </linearGradient>
+    <pattern id="grid" width="28" height="28" patternUnits="userSpaceOnUse">
+      <path d="M 28 0 L 0 0 0 28" fill="none" stroke="#8b949e" stroke-width="1" opacity="0.08"/>
+    </pattern>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="12" stdDeviation="18" flood-color="#000" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+
+  <rect x="1" y="1" width="1198" height="418" rx="26" fill="url(#background)" stroke="#30363d" stroke-width="2"/>
+  <rect x="1" y="1" width="1198" height="418" rx="26" fill="url(#grid)"/>
+
+  <g transform="translate(68 62)">
+    <g aria-hidden="true">
+      <rect x="0" y="0" width="92" height="14" rx="7" fill="#30363d"/>
+      <rect x="16" y="24" width="92" height="14" rx="7" fill="url(#accent)"/>
+      <rect x="32" y="48" width="92" height="14" rx="7" fill="#30363d"/>
+    </g>
+
+    <text x="0" y="119" fill="#f0f6fc" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="56" font-weight="750" letter-spacing="-2">Worklane</text>
+    <text x="0" y="164" fill="#c9d1d9" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="24" font-weight="500">Disposable environments.</text>
+    <text x="0" y="198" fill="#c9d1d9" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="24" font-weight="500">Persistent work.</text>
+
+    <g transform="translate(0 239)" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14">
+      <rect x="0" y="0" width="118" height="34" rx="17" fill="#1f2937" stroke="#30363d"/>
+      <circle cx="19" cy="17" r="5" fill="#56d364"/>
+      <text x="32" y="22" fill="#e6edf3">rootless</text>
+
+      <rect x="130" y="0" width="112" height="34" rx="17" fill="#1f2937" stroke="#30363d"/>
+      <circle cx="149" cy="17" r="5" fill="#58a6ff"/>
+      <text x="162" y="22" fill="#e6edf3">resumable</text>
+
+      <rect x="254" y="0" width="92" height="34" rx="17" fill="#1f2937" stroke="#30363d"/>
+      <circle cx="273" cy="17" r="5" fill="#d2a8ff"/>
+      <text x="286" y="22" fill="#e6edf3">remote</text>
+    </g>
+  </g>
+
+  <g transform="translate(527 48)" filter="url(#shadow)">
+    <rect x="0" y="0" width="620" height="324" rx="16" fill="#090c10" stroke="#30363d" stroke-width="2"/>
+    <path d="M 0 46 H 620" stroke="#30363d"/>
+    <circle cx="24" cy="23" r="6" fill="#ff7b72"/>
+    <circle cx="46" cy="23" r="6" fill="#d29922"/>
+    <circle cx="68" cy="23" r="6" fill="#56d364"/>
+    <text x="95" y="28" fill="#8b949e" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14">lane dashboard</text>
+
+    <g transform="translate(24 72)" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15">
+      <text x="0" y="0" fill="#8b949e">NAME</text>
+      <text x="184" y="0" fill="#8b949e">HOST</text>
+      <text x="324" y="0" fill="#8b949e">STATE</text>
+      <text x="432" y="0" fill="#8b949e">IMAGE</text>
+
+      <rect x="-10" y="16" width="572" height="38" rx="7" fill="#161b22" stroke="#30363d"/>
+      <text x="0" y="41" fill="#f0f6fc" font-weight="700">api-refactor</text>
+      <text x="184" y="41" fill="#c9d1d9">local</text>
+      <circle cx="330" cy="36" r="5" fill="#56d364"/>
+      <text x="344" y="41" fill="#56d364">running</text>
+      <text x="432" y="41" fill="#c9d1d9">worklane</text>
+
+      <text x="0" y="83" fill="#c9d1d9">docs</text>
+      <text x="184" y="83" fill="#c9d1d9">buildbox</text>
+      <circle cx="330" cy="78" r="5" fill="#d29922"/>
+      <text x="344" y="83" fill="#d29922">stopped</text>
+      <text x="432" y="83" fill="#c9d1d9">worklane</text>
+
+      <text x="0" y="123" fill="#c9d1d9">release-check</text>
+      <text x="184" y="123" fill="#c9d1d9">buildbox</text>
+      <circle cx="330" cy="118" r="5" fill="#56d364"/>
+      <text x="344" y="123" fill="#56d364">running</text>
+      <text x="432" y="123" fill="#c9d1d9">worklane</text>
+
+      <path d="M -10 148 H 562" stroke="#21262d"/>
+      <text x="0" y="177" fill="#58a6ff">›</text>
+      <text x="22" y="177" fill="#e6edf3">attach api-refactor</text>
+      <rect x="214" y="162" width="8" height="20" fill="#58a6ff" opacity="0.85"/>
+    </g>
+
+    <g transform="translate(24 285)" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#8b949e">
+      <text x="0" y="0">j/k move</text>
+      <text x="88" y="0">a attach</text>
+      <text x="170" y="0">d diff</text>
+      <text x="240" y="0">u upgrade</text>
+      <text x="340" y="0">r refresh</text>
+      <text x="436" y="0">q quit</text>
+    </g>
+  </g>
+</svg>
