@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+"""Per-tab Git view with shared, demand-driven discovery and status snapshots.
+
+WORKLANE_GIT_DIFF_ROOT defaults to the starting directory, MAX_DEPTH to 4, and
+INTERVAL to one second (all prefixed WORKLANE_GIT_DIFF_). Matching roots share
+discovery; overlapping roots share repository results. Each reader's interval
+is its maximum cache age, so faster readers also benefit slower readers.
+No service is needed: advisory cache locks elect collectors and atomic renames
+publish complete snapshots. Cache locks are never Git index locks.
+"""
+
+import concurrent.futures
+import fcntl
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+
+VERSION = 1
+BOOT_ID = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+GIT_TIMEOUT = 10
+
+
+def git(repo, *args):
+    env = dict(os.environ, GIT_OPTIONAL_LOCKS="0")
+    return subprocess.run(
+        ["git", "--no-optional-locks", "-C", str(repo), *args],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        timeout=GIT_TIMEOUT, check=True,
+    ).stdout
+
+
+class Cache:
+    def __init__(self, directory, interval):
+        self.directory = Path(directory)
+        self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.interval = interval
+
+    def path(self, key):
+        digest = hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()
+        return self.directory / digest
+
+    def read(self, key):
+        try:
+            value = json.loads(self.path(key).with_suffix(".json").read_text())
+            if not isinstance(value, dict):
+                return None
+            if value.get("version") != VERSION or value.get("boot") != BOOT_ID:
+                return None
+            if value.get("key") != key:
+                return None
+            for field in ("attempted", "updated"):
+                number = value.get(field)
+                if number is not None and (not isinstance(number, (int, float)) or
+                                           not math.isfinite(number) or number > time.monotonic()):
+                    return None
+            if value.get("attempted") is None or not isinstance(value.get("error"), str):
+                return None
+            data = value.get("data")
+            if data is not None:
+                if value.get("updated") is None:
+                    return None
+                if key[0] == "discovery":
+                    if not isinstance(data, list) or not all(isinstance(p, str) for p in data):
+                        return None
+                elif not valid_repository(data):
+                    return None
+            return value
+        except (OSError, ValueError, TypeError):
+            return None
+
+    def fresh(self, value):
+        return value is not None and time.monotonic() - value["attempted"] < self.interval
+
+    def refresh_in(self, value):
+        if value is None:
+            return 0
+        return max(0, self.interval - (time.monotonic() - value["attempted"]))
+
+    def refresh(self, key, collect):
+        value = self.read(key)
+        if self.fresh(value):
+            return value
+        # Never unlink these files: waiters must continue locking the same inode.
+        with self.path(key).with_suffix(".lock").open("a") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return self.read(key)
+            value = self.read(key)
+            if self.fresh(value):
+                return value
+            result = dict(version=VERSION, boot=BOOT_ID, key=key,
+                          data=value["data"] if value else None,
+                          updated=value["updated"] if value else None, error="")
+            try:
+                result["data"] = collect()
+                result["updated"] = time.monotonic()
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                # Do not dump command stderr (or possibly sensitive config) into the pane.
+                result["error"] = ("Git timed out" if isinstance(exc, subprocess.TimeoutExpired)
+                                   else "scan failed")
+            result["attempted"] = time.monotonic()
+            temporary = None
+            try:
+                with tempfile.NamedTemporaryFile("w", dir=self.directory, delete=False) as handle:
+                    temporary = handle.name
+                    json.dump(result, handle)
+                os.replace(temporary, self.path(key).with_suffix(".json"))
+            finally:
+                if temporary and os.path.exists(temporary):
+                    os.unlink(temporary)
+            return result
+
+
+def discover(root, max_depth):
+    if not Path(root).is_dir():
+        raise FileNotFoundError(root)
+    found = set()
+    for current, directories, files in os.walk(root):
+        depth = len(Path(current).relative_to(root).parts)
+        if depth < max_depth and (".git" in directories or ".git" in files):
+            found.add(str(Path(current).resolve()))
+        directories[:] = [d for d in directories if d != ".git"] if depth < max_depth - 1 else []
+    return sorted(found)
+
+
+def containing_repository(cwd):
+    for parent in (cwd, *cwd.parents):
+        if (parent / ".git").exists():
+            return str(parent)
+    return None
+
+
+def safe_text(text):
+    if any(ord(char) < 32 or ord(char) == 127 or 0xD800 <= ord(char) <= 0xDFFF for char in text):
+        return json.dumps(text, ensure_ascii=True)[1:-1]
+    return text
+
+
+def valid_repository(data):
+    return (isinstance(data, dict) and isinstance(data.get("branch"), str) and
+            isinstance(data.get("sync"), str) and isinstance(data.get("paths"), list) and
+            all(isinstance(p, str) for p in data["paths"]) and
+            all(isinstance(data.get(k), int) and data[k] >= 0 for k in ("staged", "unstaged", "untracked")))
+
+
+def collect_repository(repo):
+    # Porcelain v2 includes branch/upstream information and unambiguous NUL paths.
+    records = iter(git(repo, "status", "--porcelain=v2", "--branch", "-z").split(b"\0"))
+    headers = {}
+    paths = []
+    staged = unstaged = untracked = 0
+    for raw in records:
+        if not raw:
+            continue
+        text = os.fsdecode(raw)
+        if text.startswith("# "):
+            name, value = text[2:].split(" ", 1)
+            headers[name] = value
+            continue
+        kind = text[0]
+        if kind == "!":
+            continue
+        if kind == "?":
+            untracked += 1
+            unstaged += 1  # Preserve the existing pane's U count, including untracked paths.
+            paths.append("?? " + safe_text(text[2:]))
+            continue
+        fields = text.split(" ", {"1": 8, "2": 9, "u": 10}[kind])
+        xy, path = fields[1], fields[-1]
+        staged += xy[0] != "."
+        unstaged += xy[1] != "."
+        display = safe_text(path)
+        if kind == "2":
+            original = os.fsdecode(next(records))
+            display = safe_text(original) + " -> " + display
+        paths.append(xy.replace(".", " ") + " " + display)
+    branch = headers.get("branch.head", "unknown")
+    if branch == "(detached)":
+        branch = headers.get("branch.oid", "unknown")[:7]
+    sync = "no-upstream"
+    if "branch.upstream" in headers:
+        sync = "upstream-missing"
+        if "branch.ab" in headers:
+            ahead, behind = (int(n) for n in headers["branch.ab"].split())
+            behind = abs(behind)
+            sync = (f"diverged +{ahead} -{behind}" if ahead and behind else
+                    f"ahead +{ahead}" if ahead else f"behind -{behind}" if behind else "synced")
+    return dict(branch=safe_text(branch), sync=sync, paths=paths,
+                staged=staged, unstaged=unstaged, untracked=untracked)
+
+
+class Watcher:
+    def __init__(self, root, depth, interval, directory=None, cwd=None):
+        self.root = str(Path(root).resolve())
+        self.cwd = Path(cwd or Path.cwd()).resolve()
+        self.depth = depth
+        self.interval = interval
+        self.cache = Cache(directory or Path.home() / ".cache/worklane/git-diff/v1", interval)
+        # Different explicit Git environments must never share repository snapshots.
+        self.context = hashlib.sha256(json.dumps(
+            {k: v for k, v in os.environ.items() if k.startswith("GIT_") and k != "GIT_OPTIONAL_LOCKS"},
+            sort_keys=True).encode()).hexdigest()
+
+    def discovery_key(self):
+        return ["discovery", self.root, self.depth]
+
+    def repository_key(self, repo):
+        return ["repository", str(Path(repo).resolve()), self.context]
+
+    def repositories(self, discovery):
+        repos = set(discovery["data"] or []) if discovery else set()
+        containing = containing_repository(self.cwd)
+        if containing:
+            repos.add(containing)
+        return sorted(repos)
+
+    def refresh(self):
+        discovery = self.cache.refresh(self.discovery_key(), lambda: discover(self.root, self.depth))
+        for repo in self.repositories(discovery):
+            self.cache.refresh(self.repository_key(repo), lambda repo=repo: collect_repository(repo))
+
+    def read(self):
+        discovery = self.cache.read(self.discovery_key())
+        return discovery, [(repo, self.cache.read(self.repository_key(repo)))
+                           for repo in self.repositories(discovery)]
+
+    def refresh_in(self):
+        discovery, repositories = self.read()
+        values = [discovery, *(value for _, value in repositories)]
+        return min(self.cache.refresh_in(value) for value in values)
+
+
+def health(value, interval):
+    if value is None:
+        return "loading"
+    if value["data"] is None:
+        return "unavailable: " + value["error"]
+    age = max(0, time.monotonic() - value["updated"])
+    # Give an on-time background refresh one interval to publish its snapshot.
+    if value["error"] or age > 3 * interval:
+        return f"stale {age:.0f}s" + (": " + value["error"] if value["error"] else "")
+    return ""
+
+
+def render(watcher, width, height):
+    discovery, repositories = watcher.read()
+    lines = []
+    if os.environ.get("WORKLANE_NAME"):
+        lines.append("lane: " + safe_text(os.environ["WORKLANE_NAME"]))
+    lines.extend([time.strftime("%Y-%m-%d %H:%M:%S %Z"), "scan: " + safe_text(watcher.root)])
+    shown = [(repo, value) for repo, value in repositories
+             if health(value, watcher.interval) or value["data"]["paths"] or value["data"]["sync"] != "synced"]
+    lines.extend([f"watched: {len(repositories)}  shown: {len(shown)}", "─" * max(1, width - 1), ""])
+    discovery_health = health(discovery, watcher.interval)
+    if discovery_health:
+        lines.append("discovery: " + discovery_health)
+    if not shown and not discovery_health:
+        lines.append("\033[32mall clean and synced\033[0m")
+    for repo, value in shown:
+        relative = os.path.relpath(repo, watcher.root) if repo.startswith(watcher.root + os.sep) else repo
+        lines.append("\033[1;36m" + safe_text(relative) + "\033[0m")
+        state = health(value, watcher.interval)
+        if state:
+            lines.append("  " + state)
+        data = value["data"] if value else None
+        if data:
+            lines.append(f"  branch: {data['branch']}  S:{data['staged']} U:{data['unstaged']} ?:{data['untracked']}  {data['sync']}")
+            lines.extend("  " + p for p in data["paths"][:12])
+            if len(data["paths"]) > 12:
+                lines.append(f"  ... {len(data['paths']) - 12} more")
+        lines.append("")
+    if len(lines) > height:
+        visible = max(0, height - 1)
+        lines = lines[:visible] + [f"... {len(lines) - visible} more lines (increase pane height or reduce WORKLANE_GIT_DIFF_ROOT/MAX_DEPTH)"]
+    return "\n".join(lines) + "\n"
+
+
+def settings():
+    try:
+        interval = float(os.environ.get("WORKLANE_GIT_DIFF_INTERVAL", "1"))
+        depth = int(os.environ.get("WORKLANE_GIT_DIFF_MAX_DEPTH", "4"))
+        if not math.isfinite(interval) or interval <= 0 or depth < 0:
+            raise ValueError()
+    except ValueError:
+        raise ValueError("WORKLANE_GIT_DIFF_INTERVAL must be positive and MAX_DEPTH a nonnegative integer") from None
+    return os.environ.get("WORKLANE_GIT_DIFF_ROOT", os.getcwd()), depth, interval
+
+
+def main():
+    try:
+        watcher = Watcher(*settings())
+    except (ValueError, OSError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    stopping = False
+
+    def stop(_signum, _frame):
+        nonlocal stopping
+        stopping = True
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = None
+    previous = None
+    try:
+        print("\033[?1049h\033[?25l\033[H\033[2J\033[3J", end="", flush=True)
+        while not stopping:
+            if future is not None and future.done():
+                future.result()
+                future = None
+            if future is None and watcher.refresh_in() <= 0:
+                future = pool.submit(watcher.refresh)
+            size = shutil.get_terminal_size((80, 24))
+            frame = render(watcher, size.columns, size.lines)
+            if frame != previous:
+                painted = frame.replace("\n", "\033[K\n")
+                print("\033[?2026h\033[H" + painted + "\033[J\033[?2026l", end="", flush=True)
+                previous = frame
+            delay = min(watcher.interval, 1)
+            if future is None:
+                delay = min(delay, max(0.01, watcher.refresh_in()))
+            time.sleep(delay)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        print("Git watcher unavailable: " + str(exc), file=sys.stderr)
+        return 1
+    finally:
+        print("\033[?25h\033[?1049l\033[3J", end="", flush=True)
+        pool.shutdown(wait=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

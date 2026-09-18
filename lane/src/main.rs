@@ -1,7 +1,12 @@
 use anyhow::{Context, Result};
 use crossterm::{
-    event::{self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, Event, KeyCode},
+    cursor::Show,
+    event::{
+        self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, Event, KeyCode,
+        KeyEvent, KeyModifiers, PopKeyboardEnhancementFlags,
+    },
     execute,
+    style::{Attribute, ResetColor, SetAttribute},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
@@ -11,10 +16,14 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Paragraph},
     Terminal,
 };
+use signal_hook::{
+    consts::{SIGHUP, SIGINT, SIGTERM},
+    iterator::Signals,
+};
 use std::{
     collections::{HashMap, VecDeque},
     fs::{self, OpenOptions},
-    io::{self, Read, Write},
+    io::{self, IsTerminal, Read, Write},
     path::PathBuf,
     process::{Command, Stdio},
     sync::{
@@ -101,6 +110,11 @@ enum UiAction {
     Reload,
     EditContainerfile,
     Reconcile(bool),
+}
+#[derive(Debug, PartialEq, Eq)]
+enum RunExit {
+    Quit,
+    Signal(i32),
 }
 impl App {
     fn load() -> Result<Self> {
@@ -394,7 +408,7 @@ fn upgrade_detail(output: &[u8]) -> Result<String> {
     if values.is_empty() {
         return Ok("No lanes were selected for upgrade.".into());
     }
-    Ok(values
+    let outcomes = values
         .iter()
         .map(|value| {
             let lane = value["spec"]["name"]
@@ -415,8 +429,13 @@ fn upgrade_detail(output: &[u8]) -> Result<String> {
                 )
             }
         })
-        .collect::<Vec<_>>()
-        .join("\n"))
+        .collect::<Vec<_>>();
+    Ok(format!(
+        "Upgrade finished for {} lane{}.\n{}\nPersistent home and project data were preserved.",
+        outcomes.len(),
+        if outcomes.len() == 1 { "" } else { "s" },
+        outcomes.join("\n")
+    ))
 }
 fn inspect_detail(output: &[u8]) -> Result<String> {
     let value: serde_json::Value = serde_json::from_slice(output)?;
@@ -573,8 +592,18 @@ fn start_job(app: &mut App, verb: &str, extra: &[String], all: bool) -> Result<(
         verb: verb.into(),
         args,
     });
-    app.message = format!("{label}: queued");
-    app.detail = format!("{label}: queued");
+    app.message = if verb == "upgrade" {
+        format!("{label}: queued — preparing image rebuild")
+    } else {
+        format!("{label}: queued")
+    };
+    app.detail = if verb == "upgrade" {
+        format!(
+            "{label}: queued\nNext: rebuild the image, recreate the container, restore its prior running/stopped state, then report each lane outcome.\nPersistent home and project data will be preserved."
+        )
+    } else {
+        format!("{label}: queued")
+    };
     start_queued_jobs(app);
     Ok(())
 }
@@ -600,6 +629,7 @@ fn start_queued_jobs(app: &mut App) {
         };
         let worker_label = request.label.clone();
         let worker_verb = request.verb.clone();
+        let is_upgrade = request.verb == "upgrade";
         let args = request.args;
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
@@ -633,7 +663,14 @@ fn start_queued_jobs(app: &mut App) {
             receiver,
         });
         app.message = format!("{}: running", request.label);
-        app.detail = format!("{}: starting", request.label);
+        app.detail = if is_upgrade {
+            format!(
+                "{}: starting\nRebuilding the image, recreating the container, and restoring its prior running/stopped state.\nStandard images use a fresh build so bundled tools such as Codex are updated. Persistent home and project data are preserved.",
+                request.label
+            )
+        } else {
+            format!("{}: starting", request.label)
+        };
     }
 }
 fn start_upgrade(app: &mut App, all: bool) -> Result<()> {
@@ -648,8 +685,14 @@ fn send_progress_line(sender: &mpsc::Sender<JobEvent>, line: &[u8]) {
     let display = serde_json::from_str::<worklane_core::OperationEvent>(&line).map_or_else(
         |_| line.into_owned(),
         |event| {
+            let subject = event
+                .lane_name
+                .as_deref()
+                .map(|name| format!("{name}: "))
+                .unwrap_or_default();
             format!(
-                "{} · {:.1}s — {}",
+                "{}{:<20} · {:>6.1}s — {}",
+                subject,
                 event.phase,
                 event.elapsed_ms as f64 / 1000.0,
                 event.message
@@ -791,7 +834,21 @@ fn poll_jobs(app: &mut App) {
                                     }
                                     _ => String::new(),
                                 };
-                                app.message = format!("{}: completed", result.label);
+                                let lane_count = serde_json::from_slice::<Vec<serde_json::Value>>(
+                                    &output.stdout,
+                                )
+                                .map(|values| values.len())
+                                .unwrap_or(0);
+                                app.message = if result.verb == "upgrade" {
+                                    format!(
+                                        "{}: finished — {} lane outcome{}; details below",
+                                        result.label,
+                                        lane_count,
+                                        if lane_count == 1 { "" } else { "s" }
+                                    )
+                                } else {
+                                    format!("{}: completed", result.label)
+                                };
                                 if let Some(lanes) = cached_lanes {
                                     replace_lanes(app, lanes);
                                 }
@@ -1059,8 +1116,7 @@ fn refresh_all(app: &mut App) {
 fn edit_containerfile(app: &mut App) -> Result<()> {
     restore_terminal_state();
     let result = Command::new("worklane").args(["image", "edit"]).status();
-    execute!(io::stdout(), EnterAlternateScreen)?;
-    enable_raw_mode()?;
+    enter_terminal_state()?;
     FORCE_FULL_REDRAW.store(true, Ordering::Release);
     let status = result?;
     app.message = format!(
@@ -1069,16 +1125,30 @@ fn edit_containerfile(app: &mut App) -> Result<()> {
     );
     Ok(())
 }
+fn enter_terminal_state() -> Result<()> {
+    restore_terminal_state();
+    enable_raw_mode()?;
+    execute!(io::stdout(), EnterAlternateScreen)?;
+    Ok(())
+}
 fn restore_terminal_state() {
     let _ = disable_raw_mode();
+    if !io::stdout().is_terminal() {
+        return;
+    }
     let mut stdout = io::stdout();
     let _ = execute!(
         stdout,
-        DisableBracketedPaste,
-        DisableFocusChange,
         DisableMouseCapture,
-        LeaveAlternateScreen
+        DisableFocusChange,
+        DisableBracketedPaste,
+        PopKeyboardEnhancementFlags,
+        LeaveAlternateScreen,
+        ResetColor,
+        SetAttribute(Attribute::Reset),
+        Show
     );
+    let _ = stdout.flush();
 }
 struct TerminalGuard;
 impl Drop for TerminalGuard {
@@ -1089,17 +1159,24 @@ impl Drop for TerminalGuard {
 struct ResumeTui;
 impl Drop for ResumeTui {
     fn drop(&mut self) {
-        let _ = execute!(io::stdout(), EnterAlternateScreen);
-        let _ = enable_raw_mode();
-        FORCE_FULL_REDRAW.store(true, Ordering::Release);
+        if enter_terminal_state().is_ok() {
+            FORCE_FULL_REDRAW.store(true, Ordering::Release);
+        }
     }
 }
 fn main() {
     install_panic_hook();
-    if let Err(error) = run_tui() {
-        restore_terminal_state();
-        eprintln!("lane: {error:#}");
-        std::process::exit(1);
+    match run_tui() {
+        Ok(RunExit::Quit) => {}
+        Ok(RunExit::Signal(signal)) => {
+            restore_terminal_state();
+            std::process::exit(128 + signal);
+        }
+        Err(error) => {
+            restore_terminal_state();
+            eprintln!("lane: {error:#}");
+            std::process::exit(1);
+        }
     }
 }
 fn install_panic_hook() {
@@ -1109,19 +1186,21 @@ fn install_panic_hook() {
         previous(info);
     }));
 }
-fn run_tui() -> Result<()> {
-    restore_terminal_state();
-    enable_raw_mode()?;
-    let _guard = TerminalGuard;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-    let result = run(&mut terminal);
-    terminal.show_cursor()?;
-    result
+fn is_interrupt_key(key: &KeyEvent) -> bool {
+    key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
 }
-fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+fn run_tui() -> Result<RunExit> {
+    let mut signals = Signals::new([SIGINT, SIGTERM, SIGHUP])?;
+    let _guard = TerminalGuard;
+    enter_terminal_state()?;
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = Terminal::new(backend)?;
+    run(&mut terminal, &mut signals)
+}
+fn run(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    signals: &mut Signals,
+) -> Result<RunExit> {
     let mut app = App::load()?;
     run_app(
         &mut app,
@@ -1136,10 +1215,15 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
                 return Ok(None);
             }
             Ok(match event::read()? {
+                Event::Key(key) if is_interrupt_key(&key) => {
+                    signal_hook::low_level::raise(SIGINT)?;
+                    None
+                }
                 Event::Key(key) => Some(key.code),
                 _ => None,
             })
         },
+        || signals.pending().next(),
     )
 }
 
@@ -1147,9 +1231,13 @@ fn run_app(
     app: &mut App,
     mut redraw: impl FnMut(&App) -> Result<()>,
     mut next_key: impl FnMut() -> Result<Option<KeyCode>>,
-) -> Result<()> {
+    mut pending_signal: impl FnMut() -> Option<i32>,
+) -> Result<RunExit> {
     let mut last_registry_sync = Instant::now();
     loop {
+        if let Some(signal) = pending_signal() {
+            return Ok(RunExit::Signal(signal));
+        }
         poll_jobs(app);
         poll_state(app)?;
         if last_registry_sync.elapsed() >= Duration::from_secs(1) {
@@ -1169,11 +1257,20 @@ fn run_app(
             );
         }
         redraw(app)?;
-        let Some(key) = next_key()? else {
+        let key = match next_key() {
+            Ok(key) => key,
+            Err(error) => {
+                if let Some(signal) = pending_signal() {
+                    return Ok(RunExit::Signal(signal));
+                }
+                return Err(error);
+            }
+        };
+        let Some(key) = key else {
             continue;
         };
         match app.handle_key(key) {
-            UiAction::Quit => break,
+            UiAction::Quit => return Ok(RunExit::Quit),
             UiAction::Command(verb, true) => {
                 app.message = format!("{verb}: connecting");
                 redraw(app)?;
@@ -1214,7 +1311,6 @@ fn run_app(
             UiAction::None => {}
         }
     }
-    Ok(())
 }
 fn column(value: &str, width: usize) -> String {
     if value.chars().count() > width {
@@ -1391,6 +1487,7 @@ mod tests {
         .unwrap();
         App {
             lanes: vec![LaneStatus {
+                runtime: Default::default(),
                 spec,
                 state: "running".into(),
                 drift: false,
@@ -1605,13 +1702,67 @@ mod tests {
                 br#"[{"lane_id":"00000000-0000-4000-8000-000000000001","lane_name":"alpha","outcome":"skipped"}]"#,
             )
             .unwrap(),
-            "alpha: skipped"
+            "Upgrade finished for 1 lane.\nalpha: skipped\nPersistent home and project data were preserved."
         );
         assert!(
             upgrade_detail(br#"[{"spec":{"name":"alpha"},"state":"running","drift":true}]"#)
                 .unwrap()
                 .contains("(drift)")
         );
+        assert_eq!(column("abcdefgh", 4), "abc~");
+    }
+
+    #[test]
+    fn run_loop_reports_a_pending_signal_before_redrawing() {
+        let mut app = app();
+        let mut redraws = 0;
+        let exit = run_app(
+            &mut app,
+            |_| {
+                redraws += 1;
+                Ok(())
+            },
+            || panic!("input must not be read after a termination signal"),
+            || Some(SIGTERM),
+        )
+        .unwrap();
+        assert_eq!(exit, RunExit::Signal(SIGTERM));
+        assert_eq!(redraws, 0);
+    }
+
+    #[test]
+    fn run_loop_checks_signals_when_terminal_input_fails() {
+        let mut app = app();
+        let mut signal_checks = 0;
+        let exit = run_app(
+            &mut app,
+            |_| Ok(()),
+            || Err(anyhow::anyhow!("interrupted terminal read")),
+            || {
+                signal_checks += 1;
+                (signal_checks == 2).then_some(SIGTERM)
+            },
+        )
+        .unwrap();
+        assert_eq!(exit, RunExit::Signal(SIGTERM));
+
+        let error = run_app(
+            &mut app,
+            |_| Ok(()),
+            || Err(anyhow::anyhow!("broken terminal read")),
+            || None,
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "broken terminal read");
+    }
+
+    #[test]
+    fn control_c_is_an_interrupt_but_plain_c_remains_an_action() {
+        let control_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let plain_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE);
+        assert!(is_interrupt_key(&control_c));
+        assert!(!is_interrupt_key(&plain_c));
+        assert_eq!(app().handle_key(plain_c.code), UiAction::Reconcile(false));
     }
 
     #[test]
@@ -1679,6 +1830,7 @@ mod tests {
     fn state_poll_updates_lanes_individually() {
         let mut app = app();
         let beta = LaneStatus {
+            runtime: Default::default(),
             spec: LaneSpec::new(
                 "beta".into(),
                 "lab".into(),
@@ -1836,7 +1988,10 @@ mod tests {
         action(&mut app, "inspect").unwrap();
         assert!(app.detail.contains("State: running"));
         action(&mut app, "upgrade").unwrap();
-        assert_eq!(app.detail, "alpha: running");
+        assert_eq!(
+            app.detail,
+            "Upgrade finished for 1 lane.\nalpha: running\nPersistent home and project data were preserved."
+        );
         assert!(!action(&mut app, "fail").unwrap());
         assert_eq!(app.message, "fail: failed");
         assert_eq!(app.detail, "command failed");
@@ -1848,7 +2003,10 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert_eq!(app.message, "upgrade all: completed");
+        assert_eq!(
+            app.message,
+            "upgrade all: finished — 1 lane outcome; details below"
+        );
         assert!(app.detail.contains("alpha: running"));
         assert!(fs::read_to_string(worklane.with_extension("log"))
             .unwrap()
@@ -1982,6 +2140,7 @@ mod tests {
                 Ok(())
             },
             || Ok(keys.next().expect("test has a key for every redraw")),
+            || None,
         )
         .unwrap();
         assert_eq!(redraws, 4);
@@ -2011,6 +2170,7 @@ mod tests {
                 Ok(())
             },
             || Ok(locked_keys.next().expect("test has a key for every redraw")),
+            || None,
         )
         .unwrap();
         assert_eq!(locked_redraws, 2);
@@ -2051,6 +2211,7 @@ mod tests {
                     .next()
                     .expect("failed attach must redraw before quit"))
             },
+            || None,
         )
         .unwrap();
         assert_eq!(attach_redraws, 3);
@@ -2142,6 +2303,7 @@ mod tests {
         app.lanes[0].runtime_started_at = Some(Utc::now() - chrono::Duration::days(2));
         assert_eq!(live_age(&app.lanes[0]), "2d");
         app.lanes.push(LaneStatus {
+            runtime: Default::default(),
             spec: LaneSpec::new(
                 "beta".into(),
                 "other".into(),

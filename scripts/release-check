@@ -14,8 +14,8 @@ if [[ ${1:-} == --publish ]]; then
   sort -u "$ARTIFACT_DIR/passed-features.txt" >"$ARTIFACT_DIR/publish-actual-features.txt"
   diff -u "$ARTIFACT_DIR/publish-expected-features.txt" "$ARTIFACT_DIR/publish-actual-features.txt"
   mkdir -p dist
-  cp target/x86_64-unknown-linux-gnu/release/worklane target/x86_64-unknown-linux-gnu/release/lane dist/
-  sha256sum dist/worklane dist/lane | tee "$ARTIFACT_DIR/dist.sha256"
+  cp target/x86_64-unknown-linux-gnu/release/worklane target/x86_64-unknown-linux-gnu/release/lane target/x86_64-unknown-linux-gnu/release/worklane-mcp dist/
+  sha256sum dist/worklane dist/lane dist/worklane-mcp | tee "$ARTIFACT_DIR/dist.sha256"
   exit 0
 fi
 RUN_ID=${WORKLANE_ACCEPTANCE_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}
@@ -34,8 +34,9 @@ if command -v cargo-llvm-cov >/dev/null 2>&1; then "${CARGO[@]}" llvm-cov --work
 "${CARGO[@]}" build --release --target x86_64-unknown-linux-gnu
 WORKLANE="$ROOT/target/x86_64-unknown-linux-gnu/release/worklane"
 LANE="$ROOT/target/x86_64-unknown-linux-gnu/release/lane"
-sha256sum "$WORKLANE" "$LANE" >"$ARTIFACT_DIR/candidate.sha256"
-WORKLANE_ACCEPTANCE_RUN_ID="$RUN_ID" "$ROOT/scripts/lab-acceptance" "$WORKLANE" "$LANE" "$ARTIFACT_DIR"
+WORKLANE_MCP="$ROOT/target/x86_64-unknown-linux-gnu/release/worklane-mcp"
+sha256sum "$WORKLANE" "$LANE" "$WORKLANE_MCP" >"$ARTIFACT_DIR/candidate.sha256"
+WORKLANE_ACCEPTANCE_RUN_ID="$RUN_ID" "$ROOT/scripts/lab-acceptance" "$WORKLANE" "$LANE" "$WORKLANE_MCP" "$ARTIFACT_DIR"
 
 pngs=("$ARTIFACT_DIR"/tui/*.png)
 (( ${#pngs[@]} > 0 )) || { echo 'no TUI PNG artifacts were produced' >&2; exit 1; }

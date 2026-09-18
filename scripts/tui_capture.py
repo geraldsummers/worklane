@@ -108,7 +108,10 @@ def snapshot(screen, out, name):
     (out / f"{name}.html").write_text(f'''<!doctype html><meta charset="utf-8"><style>body{{margin:0;background:#111;color:#eee}}pre{{font:16px/1.25 monospace;padding:18px}}</style><pre>{body}</pre>''')
 
 def main():
-    ap=argparse.ArgumentParser(); ap.add_argument("--out",required=True); ap.add_argument("--scenario",required=True); ap.add_argument("command",nargs=argparse.REMAINDER)
+    ap = argparse.ArgumentParser(description="Capture a terminal scenario from a real PTY as text and HTML.")
+    ap.add_argument("--out", required=True, help="Directory for captures and the ANSI transcript")
+    ap.add_argument("--scenario", required=True, help="JSON scenario with startup_wait and ordered steps")
+    ap.add_argument("command", nargs=argparse.REMAINDER, help="Program and arguments to run in the PTY")
     a=ap.parse_args(); out=Path(a.out); out.mkdir(parents=True,exist_ok=True)
     scenario=json.loads(Path(a.scenario).read_text()); master, slave=pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 140, 0, 0))

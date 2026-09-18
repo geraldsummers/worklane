@@ -1,4 +1,9 @@
 # Every public command/action must have a matching pass marker in lab-acceptance.
+api.codex
+api.herdr
+api.jobs
+api.lifecycle
+api.shell
 cleanup.complete
 credentials.codex
 credentials.github
@@ -34,14 +39,27 @@ lane.stop
 lane.upgrade
 lane.upgrade.all
 lane.upgrade.force
+mcp.streamable_http
+mcp.tools
 registry.init
+runtime.agent_guidance
+runtime.agent_guidance.preserve
+runtime.git_index_safety
+runtime.git_shared_scans
 runtime.immutable_root
 runtime.mounts
 runtime.network
 runtime.process_reaping
+runtime.system_scope_denied
+runtime.systemd
+runtime.task_limits
 runtime.timestamp
 runtime.herdr_graphics
+runtime.herdr_supervision
 runtime.tools
+runtime.user_manager
+runtime.user_units
+runtime.user_units.persist
 tui.attach
 tui.confirmations
 tui.diff

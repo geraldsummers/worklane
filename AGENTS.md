@@ -1,194 +1,34 @@
-# Lane environment
+# Working on Worklane
 
-Worklane lanes have an immutable operating-system root filesystem. Agents do not have `sudo`,
-must not attempt `apt`, and must not modify files outside the explicitly writable locations below.
-When additional tools are needed, install or build them in user space instead of changing the
-system image from inside the lane.
+These instructions apply to this repository. When working inside a lane, also read
+[the shared lane guide](docs/agents/lane.md) before acting; it defines filesystem,
+Herdr, coordination, and progress-reporting requirements. Outside a lane, use the host's
+normal build environment and record that you are outside a Herdr pane when applicable.
 
-Use these locations for additions and generated state:
+## Documentation ownership
 
-- Project dependencies and generated files: `/home/dev`
-- Personal tools and binaries: `/home/dev/.local/bin`
-- Python virtual environments: `/home/dev/.venv` or a project `.venv`
-- Node global packages: `/home/dev/.local`
-- Rust-installed binaries: `/home/dev/.local/bin` (`CARGO_INSTALL_ROOT` is configured there)
-- Go-installed binaries: `/home/dev/.local/bin` (`GOBIN` is configured there)
-- Temporary files: Do not use `/tmp` for anything. Store temporary files under
-  `/home/dev/.tmp` (or a project-local temporary directory) instead. `/var/tmp` is also
-  unavailable unless the user explicitly authorizes it.
+- `docs/agents/lane.md` is the canonical prompt seeded into new lanes.
+- `docs/agents/automation.md` contains task-specific recipes shipped with that prompt.
+- `docs/agents/MIGRATE.md` explains agent-assisted adoption in existing lanes.
+- This file contains Worklane contributor requirements and is not embedded in lane prompts.
+- The README documents the user interface and links to these guides. Keep examples aligned
+  with the CLI, image recipe, helpers, and tests; distinguish implemented features from recipes.
 
-Use `$HOME/.local/bin` as the single standard entry point for locally installed executables. It
-is already added to `PATH` by the lane bootstrap and base image; do not create a new PATH fragment
-for each tool. Install a tool there directly, or place an executable symlink or small launcher in
-`$HOME/.local/bin` when the tool must live under another user-space prefix. Launchers must resolve
-their paths relative to `$HOME`, must forward arguments with `"$@"`, and must not depend on the
-installing agent's transient environment. After installation, verify the command from a fresh
-login shell with `zsh -lic 'command -v TOOL && TOOL --version'`. Only add an idempotent export to
-`$HOME/.zshenv` when a tool fundamentally cannot be exposed through `$HOME/.local/bin`; never
-overwrite shell startup files.
+Before editing, inspect `git status --short`, read all agent claims, and correlate them with
+live Herdr state as described in the shared guide. Preserve existing dirty and untracked work;
+coordinate before overlapping. Update only your own claim.
 
-The base image already provides common build, debugging, search, archive, network, browser, and
-language tooling. Prefer the installed tool before adding a new one.
+## Local release toolchain
 
-JVM SDKs are intentionally user-managed rather than installed from Debian packages. Use SDKMAN
-under `$HOME/.sdkman` to install and update Java, Kotlin, Gradle, Maven, and other supported SDKs.
-If SDKMAN is absent, install it as the lane user with its upstream installer; do not install it
-system-wide. SDKMAN-managed tools persist with the lane workspace and can be upgraded by agents
-without rebuilding the immutable image.
+Release validation uses Rust 1.88.0, installed with rustup under
+`/home/dev/.rustup-worklane` (Cargo state: `/home/dev/.cargo-worklane`). Reproduce with
+`TMPDIR=/home/dev/.tmp RUSTUP_HOME=/home/dev/.rustup-worklane CARGO_HOME=/home/dev/.cargo-worklane rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy`; activate individual
+commands with the same environment followed by `rustup run 1.88.0 cargo ...`.
 
-Whenever you install or upgrade an SDK, record its name, resolved version, installation method,
-and user-space location in the nearest applicable `AGENTS.md` before handing off. Include any
-activation or reproducibility command another agent will need. Keep this inventory current when
-an SDK is replaced or removed; do not leave essential toolchain state discoverable only from the
-current shell or an agent transcript.
-
-Herdr is the lane session manager. A normal `worklane lane attach` enters the lane through
-a stable lane session, with the lane workspace focused at `/home/dev`.
-Use Herdr-managed sessions unless the user explicitly asks for a plain shell.
-
-## Operating Herdr from an agent
-
-Treat Herdr as a structured control plane for the lane's persistent terminals. Use its CLI
-instead of sending interactive prefix-key sequences. The lane name is the Herdr session name;
-when there could be more than one session, target it explicitly by placing `--session LANE`
-immediately after `herdr` on every command.
-
-- Discover state before acting: use `herdr api snapshot`, `herdr workspace list`,
-  `herdr pane list`, and `herdr agent list`. These commands return JSON; select stable IDs from
-  their output rather than scraping labels or assuming pane order.
-- Identify where you yourself hail from before interpreting global state. Herdr injects
-  `HERDR_SESSION`, `HERDR_WORKSPACE_ID`, `HERDR_TAB_ID`, and `HERDR_PANE_ID`; record those exact
-  values and match `HERDR_PANE_ID` against `agent list` or the snapshot. Do not use the currently
-  focused pane as a proxy for your identity because another client or agent may hold focus. If the
-  variables are unset, explicitly record that the agent is outside a Herdr pane.
-- At the start of every turn, pair the collaboration claims described below with live Herdr agent
-  state. `herdr --session "$HERDR_SESSION" agent list` reports recognized agents and their
-  `agent_status` (`working`, `blocked`, `idle`, `done`, or `unknown`); the claim files explain what
-  those agents intend to change. Use `.pane_id` as the unambiguous live target when an agent has
-  no name.
-- Treat the two views as complementary rather than interchangeable. A live agent without a claim
-  may still own in-progress work, while a claim without a live agent may be stale. Never delete or
-  rewrite another agent's claim to reconcile them. When ownership or overlap is unclear, inspect
-  the live pane with `herdr agent read PANE_ID --lines 60`, then coordinate with
-  `herdr agent prompt PANE_ID 'TEXT'` before editing the same area.
-- Inspect work without taking focus using `herdr pane read PANE_ID --source recent-unwrapped
-  --lines N` or `herdr agent read TARGET`. Use `herdr pane process-info PANE_ID` when ownership
-  of a terminal is unclear.
-- Run a command in an existing shell with `herdr pane run PANE_ID 'COMMAND'`. To send a message to
-  Codex or another detected agent, use `herdr agent prompt TARGET 'TEXT'`; it submits the text with
-  Enter. `herdr pane send-text PANE_ID 'TEXT'` only types into the terminal and does not press
-  Enter, so follow it with `herdr agent send-keys TARGET enter` or `herdr pane send-keys PANE_ID
-  enter` when submission is intended. Never assume visible typed text was sent. Use raw key input
-  only when the higher-level prompt or run commands cannot express the interaction.
-- Create isolated work with `herdr pane split PANE_ID --direction right|down --cwd PATH
-  --no-focus`, or start a detected agent in an available shell pane with `herdr agent start NAME
-  --kind KIND --pane PANE_ID -- [ARG ...]`. Re-list state after creation and retain the returned
-  IDs.
-- Observe completion with `herdr agent wait TARGET --until idle --until blocked --timeout MS`, then
-  read the agent or pane output. Use bounded timeouts and report timeouts as inconclusive, not
-  success.
-- Do not focus panes merely to inspect them. Do not close panes or workspaces, stop/delete
-  sessions, or restart the Herdr server unless the user requested that lifecycle change and the
-  exact target was resolved first. Those operations can disrupt other agents and persistent work.
-
-### Sending keystrokes to a Herdr tab
-
-Herdr sends input to panes, not tabs. Resolve the target tab and then the exact pane within it;
-never assume that a tab has only one pane or that its first pane is the intended recipient.
-
-```sh
-state="$(herdr --session "$LANE" api snapshot)"
-tab_id="$(printf '%s\n' "$state" | jq -r '.result.snapshot.tabs[] | select(.label == "TAB_LABEL") | .tab_id')"
-printf '%s\n' "$state" | jq -r --arg tab "$tab_id" \
-  '.result.snapshot.panes[] | select(.tab_id == $tab) | [.pane_id, (.label // ""), (.agent // "")] | @tsv'
-```
-
-Choose one returned `pane_id`, confirm its contents with `herdr --session "$LANE" pane read
-PANE_ID --source recent-unwrapped --lines 40`, and send logical keys without focusing the tab:
-
-```sh
-herdr --session "$LANE" pane send-keys PANE_ID up up enter
-herdr --session "$LANE" pane send-keys PANE_ID ctrl+c
-herdr --session "$LANE" pane send-keys PANE_ID shift+tab enter
-```
-
-Key names are case-insensitive. Use printable keys such as `a`; special keys such as `enter`,
-`tab`, `esc`, `backspace`, and the arrow names `left`, `right`, `up`, and `down`; modifier chords
-such as `ctrl+h`, `alt+x`, and `shift+tab`; function keys such as `f1`; and named punctuation such
-as `minus`, `plus`, and `backtick`. Each argument is one key event. Prefer `pane run` for a shell
-command, `pane send-text` for literal text without Enter, and `agent prompt` or `agent send-keys`
-when targeting a detected agent by name. Read the pane again after input when confirmation matters.
-
-### Showing images to the human
-
-The target terminal is Ghostty. When the human needs to inspect an image, use Worklane's Herdr
-pane-graphics presenter, which creates a fresh, clearly labeled workspace and tab and focuses the
-presentation only after the native image is ready:
-
-```sh
-worklane-show-image --session "$LANE" --label "image review" /absolute/path/to/image.png
-```
-
-The helper supports PNG directly and uses GraphicsMagick for other common formats. It requires
-Herdr's experimental native pane-graphics API and a connected Ghostty frontend; there is no text or
-external-renderer fallback. Keep image review in its dedicated workspace rather than reusing a
-development pane.
-
-Run the relevant subcommand with `--help` for its exact arguments. Prefer Worklane-managed
-session lifecycle; do not manually start a second Herdr server for the lane.
-
-## Progress and ETA updates
-
-For work lasting more than a few minutes, send regular progress updates at meaningful phase
-boundaries and at least about every five minutes while work is active. Use real UTC timestamps,
-an honest phase count, concrete completed work, the current decision or blocker, elapsed time,
-and a recalibrated ETA. Do not repeat a stale ETA after new evidence changes the estimate.
-
-Use a compact shape such as:
-
-```text
-2026-08-09 13:45 UTC — Status — phase 1/6: contract audit nearly complete
-Progress: command routing, reachability model, and dirty-worktree ownership verified
-Decision: isolate the implementation in a new analyzer and make only narrow additive edits to the already-dirty CLI/test files
-Elapsed: ~6m
-ETA: ~45–60m to the deterministic proposal checkpoint; recalibrate after the first successful full-graph run
-Tokens: ~18k used / ~55–70k estimated total (best-effort estimate)
-```
-
-Estimate token usage when practical, clearly label it as approximate, and revise the estimate as
-scope changes. Prefer a useful range over false precision. If exact usage is unavailable, say so
-and estimate from elapsed work, tool output, and remaining phases.
-
-## Programmatic bulk delegation
-
-For independent bulk classification, extraction, or tagging, prefer the repository's
-`scripts/codex-bulk` driver when it is available. Feed it JSONL records with stable IDs and a
-JSON output schema. It defaults to `gpt-5.6-luna` with low reasoning, starts with 32 workers,
-adapts concurrency after successful runs, and coordinates queue-wide backoff after HTTP 429s.
-Its 256-worker setting is a hard ceiling, not a launch target. Preserve its append-only result
-file so completed IDs and retry state survive restarts. Do not replace its shared scheduler with
-unbounded background `codex exec` processes or per-process immediate retry loops.
-
-## Git and agent coordination
-
-- Before editing repository files, inspect `git status --short`. Treat existing
-  dirty and untracked files as user-owned unless the user explicitly says
-  otherwise.
-- Agents may delegate concrete, bounded subtasks to other agents when useful
-  and remain responsible for the combined result.
-- Coordinate through `$HOME/.local/share/worklane/agent-work/`. Use one
-  Markdown claim per agent named `agent--<id>.md`, where the canonical agent ID
-  loses its leading `/` and every remaining `/` becomes `--`. For example,
-  `/root/api` uses `agent--root--api.md`.
-- Read all claims at the start of every turn and immediately before editing, and correlate them
-  with `herdr agent list` as described above so both declared ownership and current activity inform
-  coordination.
-  Each agent updates and removes only its own file. Record the agent ID; files/area; status; exact
-  Herdr session, workspace, tab, and pane IDs from the injected environment; and an updated UTC
-  timestamp. If the agent is outside Herdr, record that instead of inventing IDs. Treat claims as
-  advisory soft locks and coordinate before overlapping.
-- Follow the repository testing cadence below before pushing. Do not push while
-  a required local check fails.
+For all local checks, set `TMPDIR=/home/dev/.tmp` and ensure that directory exists.
+Record any SDK installation or upgrade here with its resolved version, installation method,
+location, and activation command. This inventory describes the lane's user-managed release
+toolchain, not the Rust version bundled in the standard image.
 
 ## Repository testing cadence
 
@@ -219,6 +59,6 @@ scripts/release-check --publish RUN_ID
 ```
 
 This gate runs formatting, linting, tests, coverage, the complete isolated acceptance matrix on
-`gerald@192.168.0.11`, and real-PTY TUI capture. Directly copying binaries into `dist/` is not an
-acceptable substitute. Report the two SHA-256 hashes. Do not commit `dist/`, `target/`, or
+`podman_lab@192.168.0.11`, and real-PTY TUI capture. Directly copying binaries into `dist/` is not an
+acceptable substitute. Report the three SHA-256 hashes. Do not commit `dist/`, `target/`, or
 `artifacts/`; they are ignored.

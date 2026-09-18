@@ -6,52 +6,6 @@ and working directory. Project files, dotfiles, caches, agent state, and
 user-space tools therefore remain together in the user-managed directory. The
 container root filesystem is read-only and intentionally disposable.
 
-## Build
-
-Build the two static-distribution candidates on a Rust-enabled Linux workstation:
-
-```sh
-cargo build --release --target x86_64-unknown-linux-gnu
-sha256sum target/x86_64-unknown-linux-gnu/release/{worklane,lane}
-```
-
-Shell completions can be generated from the installed binary:
-
-```sh
-worklane completions bash > ~/.local/share/bash-completion/completions/worklane
-worklane completions zsh > ~/.zfunc/_worklane
-```
-
-## Release validation
-
-Every distributable build must pass the local quality suite and the isolated full-feature
-acceptance matrix on the lab workstation. The harness uses a unique registry, project, lane,
-image, and remote state directory for each run. It exercises real host credentials only through
-read-only login checks and captures each TUI interaction from a real PTY as text, HTML, and PNG.
-
-```sh
-scripts/release-check
-```
-
-The default lab is `gerald@192.168.0.11`; override it with `WORKLANE_LAB_SSH` when necessary.
-Inspect every reported PNG, create the requested `visual-review.txt` record, and publish only that
-successful candidate with `scripts/release-check --publish RUN_ID`. Artifacts are retained below
-`artifacts/lab-acceptance/RUN_ID`; `dist/` is untouched until the reviewed run is published.
-
-On first startup, Worklane seeds its embedded standard image recipe to
-`~/.local/share/worklane/Containerfile`. Custom edits are preserved, while a
-recognized older stock recipe can be refreshed by a newer binary. Open it with
-`worklane image edit` (the `e` key in `lane`). Standard image builds and
-lane upgrades use this file. Pass `--file PATH` to override it for a single build and
-`--no-cache` only when a clean Podman build is required. Worklane currently
-deliberately has no OCI registry: each host builds and retains its own Podman image.
-
-The standard image includes Python (pip and venv), Node.js/npm, TypeScript,
-Prettier for JS/TS/HTML/CSS, Rust/Cargo, zsh, GraphicsMagick for image conversion,
-and native build tooling, as well as Codex, Herdr, Git, and GitHub CLI. JVM SDKs
-such as Java, Kotlin, Gradle, and Maven are installed and updated by lane users through SDKMAN under
-`$HOME/.sdkman`, rather than being tied to Debian's package versions.
-
 ## First lane
 
 ```sh
@@ -64,9 +18,8 @@ uses the `default` profile. If the declared image is missing, it is built automa
 the lane starts. `lane attach` starts or reattaches the lane's default persistent Herdr session
 and starts Codex when that workspace does not already have a Codex agent.
 Detach with `Ctrl-B q`; panes and agents keep running in the lane. Use
-`worklane lane attach my-project --shell` for a plain zsh login shell. Use
-Herdr's own session commands only after attaching when you deliberately need a
-separate Herdr server. On the first Herdr attach, Worklane installs Herdr's
+`worklane lane attach my-project --shell` for a plain zsh login shell. Manage session lifecycle through Worklane; agents should not start a second
+Herdr server for the lane. On the first Herdr attach, Worklane installs Herdr's
 Codex integration into the selected directory so supported Codex sessions can
 be restored after a Herdr server restart. Worklane also bridges Herdr agent
 alerts to the outer terminal as a terminal bell, allowing terminal emulators
@@ -78,74 +31,38 @@ pane. Worklane enables Herdr's experimental Kitty graphics support and the helpe
 review workspace, converts common image formats when necessary, and presents the image through
 Herdr's native pane-graphics API.
 
-### Programmatic Codex runs
+## Agent guidance
 
-The attached Codex agent is useful for interactive work, but Codex can also be reinvoked
-non-interactively from scripts with `codex exec`. This is a convenient way for an agent or an
-ordinary program to delegate independent, well-bounded jobs without opening another TUI. For
-bulk work, write a small driver that pushes structured JSON or JSONL records into separate Codex
-invocations through standard input. Select the appropriate model with `--model`, and use a JSON
-Schema when the caller needs stable machine-readable results:
+Worklane currently bundles Codex and installs its Herdr integration. Herdr can recognize
+other agents, but Worklane does not install agent-specific instructions for them.
 
-```sh
-codex exec --ephemeral --model gpt-5.6-luna \
-  -c 'model_reasoning_effort="low"' \
-  --output-schema ./classification.schema.json \
-  "Classify the supplied record. Return only the schema-defined result." < record.json
-```
+On attach (including `--shell`), the owning host's Worklane binary publishes its embedded
+reference bundle at `$HOME/.local/share/worklane/agent-docs/current` inside the lane.
+The bundle includes the lane guide, automation recipes, migration checklist, and a
+content-derived `REVISION`. Attach seeds `$HOME/.codex/AGENTS.md` only if neither it nor
+`AGENTS.override.md` exists. Existing files, including empty files and symlinks, are preserved.
+The repository's contributor `AGENTS.md` is not part of the lane prompt.
 
-The repository includes `scripts/codex-bulk`, a standard-library Python driver that reads one
-JSON object per input line, requires a stable `id` field, and appends durable result events to
-an output JSONL file:
+For an existing lane, attach with the updated owning-host binary, then ask an agent:
 
-```sh
-scripts/codex-bulk records.jsonl \
-  --output classifications.jsonl \
-  --schema classification.schema.json \
-  --prompt "Classify the supplied record. Return only the schema-defined result."
-```
+> Read `$HOME/.local/share/worklane/agent-docs/current/MIGRATE.md` and migrate my active
+> instructions to that guidance, preserving my custom rules and backing up affected files.
 
-Successful IDs are skipped when the command is rerun. Rate-limited records produce a persisted
-`retrying` event before they return to the queue; final rows use `ok` or `error`. Override
-`--id-field`, `--initial-workers`, or other limits when required; run
-`scripts/codex-bulk --help` for the complete interface.
+The agent performs the merge; attach never rewrites active instructions or launches a
+migration agent. Custom `CODEX_HOME` locations need explicit migration. A running Codex
+session does not automatically reload initial instructions; start a new run after migration.
+The bundle is refreshed from the attaching binary, so an older host binary carries older
+guidance. Update the owning host before adopting a new version.
 
-This pattern is especially useful for bulk classification, extraction, or tagging: split the
-input into independent records, invoke bounded `codex exec` jobs with controlled concurrency,
-and aggregate their structured outputs. Treat 256 parallel Codex instances as a hard upper
-ceiling, not a launch target: OpenAI limits vary by organization, project, model, requests per
-minute, and tokens per minute, so no fixed concurrency is universally safe. Start with 32
-workers and adapt from observed results. The driver should preserve a stable input ID in every
-result, validate each response against the schema, and route low-confidence or terminal failures
-to a fallback model. Keeping one independent record per invocation makes failures isolated and
-results easy to resume or reorder; batch records together only when the classification requires
-cross-record context.
+- [Lane guide](docs/agents/lane.md): writable paths, tools, Herdr, coordination, and progress.
+- [Automation](docs/agents/automation.md): user services, allowance-driven work, and `scripts/codex-bulk`.
+- [Migration checklist](docs/agents/MIGRATE.md): backup, merge, verification, and rollback.
 
-Use one shared scheduler for the entire queue. After 32 consecutive successful completions,
-increase its worker target by one, up to 256. If any invocation exits with `429 Too Many Requests`
-or `exceeded retry limit`, stop launching new work, halve the worker target (with a floor of one),
-and apply a queue-wide 60-second cooldown plus random jitter before retrying the affected record.
-Do not let each subprocess immediately retry independently: unsuccessful requests also consume
-rate-limit capacity, and `codex exec` has already exhausted its own retries when it reports that
-message. Bound outer retries to three attempts and 15 minutes total per record, persist retry
-state for resumability, and distinguish temporary rate limits from quota or billing failures that
-require user action. When using the API directly instead of the CLI, honor `Retry-After` and the
-`x-ratelimit-*` response headers. See OpenAI's
-[rate-limit guidance](https://developers.openai.com/api/docs/guides/rate-limits).
+The standard image configures Codex with approvals disabled and `danger-full-access`.
+The lane's immutable root and container configuration apply to both interactive and scripted
+runs; do not assume `codex exec` uses a read-only sandbox in this image.
 
-Default to `gpt-5.6-luna` with low reasoning for these simple, high-volume delegations. It offers
-enough capability for structured classification while keeping reasoning latency and token use
-bounded. Reserve a stronger model or the persistent interactive agent for ambiguous cases,
-synthesis, and repository-wide changes. Use `--json` instead when the caller needs the full JSONL
-event stream, and keep the default read-only sandbox unless a job genuinely needs workspace writes.
-
-To build for a managed host, the Containerfile and build context must already exist on that host:
-
-```sh
-worklane image build --host lab --context /home/gerald/worklane --tag localhost/worklane:latest
-worklane lane create my-project --host lab --project /home/gerald/projects/my-project \
-  --profile default
-```
+## Lane configuration and lifecycle
 
 The portable, schema-v5 `.worklane/lane.toml` in each selected directory is
 the authority for lane configuration. The controller registry at
@@ -187,16 +104,29 @@ worklane host bootstrap lab
 worklane host deploy lab --binary target/x86_64-unknown-linux-gnu/release/worklane
 ```
 
-The SSH transport uses the existing OpenSSH configuration with `StrictHostKeyChecking=yes`; unknown or changed keys are rejected. Deployment copies a versioned binary, verifies SHA-256 on the host, then atomically updates `~/.local/bin/worklane`.
+To build for a managed host, the Containerfile and build context must already exist on that host:
+
+```sh
+worklane image build --host lab --context /home/dev/worklane --tag localhost/worklane:latest
+worklane lane create my-project --host lab --project /home/dev/projects/my-project \
+  --profile default
+```
+
+The SSH transport uses the existing OpenSSH configuration with `BatchMode=yes` and
+`StrictHostKeyChecking=yes`; it rejects password prompts and unknown or changed keys. Deployment
+copies a versioned binary, verifies SHA-256 on the host, then atomically updates
+`~/.local/bin/worklane`.
 
 All control commands accept `--json`. `image build` and `image inspect` accept
-`--host`; `image push` is intentionally unavailable. Builds use Podman's cache
-by default and accept `--no-cache` explicitly. `lane upgrade --all` builds each
+`--host`; `image push` is intentionally unavailable. Image builds use Podman's
+cache by default and accept `--no-cache` explicitly. Lane upgrades always rebuild
+the standard embedded image without cache and pull its base image so bundled
+tools such as Codex are actually refreshed. `lane upgrade --all` builds each
 distinct effective image once per host, then recreates its lanes so their
-immutable root filesystems are fresh. In the TUI, `u` performs a cached upgrade
-of one lane, while `U` performs a cached upgrade of all effective images. Use
-the CLI's explicit `--no-cache` option when a fresh rebuild and base-image pull
-are required. Custom Containerfiles retain control over local-only base images.
+immutable root filesystems are fresh. In the TUI, `u` upgrades one lane and `U`
+upgrades all effective images. For custom Containerfiles, pass `--no-cache` when
+a completely fresh rebuild is required; local-only base images remain under the
+custom Containerfile's control.
 Run `lane` for the keyboard-first terminal
 view. Host operations and bounded state checks run in the background; cached
 state is rendered immediately with its age, navigation remains available, and
@@ -207,10 +137,12 @@ Worklane does not impose a per-lane disk quota or preallocate storage. Because
 all persistent state is in the selected directory, users can inspect, back up,
 move, and constrain it with their filesystem's normal tools.
 
-Every lane runs with Podman's init process as PID 1 so orphaned subprocesses are reaped after
-cancelled or interrupted agent tools. Worklane also raises the lane cgroup PID limit to 16,384;
-this provides headroom for tool-heavy workloads while retaining a finite process bound. Existing
-lanes acquire these runtime settings when they are upgraded and recreated.
+New lanes using the standard image run systemd as PID 1. The system manager and its unit files
+remain on the immutable root, while `dev` receives a persistent user manager for autonomous lane
+services. Legacy and custom-image lanes may continue using Podman's init process. Both runtimes
+reap orphaned subprocesses, and Worklane raises the lane cgroup PID limit to 16,384 to provide
+headroom for tool-heavy workloads while retaining a finite process bound. Existing standard lanes
+migrate to systemd through the normal `lane upgrade` flow.
 
 ## Profiles
 
@@ -234,12 +166,13 @@ moved or imported; an explicit path remains fixed.
 [profiles.docs]
 image = "worklane:latest"
 network = "outbound"
+runtime = "systemd"
 devices = ["nvidia.com/gpu=all"]
 mount_codex_credentials = true
 mount_gh_credentials = true
 
 [[profiles.docs.mounts]]
-source = "/home/gerald/.cache/pip"
+source = "/home/dev/.cache/pip"
 target = "/home/dev/.cache/pip"
 read_only = false
 ```
@@ -251,3 +184,68 @@ contains CDI qualified device names; Worklane passes each entry to Podman as a
 separate `--device` argument. For example, `nvidia.com/gpu=all` exposes every
 GPU described by the host's NVIDIA CDI configuration. The host must already
 provide the named CDI devices and grant the lane-owning account access to them.
+`runtime` accepts `auto`, `systemd`, or `podman-init`. `auto` selects systemd for the embedded
+standard image and Podman's init for custom images. A custom image may opt into systemd when it
+contains a bootable `/sbin/init`, starts a persistent user manager for its `dev` account, exposes
+that user's D-Bus below `/run/user/UID`, and supplies the Worklane Herdr/helper user units. Worklane
+verifies the user manager before committing creation or upgrade. The image must create the runtime
+directory without depending on host `systemd-logind` and pass `XDG_RUNTIME_DIR` and
+`DBUS_SESSION_BUS_ADDRESS` into `user@UID.service`; the standard image supplies container-specific
+drop-ins for both requirements.
+
+## Standard image
+
+On first startup, Worklane seeds its embedded standard image recipe to
+`~/.local/share/worklane/Containerfile`. Custom edits are preserved, while a
+recognized older stock recipe can be refreshed by a newer binary. Open it with
+`worklane image edit` (the `e` key in `lane`). Standard image builds and
+lane upgrades use this file. Pass `--file PATH` to override it for a single build and
+`--no-cache` only when a clean Podman build is required. Worklane currently
+deliberately has no OCI registry: each host builds and retains its own Podman image.
+
+The standard image includes Python (pip and venv), Node.js/npm, TypeScript,
+Prettier for JS/TS/HTML/CSS, Rust/Cargo, zsh, GraphicsMagick for image conversion,
+and native build tooling, as well as Codex, Herdr, Git, GitHub CLI, and systemd. JVM SDKs
+such as Java, Kotlin, Gradle, and Maven are installed and updated by lane users through SDKMAN under
+`$HOME/.sdkman`, rather than being tied to Debian's package versions.
+
+## Development and release
+
+See [contributor instructions](AGENTS.md) for coordination, the local toolchain, and required
+checks. The commands below run on the build/controller host from a Worklane checkout.
+
+### Build
+
+Build the three distribution candidates on a Rust-enabled Linux workstation:
+
+```sh
+cargo build --release --target x86_64-unknown-linux-gnu
+sha256sum target/x86_64-unknown-linux-gnu/release/{worklane,lane,worklane-mcp}
+```
+
+For the internal ChatGPT connector, versioned machine API, OAuth setup, user service, and Caddy
+route, see [the connector guide](docs/connector.md).
+
+Shell completions can be generated from the installed binary:
+
+```sh
+mkdir -p ~/.local/share/bash-completion/completions ~/.zfunc
+worklane completions bash > ~/.local/share/bash-completion/completions/worklane
+worklane completions zsh > ~/.zfunc/_worklane
+```
+
+### Release validation
+
+Every distributable build must pass the local quality suite and the isolated full-feature
+acceptance matrix on the lab workstation. The harness uses a unique registry, project, lane,
+image, and remote state directory for each run. It verifies credential mounts with isolated
+fixture files and captures each TUI interaction from a real PTY as text, HTML, and PNG.
+
+```sh
+scripts/release-check
+```
+
+The default lab is `podman_lab@192.168.0.11`; override it with `WORKLANE_LAB_SSH` when necessary.
+Inspect every reported PNG, create the requested `visual-review.txt` record, and publish only that
+successful candidate with `scripts/release-check --publish RUN_ID`. Artifacts are retained below
+`artifacts/lab-acceptance/RUN_ID`; `dist/` is untouched until the reviewed run is published.

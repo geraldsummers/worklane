@@ -1,0 +1,21 @@
+[Unit]
+Description=Worklane MCP connector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=%h/.local/bin/worklane-mcp --worklane-bin %h/.local/bin/worklane
+EnvironmentFile=%h/.config/worklane/mcp.env
+Restart=on-failure
+RestartSec=5s
+RuntimeDirectory=worklane-mcp
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+TasksMax=4096
+MemoryHigh=1G
+MemoryMax=2G
+
+[Install]
+WantedBy=default.target

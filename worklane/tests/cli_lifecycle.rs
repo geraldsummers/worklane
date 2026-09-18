@@ -108,6 +108,34 @@ fn run_with_input(binary: &str, data: &Path, bin: &Path, input: &[u8]) -> std::p
 }
 
 #[test]
+fn upgrade_progress_events_do_not_mix_with_the_json_result() {
+    let root = temp("upgrade-progress");
+    let output = Command::new(env!("CARGO_BIN_EXE_worklane"))
+        .args(["--json", "lane", "upgrade", "--all"])
+        .env("XDG_DATA_HOME", root.join("data"))
+        .env("WORKLANE_EVENT_STREAM", "1")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result, serde_json::json!([]));
+    let events: Vec<serde_json::Value> = String::from_utf8(output.stderr)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(!events.is_empty());
+    assert_eq!(events[0]["phase"], "planning-upgrade");
+    assert!(events[0]["message"].as_str().unwrap().contains("0 lanes"));
+    assert!(events[0]["operation_id"].as_str().is_some());
+    for event in &events {
+        assert_eq!(event["operation_id"], events[0]["operation_id"]);
+        assert!(event["elapsed_ms"].is_u64());
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn executor_returns_correlated_success_and_error_envelopes() {
     let root = temp("executor-envelope");
     let bin_dir = root.join("bin");
@@ -246,6 +274,23 @@ case "$1:$2" in
     mv "$0.owner.$2" "$0.owner.$3"
     exit 0
     ;;
+  exec:--user)
+    failure="$(cat "$0.fail" 2>/dev/null || true)"
+    case "$failure:$*" in
+      shell:*WORKLANE_GIT_DIFF_PANE*|herdr:*herdr-codex-integration-v1*)
+        printf 'injected bootstrap failure\n' >&2
+        exit 23
+        ;;
+    esac
+    case "$*" in
+      *"systemctl --user is-active worklane-herdr.service"*) printf 'active\n' ;;
+    esac
+    exit 0
+    ;;
+  exec:-it)
+    test "$(cat "$0.fail" 2>/dev/null || true)" != attach
+    exit $?
+    ;;
   run:-d)
     name=''
     lane_id=''
@@ -353,6 +398,7 @@ exit 1
         ],
     );
     assert!(created.contains("\"state\":\"running\""));
+    assert!(created.contains("\"runtime\":\"systemd\""));
     assert!(run(
         binary,
         &data,
@@ -376,12 +422,15 @@ exit 1
     assert!(manifest.contains("session_name = \"smoke\""));
     assert!(manifest.contains("mount_codex_credentials = true"));
     assert!(manifest.contains("mount_gh_credentials = true"));
+    assert!(manifest.contains("runtime = \"systemd\""));
     assert!(!manifest.contains("host ="));
     assert!(!manifest.contains("project_path ="));
     let create_log = fs::read_to_string(podman.with_extension("log")).unwrap();
     assert!(create_log.contains(&format!("--name worklane-smoke-{SMOKE_ID}")));
     assert!(create_log.contains(&format!("--label io.worklane.id={SMOKE_ID}")));
     assert!(create_log.contains("--label io.worklane.name=smoke"));
+    assert!(create_log.contains("--systemd=always --cgroupns=private --user=0"));
+    assert!(!create_log.contains("--init"));
     assert!(create_log.contains("--workdir /home/dev"));
     assert!(create_log.contains(&format!(
         "src={},dst=/home/dev/.codex/auth.json,rw=true",
@@ -496,6 +545,44 @@ exit 1
     let start_log = fs::read_to_string(podman.with_extension("log")).unwrap();
     assert!(!start_log.lines().any(|line| line.starts_with("rm -f")));
     assert!(!start_log.lines().any(|line| line.starts_with("run -d")));
+    // Failed helper installation, Herdr setup, and PTY entry must not record an attach.
+    let before: serde_json::Value = serde_json::from_str(&run(
+        binary,
+        &data,
+        &bin_dir,
+        &["--json", "lane", "inspect", "smoke"],
+    ))
+    .unwrap();
+    for (failure, message) in [
+        ("shell", "lane zsh bootstrap failed"),
+        (
+            "herdr",
+            "Herdr Codex integration bootstrap failed: injected bootstrap failure",
+        ),
+        ("attach", "attach failed"),
+    ] {
+        fs::write(podman.with_extension("fail"), failure).unwrap();
+        fs::write(podman.with_extension("log"), "").unwrap();
+        let error = run_failure(binary, &data, &bin_dir, &["lane", "attach", "smoke"]);
+        assert!(error.contains(message), "{error}");
+        let log = fs::read_to_string(podman.with_extension("log")).unwrap();
+        if failure != "attach" {
+            assert!(!log.lines().any(|line| line.starts_with("exec -it")));
+        }
+        let after: serde_json::Value = serde_json::from_str(&run(
+            binary,
+            &data,
+            &bin_dir,
+            &["--json", "lane", "inspect", "smoke"],
+        ))
+        .unwrap();
+        assert_eq!(
+            after["spec"]["last_attached"],
+            before["spec"]["last_attached"]
+        );
+        assert_eq!(after["state"], "running");
+    }
+    fs::remove_file(podman.with_extension("fail")).unwrap();
     assert!(run(binary, &data, &bin_dir, &["lane", "attach", "smoke"]).is_empty());
     assert!(run(
         binary,
@@ -507,7 +594,7 @@ exit 1
     let attach_log = fs::read_to_string(podman.with_extension("log")).unwrap();
     assert!(attach_log
         .lines()
-        .any(|line| line.starts_with("exec -it --workdir /home/dev ")));
+        .any(|line| line.starts_with("exec -it --user dev --workdir /home/dev ")));
     assert!(run(
         binary,
         &data,

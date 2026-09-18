@@ -20,6 +20,17 @@ pub const DATABASE_SCHEMA_VERSION: u32 = 5;
 pub const OPERATION_SCHEMA_VERSION: u32 = 3;
 pub const EXECUTOR_PROTOCOL: u32 = 5;
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeMode {
+    /// Resolve when a new lane is created. Existing manifests that predate this
+    /// field retain their Podman-init runtime until a standard image upgrade.
+    #[default]
+    Auto,
+    Systemd,
+    PodmanInit,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Host {
     pub name: String,
@@ -43,6 +54,8 @@ pub struct Profile {
     pub embedded_containerfile: bool,
     #[serde(default = "default_network")]
     pub network: String,
+    #[serde(default)]
+    pub runtime: RuntimeMode,
     #[serde(default)]
     pub mounts: Vec<MountSpec>,
     /// CDI-qualified devices exposed to the lane by Podman.
@@ -112,10 +125,44 @@ impl Default for Profile {
             containerfile: default_containerfile(),
             embedded_containerfile: default_embedded_containerfile(),
             network: default_network(),
+            runtime: RuntimeMode::Auto,
             mounts: vec![],
             devices: vec![],
             mount_codex_credentials: default_mount_credentials(),
             mount_gh_credentials: default_mount_credentials(),
+        }
+    }
+}
+
+impl Profile {
+    /// Canonicalize a profile before it is snapshotted into a new lane.
+    pub fn resolve_runtime_for_new_lane(&mut self) {
+        if self.runtime == RuntimeMode::Auto {
+            self.runtime = if self.embedded_containerfile {
+                RuntimeMode::Systemd
+            } else {
+                RuntimeMode::PodmanInit
+            };
+        }
+    }
+
+    /// Runtime used by an existing lane. `Auto` is the backward-compatible
+    /// representation of manifests written before runtime selection existed.
+    pub fn effective_runtime(&self) -> RuntimeMode {
+        match self.runtime {
+            RuntimeMode::Auto => RuntimeMode::PodmanInit,
+            runtime => runtime,
+        }
+    }
+
+    /// Standard image upgrades are the explicit migration point for legacy
+    /// manifests. Explicit runtime choices are never overwritten.
+    pub fn migrate_runtime_for_standard_upgrade(&mut self) -> bool {
+        if self.runtime == RuntimeMode::Auto && self.embedded_containerfile {
+            self.runtime = RuntimeMode::Systemd;
+            true
+        } else {
+            false
         }
     }
 }
@@ -384,6 +431,8 @@ pub struct LaneStatus {
     pub spec: LaneSpec,
     pub state: String,
     pub drift: bool,
+    #[serde(default)]
+    pub runtime: RuntimeMode,
     pub cached_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_started_at: Option<DateTime<Utc>>,
@@ -669,6 +718,7 @@ impl Store {
             .map(|id| {
                 let index = self.index(&id)?;
                 Ok(LaneStatus {
+                    runtime: index.profile.effective_runtime(),
                     spec: cached_spec(&index),
                     state: index.state,
                     drift: index.drift,
@@ -884,7 +934,7 @@ pub fn host_state(r: &impl Runner, spec: &LaneSpec) -> Result<(String, bool)> {
     let name = spec.container_name();
     let state = host_runtime_state(r, spec)?;
     let drift = !matches!(state.as_str(), "absent")
-        && !meaningful_drift_lines(&podman(r, ["diff", &name])?, &spec.container_home()).is_empty();
+        && !meaningful_drift_lines_for_spec(&podman(r, ["diff", &name])?, spec).is_empty();
     Ok((state, drift))
 }
 pub fn host_runtime_state(r: &impl Runner, spec: &LaneSpec) -> Result<String> {
@@ -948,13 +998,6 @@ pub fn has_meaningful_drift(diff: &str, container_home: &Path) -> bool {
     !meaningful_drift_lines(diff, container_home).is_empty()
 }
 pub fn meaningful_drift_lines(diff: &str, container_home: &Path) -> Vec<String> {
-    meaningful_drift_lines_with_devices(diff, container_home, true)
-}
-fn meaningful_drift_lines_with_devices(
-    diff: &str,
-    container_home: &Path,
-    has_cdi_devices: bool,
-) -> Vec<String> {
     let mounted_home = container_home.display().to_string();
     let mounted_home_contents = format!("{mounted_home}/");
     diff.lines()
@@ -969,53 +1012,86 @@ fn meaningful_drift_lines_with_devices(
                 .any(|tmp| path == *tmp || path.starts_with(&format!("{tmp}/")));
             let mounted_home_change =
                 path == mounted_home || path.starts_with(&mounted_home_contents);
-            let cdi_runtime_change = has_cdi_devices
-                && ([
-                    "/etc/ld.so.cache",
-                    "/etc/ld.so.conf.d",
-                    "/etc/nvidia",
-                    "/etc/vulkan",
-                    "/usr",
-                    "/usr/bin",
-                    "/usr/lib",
-                    "/usr/lib/firmware",
-                    "/usr/lib/firmware/nvidia",
-                    "/usr/lib/x86_64-linux-gnu",
-                    "/usr/lib/x86_64-linux-gnu/nvidia",
-                    "/usr/lib/xorg",
-                    "/usr/lib/xorg/modules",
-                    "/usr/lib/xorg/modules/drivers",
-                    "/usr/share",
-                    "/usr/share/X11",
-                    "/usr/share/X11/xorg.conf.d",
-                    "/usr/share/egl",
-                    "/usr/share/egl/egl_external_platform.d",
-                    "/usr/share/glvnd",
-                    "/usr/share/glvnd/egl_vendor.d",
-                    "/var/cache/ldconfig",
-                ]
-                .contains(&path)
-                    || path.starts_with("/etc/ld.so.conf.d/")
-                    || path.starts_with("/etc/nvidia/")
-                    || path.starts_with("/etc/vulkan/")
-                    || path.starts_with("/usr/bin/nvidia-")
-                    || path.starts_with("/usr/lib/firmware/nvidia/")
-                    || path.starts_with("/usr/lib/x86_64-linux-gnu/libnvidia-")
-                    || path.starts_with("/usr/lib/x86_64-linux-gnu/nvidia/")
-                    || path.starts_with("/usr/lib/xorg/modules/drivers/nvidia_")
-                    || path.starts_with("/usr/share/X11/xorg.conf.d/nvidia-")
-                    || path.starts_with("/usr/share/egl/")
-                    || path.starts_with("/usr/share/glvnd/")
-                    || path.starts_with("/var/cache/ldconfig/"));
             !matches!(
                 *line,
                 "C /etc" | "C /etc/passwd" | "C /etc/group" | "C /home"
             ) && !mounted_home_change
                 && !transient_tmp
-                && !cdi_runtime_change
         })
         .map(str::to_owned)
         .collect()
+}
+
+/// NVIDIA's CDI hook injects its host driver libraries and metadata into the
+/// disposable root at container start. Those declared-device changes are
+/// runtime plumbing, while any unrelated writable-root change remains drift.
+pub fn meaningful_drift_lines_for_spec(diff: &str, spec: &LaneSpec) -> Vec<String> {
+    let nvidia_cdi = spec
+        .profile
+        .devices
+        .iter()
+        .any(|device| device.starts_with("nvidia.com/gpu="));
+    meaningful_drift_lines(diff, &spec.container_home())
+        .into_iter()
+        .filter(|line| {
+            let path = line
+                .split_once(' ')
+                .map(|(_, path)| path)
+                .unwrap_or_default();
+            !nvidia_cdi || !is_nvidia_cdi_runtime_path(path)
+        })
+        .collect()
+}
+
+fn is_nvidia_cdi_runtime_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/etc/ld.so.cache"
+            | "/etc/ld.so.conf.d"
+            | "/etc/vulkan"
+            | "/etc/vulkan/icd.d"
+            | "/etc/vulkan/implicit_layer.d"
+            | "/usr"
+            | "/usr/bin"
+            | "/usr/lib"
+            | "/usr/lib/firmware"
+            | "/usr/lib/x86_64-linux-gnu"
+            | "/usr/lib/x86_64-linux-gnu/nvidia"
+            | "/usr/lib/xorg"
+            | "/usr/lib/xorg/modules"
+            | "/usr/lib/xorg/modules/drivers"
+            | "/usr/share"
+            | "/usr/share/X11"
+            | "/usr/share/X11/xorg.conf.d"
+            | "/usr/share/egl"
+            | "/usr/share/egl/egl_external_platform.d"
+            | "/usr/share/glvnd"
+            | "/usr/share/glvnd/egl_vendor.d"
+            | "/var/cache"
+            | "/var/cache/ldconfig"
+            | "/var/cache/ldconfig/aux-cache"
+    ) || path.starts_with("/etc/ld.so.conf.d/00-nvcr-")
+        || path.starts_with("/etc/ld.so.conf.d/zz-nvcr-")
+        || path == "/etc/nvidia"
+        || path.starts_with("/etc/nvidia/")
+        || path.ends_with("/nvidia_icd.json")
+        || path.ends_with("/nvidia_layers.json")
+        || path.starts_with("/usr/bin/nvidia-")
+        || path == "/usr/lib/firmware/nvidia"
+        || path.starts_with("/usr/lib/firmware/nvidia/")
+        || path.starts_with("/usr/lib/x86_64-linux-gnu/libnvidia-")
+        || path.starts_with("/usr/lib/x86_64-linux-gnu/nvidia/")
+        || path.starts_with("/usr/lib/x86_64-linux-gnu/nvidia/current/libEGL_nvidia")
+        || path.starts_with("/usr/lib/x86_64-linux-gnu/nvidia/current/libGLES")
+        || path.starts_with("/usr/lib/x86_64-linux-gnu/nvidia/current/libGLX")
+        || path.starts_with("/usr/lib/x86_64-linux-gnu/nvidia/current/libcuda")
+        || path.starts_with("/usr/lib/x86_64-linux-gnu/nvidia/current/libnvcuvid")
+        || path.starts_with("/usr/lib/x86_64-linux-gnu/nvidia/current/libvdpau_nvidia")
+        || path == "/usr/lib/xorg/modules/drivers/nvidia_drv.so"
+        || path.ends_with("/nvidia-drm-outputclass.conf")
+        || path.ends_with("/10_nvidia_wayland.json")
+        || path.ends_with("/15_nvidia_gbm.json")
+        || path.ends_with("/10_nvidia.json")
 }
 pub fn write_lane_spec(spec: &LaneSpec) -> Result<()> {
     let manifest = LaneManifest::from(spec);
@@ -1474,10 +1550,37 @@ mod tests {
         assert_eq!(profile.network, "outbound");
         assert_eq!(profile.containerfile, PathBuf::from("Containerfile"));
         assert!(profile.embedded_containerfile);
+        assert_eq!(profile.runtime, RuntimeMode::Auto);
         assert!(profile.build_context.is_none());
         assert!(profile.mount_codex_credentials);
         assert!(profile.mount_gh_credentials);
         assert!(profile.devices.is_empty());
+    }
+
+    #[test]
+    fn runtime_resolution_preserves_legacy_manifests_and_canonicalizes_new_lanes() {
+        let mut standard: Profile = toml::from_str("image = 'test:latest'").unwrap();
+        assert_eq!(standard.effective_runtime(), RuntimeMode::PodmanInit);
+        assert!(standard.migrate_runtime_for_standard_upgrade());
+        assert_eq!(standard.runtime, RuntimeMode::Systemd);
+        assert!(!standard.migrate_runtime_for_standard_upgrade());
+
+        let mut new_standard = Profile::default();
+        new_standard.resolve_runtime_for_new_lane();
+        assert_eq!(new_standard.runtime, RuntimeMode::Systemd);
+
+        let mut custom = Profile {
+            embedded_containerfile: false,
+            ..Profile::default()
+        };
+        custom.resolve_runtime_for_new_lane();
+        assert_eq!(custom.runtime, RuntimeMode::PodmanInit);
+
+        let explicit: Profile = toml::from_str(
+            "image = 'custom:latest'\nembedded_containerfile = false\nruntime = 'systemd'",
+        )
+        .unwrap();
+        assert_eq!(explicit.effective_runtime(), RuntimeMode::Systemd);
     }
 
     #[test]
@@ -1543,6 +1646,12 @@ mod tests {
         profile.mount_codex_credentials = false;
         profile.mount_gh_credentials = true;
         assert!(validate_profile(&profile, Path::new("/home/gerald"), false).is_err());
+        profile.mounts[0].source = PathBuf::from("relative/source");
+        profile.mounts[0].target = PathBuf::from("/opt/tools");
+        profile.mount_gh_credentials = false;
+        assert!(validate_profile(&profile, Path::new("/home/gerald"), false).is_err());
+        profile.mounts[0].source = PathBuf::from("/definitely/not/a/real/worklane/source");
+        assert!(validate_profile(&profile, Path::new("/home/gerald"), true).is_err());
     }
 
     #[test]
@@ -1581,15 +1690,23 @@ mod tests {
     }
 
     #[test]
-    fn cdi_runtime_injection_is_not_drift_but_other_root_changes_are() {
-        let home = Path::new("/home/dev");
-        let injected = "C /etc/ld.so.cache\nC /usr\nC /usr/bin\nA /usr/bin/nvidia-smi\nC /usr/lib\nA /usr/lib/firmware/nvidia\nA /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1\nA /usr/lib/x86_64-linux-gnu/nvidia\nC /usr/share\nA /usr/share/glvnd/egl_vendor.d/10_nvidia.json\nC /var/cache/ldconfig\nC /var/cache/ldconfig/aux-cache\n";
-        assert!(meaningful_drift_lines(injected, home).is_empty());
+    fn declared_nvidia_cdi_injection_is_not_drift() {
+        let mut spec = LaneSpec::new(
+            "gpu".into(),
+            "local".into(),
+            PathBuf::from("/tmp/gpu"),
+            Profile::default(),
+        )
+        .unwrap();
+        spec.profile.devices = vec!["nvidia.com/gpu=all".into()];
+        let injected = "C /usr\nC /usr/bin\nA /usr/bin/nvidia-smi\nC /usr/lib\nA /usr/lib/x86_64-linux-gnu/nvidia\nA /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1\nC /usr/share\nC /usr/share/X11\nA /usr/share/X11/xorg.conf.d\nC /var/cache\nC /var/cache/ldconfig\nC /var/cache/ldconfig/aux-cache\n";
+        assert!(meaningful_drift_lines_for_spec(injected, &spec).is_empty());
         assert_eq!(
-            meaningful_drift_lines(&format!("{injected}A /opt/unexpected.txt\n"), home),
-            ["A /opt/unexpected.txt"]
+            meaningful_drift_lines_for_spec(&format!("{injected}A /usr/bin/user-tool\n"), &spec),
+            vec!["A /usr/bin/user-tool"]
         );
-        assert!(!has_meaningful_drift(injected, home));
+        spec.profile.devices.clear();
+        assert!(!meaningful_drift_lines_for_spec(injected, &spec).is_empty());
     }
 
     #[test]
