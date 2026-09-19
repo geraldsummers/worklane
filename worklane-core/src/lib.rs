@@ -956,12 +956,10 @@ pub fn host_state(r: &impl Runner, spec: &LaneSpec) -> Result<(String, bool, Vec
             &name,
         ],
     )?;
-    if actual != expected {
-        reasons.push(if actual.is_empty() || actual == "<no value>" {
-            "configuration-metadata-missing".into()
-        } else {
-            "configuration-changed".into()
-        });
+    // Containers created before configuration fingerprints were introduced do not provide
+    // evidence of drift. Once a fingerprint is present, however, a mismatch is definitive.
+    if !actual.is_empty() && actual != "<no value>" && actual != expected {
+        reasons.push("configuration-changed".into());
     }
     Ok((state, !reasons.is_empty(), reasons))
 }
@@ -1792,6 +1790,40 @@ mod tests {
         )
         .unwrap();
         assert!(host_state(&DiffFailingMock, &spec).is_err());
+    }
+
+    #[test]
+    fn configuration_drift_requires_a_present_mismatched_fingerprint() {
+        struct ConfigRunner(&'static str);
+        impl Runner for ConfigRunner {
+            fn run(&self, program: &str, args: &[String]) -> Result<String> {
+                assert_eq!(program, "podman");
+                Ok(match args.first().map(String::as_str) {
+                    Some("container") => String::new(),
+                    Some("diff") => String::new(),
+                    Some("inspect") if args.iter().any(|arg| arg.contains("config-sha256")) => {
+                        self.0.into()
+                    }
+                    Some("inspect") => "exited".into(),
+                    command => panic!("unexpected podman command: {command:?}"),
+                })
+            }
+        }
+        let spec = LaneSpec::new(
+            "legacy".into(),
+            "local".into(),
+            PathBuf::from("/tmp"),
+            Profile::default(),
+        )
+        .unwrap();
+
+        let (_, drift, reasons) = host_state(&ConfigRunner("<no value>"), &spec).unwrap();
+        assert!(!drift);
+        assert!(reasons.is_empty());
+
+        let (_, drift, reasons) = host_state(&ConfigRunner("outdated"), &spec).unwrap();
+        assert!(drift);
+        assert_eq!(reasons, ["configuration-changed"]);
     }
 
     #[test]

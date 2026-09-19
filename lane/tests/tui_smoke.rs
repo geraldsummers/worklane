@@ -8,6 +8,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+use worklane_core::{LaneSpec, Profile, Store};
 
 fn shell_quote(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
@@ -44,6 +45,77 @@ fn tui_starts_and_restores_a_real_pseudoterminal() {
         String::from_utf8_lossy(&output.stderr)
     );
     fs::remove_dir_all(data).unwrap();
+}
+
+#[test]
+fn attach_cannot_poison_the_calling_shell_terminal() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = env::temp_dir().join(format!("lane-attach-pty-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let data = root.join("data");
+    let bin = root.join("bin");
+    fs::create_dir_all(data.join("worklane")).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    let spec = LaneSpec::new(
+        "terminal-test".into(),
+        "lab".into(),
+        root.join("project"),
+        Profile::default(),
+    )
+    .unwrap();
+    Store::open(data.join("worklane/worklane-v5.db"))
+        .unwrap()
+        .save_lane(&spec, "running", false)
+        .unwrap();
+    let worklane = bin.join("worklane");
+    let attached = root.join("attached");
+    fs::write(
+        &worklane,
+        format!(
+            "#!/bin/sh\ncase \"$*\" in *'lane attach'*) stty -echo -icanon; : > {}; exit 0;; esac\nexit 1\n",
+            shell_quote(&attached)
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&worklane, fs::Permissions::from_mode(0o755)).unwrap();
+    let result_path = root.join("result");
+    let transcript_path = root.join("transcript");
+    let command = format!(
+        "before=$(stty -g); {}; lane_status=$?; after=$(stty -g); printf '%s\\n%s\\n%s\\n' \"$before\" \"$after\" \"$lane_status\" > {}",
+        shell_quote(Path::new(env!("CARGO_BIN_EXE_lane"))),
+        shell_quote(&result_path),
+    );
+    let path = format!("{}:{}", bin.display(), env::var("PATH").unwrap());
+    let mut child = Command::new("script")
+        .args(["-qfec", &command, transcript_path.to_str().unwrap()])
+        .env("XDG_DATA_HOME", &data)
+        .env("PATH", path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"a").unwrap();
+    assert!(wait_until(Duration::from_secs(3), || attached.exists()));
+    thread::sleep(Duration::from_millis(200));
+    stdin.write_all(b"q").unwrap();
+    thread::sleep(Duration::from_millis(300));
+    drop(stdin);
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        fs::read_to_string(&transcript_path).unwrap_or_default(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result = fs::read_to_string(&result_path).unwrap();
+    let lines = result.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 3);
+    assert_eq!(lines[0], lines[1], "terminal attributes were poisoned");
+    assert_eq!(lines[2], "0");
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
