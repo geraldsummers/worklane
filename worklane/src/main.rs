@@ -813,6 +813,8 @@ fn create_local_container<R: Runner>(r: &R, spec: &LaneSpec, name: &str) -> Resu
         format!("io.worklane.id={}", spec.id),
         "--label".into(),
         format!("io.worklane.name={}", spec.session_name),
+        "--label".into(),
+        format!("io.worklane.config-sha256={}", runtime_config_sha256(spec)?),
         "--env".into(),
         format!("WORKLANE_NAME={}", spec.name),
         "--env".into(),
@@ -1106,10 +1108,10 @@ fn finalize_local_upgrade_runtime<R: Runner>(
     cleanup_local_upgrade_helpers(r, spec)
 }
 fn refresh<R: Runner>(runner: &R, store: &Store, spec: &LaneSpec) -> Result<LaneStatus> {
-    let (resolved, state, drift, runtime_started_at) = if spec.host == "local" {
-        let (state, drift) = host_state(runner, spec)?;
+    let (resolved, state, drift, drift_reasons, runtime_started_at) = if spec.host == "local" {
+        let (state, drift, drift_reasons) = host_state(runner, spec)?;
         let started_at = host_runtime_started_at(runner, spec, &state)?;
-        (spec.clone(), state, drift, started_at)
+        (spec.clone(), state, drift, drift_reasons, started_at)
     } else {
         let out = remote(
             runner,
@@ -1127,6 +1129,7 @@ fn refresh<R: Runner>(runner: &R, store: &Store, spec: &LaneSpec) -> Result<Lane
             resolved,
             remote_status.state,
             remote_status.drift,
+            remote_status.drift_reasons,
             remote_status.runtime_started_at,
         )
     };
@@ -1136,6 +1139,7 @@ fn refresh<R: Runner>(runner: &R, store: &Store, spec: &LaneSpec) -> Result<Lane
         spec: resolved,
         state,
         drift,
+        drift_reasons,
         cached_at: Utc::now(),
         runtime_started_at,
     })
@@ -1180,6 +1184,7 @@ fn refresh_state_only<R: Runner>(runner: &R, store: &Store, spec: &LaneSpec) -> 
         spec: resolved,
         state,
         drift: existing_drift,
+        drift_reasons: Vec::new(),
         cached_at: Utc::now(),
         runtime_started_at,
     })
@@ -3662,6 +3667,23 @@ CMD ["sleep", "infinity"]
                         if args.iter().any(|arg| arg.contains("StartedAt")) =>
                     {
                         "2026-08-02 10:00:00 +1000 AEST".into()
+                    }
+                    ("podman", Some("inspect"))
+                        if args
+                            .iter()
+                            .any(|arg| arg.contains("io.worklane.config-sha256")) =>
+                    {
+                        self.calls
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .flat_map(|(_, values)| values)
+                            .find_map(|value| {
+                                value
+                                    .strip_prefix("io.worklane.config-sha256=")
+                                    .map(str::to_owned)
+                            })
+                            .unwrap()
                     }
                     ("podman", Some("inspect")) => "running".into(),
                     ("id", Some("-un")) => "gerald".into(),

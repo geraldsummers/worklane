@@ -434,6 +434,8 @@ pub struct LaneStatus {
     pub spec: LaneSpec,
     pub state: String,
     pub drift: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub drift_reasons: Vec<String>,
     #[serde(default)]
     pub runtime: RuntimeMode,
     pub cached_at: DateTime<Utc>,
@@ -725,6 +727,7 @@ impl Store {
                     spec: cached_spec(&index),
                     state: index.state,
                     drift: index.drift,
+                    drift_reasons: Vec::new(),
                     cached_at: index.status_cached_at,
                     runtime_started_at: None,
                 })
@@ -933,12 +936,34 @@ pub fn executor_command(target: &str) -> Vec<String> {
 pub fn executor_request(args: Vec<String>) -> Result<Vec<u8>> {
     Ok(serde_json::to_vec(&new_executor_request(args))?)
 }
-pub fn host_state(r: &impl Runner, spec: &LaneSpec) -> Result<(String, bool)> {
+pub fn host_state(r: &impl Runner, spec: &LaneSpec) -> Result<(String, bool, Vec<String>)> {
     let name = spec.container_name();
     let state = host_runtime_state(r, spec)?;
-    let drift = !matches!(state.as_str(), "absent")
-        && !meaningful_drift_lines_for_spec(&podman(r, ["diff", &name])?, spec).is_empty();
-    Ok((state, drift))
+    if state == "absent" {
+        return Ok((state, false, Vec::new()));
+    }
+    let mut reasons = meaningful_drift_lines_for_spec(&podman(r, ["diff", &name])?, spec)
+        .into_iter()
+        .map(|line| format!("writable-root:{line}"))
+        .collect::<Vec<_>>();
+    let expected = runtime_config_sha256(spec)?;
+    let actual = podman(
+        r,
+        [
+            "inspect",
+            "--format",
+            "{{index .Config.Labels \"io.worklane.config-sha256\"}}",
+            &name,
+        ],
+    )?;
+    if actual != expected {
+        reasons.push(if actual.is_empty() || actual == "<no value>" {
+            "configuration-metadata-missing".into()
+        } else {
+            "configuration-changed".into()
+        });
+    }
+    Ok((state, !reasons.is_empty(), reasons))
 }
 pub fn host_runtime_state(r: &impl Runner, spec: &LaneSpec) -> Result<String> {
     container_runtime_state(r, &spec.container_name())
@@ -1297,6 +1322,16 @@ pub fn clear_operation_journal(spec: &LaneSpec) -> Result<()> {
 }
 pub fn manifest_sha256(spec: &LaneSpec) -> Result<String> {
     manifest_value_sha256(&LaneManifest::from(spec))
+}
+/// Fingerprint only container configuration. The locally resolved image ID is
+/// recorded separately and may be learned after container creation.
+pub fn runtime_config_sha256(spec: &LaneSpec) -> Result<String> {
+    let mut manifest = LaneManifest::from(spec);
+    // Display-name changes deliberately preserve the stable session/container
+    // identity and do not require a container rebuild.
+    manifest.name = manifest.session_name.clone();
+    manifest.image_digest = None;
+    manifest_value_sha256(&manifest)
 }
 fn manifest_value_sha256(manifest: &LaneManifest) -> Result<String> {
     Ok(format!(

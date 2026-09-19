@@ -267,11 +267,12 @@ case "$1:$2" in
   container:exists) test -e "$0.container.$3"; exit $? ;;
   stop:*) printf 'exited\n' > "$0.state.$2"; exit 0 ;;
   start:*) printf 'running\n' > "$0.state.$2"; exit 0 ;;
-  rm:-f) rm -f "$0.container.$3" "$0.state.$3" "$0.owner.$3"; exit 0 ;;
+  rm:-f) rm -f "$0.container.$3" "$0.state.$3" "$0.owner.$3" "$0.config.$3"; exit 0 ;;
   rename:*)
     mv "$0.container.$2" "$0.container.$3"
     mv "$0.state.$2" "$0.state.$3"
     mv "$0.owner.$2" "$0.owner.$3"
+    mv "$0.config.$2" "$0.config.$3"
     exit 0
     ;;
   exec:--user)
@@ -295,6 +296,7 @@ case "$1:$2" in
     name=''
     lane_id=''
     lane_name=''
+    config_hash=''
     while test $# -gt 0; do
       case "$1" in
         --name) name=$2; shift 2 ;;
@@ -302,6 +304,7 @@ case "$1:$2" in
           case "$2" in
             io.worklane.id=*) lane_id=${2#io.worklane.id=} ;;
             io.worklane.name=*) lane_name=${2#io.worklane.name=} ;;
+            io.worklane.config-sha256=*) config_hash=${2#io.worklane.config-sha256=} ;;
           esac
           shift 2
           ;;
@@ -311,6 +314,7 @@ case "$1:$2" in
     touch "$0.container.$name"
     printf 'running\n' > "$0.state.$name"
     printf '%s|%s\n' "$lane_id" "$lane_name" > "$0.owner.$name"
+    printf '%s\n' "$config_hash" > "$0.config.$name"
     exit 0
     ;;
   image:inspect) printf 'sha256:test-image\n'; exit 0 ;;
@@ -318,6 +322,7 @@ case "$1:$2" in
     for name do :; done
     test -e "$0.container.$name" || exit 1
     case "$3" in
+      *config-sha256*) cat "$0.config.$name" ;;
       *Labels*) cat "$0.owner.$name" ;;
       *StartedAt*) printf '2026-08-02 10:00:00 +1000 AEST\n' ;;
       *) cat "$0.state.$name" ;;
@@ -429,6 +434,7 @@ exit 1
     assert!(create_log.contains(&format!("--name worklane-smoke-{SMOKE_ID}")));
     assert!(create_log.contains(&format!("--label io.worklane.id={SMOKE_ID}")));
     assert!(create_log.contains("--label io.worklane.name=smoke"));
+    assert!(create_log.contains("--label io.worklane.config-sha256="));
     assert!(create_log.contains("--systemd=always --cgroupns=private --user=0"));
     assert!(!create_log.contains("--init"));
     assert!(create_log.contains("--workdir /home/dev"));

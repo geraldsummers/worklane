@@ -1491,6 +1491,7 @@ mod tests {
                 spec,
                 state: "running".into(),
                 drift: false,
+                drift_reasons: Vec::new(),
                 cached_at: Utc::now(),
                 runtime_started_at: None,
             }],
@@ -1840,6 +1841,7 @@ mod tests {
             .unwrap(),
             state: "unknown".into(),
             drift: false,
+            drift_reasons: Vec::new(),
             cached_at: Utc::now(),
             runtime_started_at: None,
         };
@@ -2313,6 +2315,7 @@ mod tests {
             .unwrap(),
             state: "stopped".into(),
             drift: true,
+            drift_reasons: vec!["writable-root:C /etc/example".into()],
             cached_at: Utc::now(),
             runtime_started_at: None,
         });
