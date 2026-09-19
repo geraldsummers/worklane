@@ -149,7 +149,9 @@ migrate to systemd through the normal `lane upgrade` flow.
 Profiles are named entries in `~/.config/worklane/profiles.toml`. The built-in
 `default` profile uses the embedded Containerfile, outbound networking, and
 mounts the owning host's Codex and GitHub CLI credentials at their standard
-paths. Codex `auth.json` is mounted directly. For GitHub CLI, Worklane asks the
+paths. Worklane mounts the owning account's Codex directory behind a managed
+`auth.json` symlink. This directory-backed mount means an atomic host-side
+credential replacement is immediately visible to running lanes. For GitHub CLI, Worklane asks the
 host `gh` process to export active tokens—including tokens held in a desktop
 keyring—into a lane-specific managed file with mode 0600, then mounts that file.
 The export is refreshed whenever the lane container is created. Credential

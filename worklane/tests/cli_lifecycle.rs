@@ -433,8 +433,8 @@ exit 1
     assert!(!create_log.contains("--init"));
     assert!(create_log.contains("--workdir /home/dev"));
     assert!(create_log.contains(&format!(
-        "src={},dst=/home/dev/.codex/auth.json,rw=true",
-        data.join("credentials/codex/auth.json").display()
+        "src={},dst=/home/dev/.codex/host,rw=true",
+        data.join("credentials/codex").display()
     )));
     assert!(create_log.contains(&format!(
         "src={},dst=/home/dev/.config/gh/hosts.yml,rw=true",
@@ -458,11 +458,10 @@ exit 1
         );
     }
     assert_eq!(
-        fs::metadata(project.join(".codex/auth.json"))
-            .unwrap()
-            .len(),
-        0
+        fs::read_link(project.join(".codex/auth.json")).unwrap(),
+        PathBuf::from("host/auth.json")
     );
+    assert!(project.join(".codex/host").is_dir());
     assert_eq!(
         fs::metadata(project.join(".config/gh/hosts.yml"))
             .unwrap()

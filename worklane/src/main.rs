@@ -503,8 +503,8 @@ fn credential_mounts(spec: &LaneSpec) -> Result<Vec<(&'static str, PathBuf, Path
             absolute_environment_dir("CODEX_HOME")?.unwrap_or_else(|| home.join(".codex"));
         mounts.push((
             "Codex",
-            codex_home.join("auth.json"),
-            spec.container_home().join(".codex/auth.json"),
+            codex_home,
+            spec.container_home().join(".codex/host"),
         ));
     }
     if spec.profile.mount_gh_credentials {
@@ -522,6 +522,73 @@ fn credential_mounts(spec: &LaneSpec) -> Result<Vec<(&'static str, PathBuf, Path
         ));
     }
     Ok(mounts)
+}
+fn prepare_codex_credential_mountpoint(
+    spec: &LaneSpec,
+    source: &Path,
+    target: &Path,
+) -> Result<()> {
+    let auth_source = source.join("auth.json");
+    if !auth_source.is_file() {
+        bail!(
+            "Codex credentials were not found at {}; authenticate on host '{}' or disable the corresponding credential mount in the lane profile",
+            auth_source.display(),
+            spec.host
+        )
+    }
+    let relative = target
+        .strip_prefix(spec.container_home())
+        .expect("managed credential target is below lane home");
+    let mountpoint = spec.project_path.join(relative);
+    match fs::symlink_metadata(&mountpoint) {
+        Ok(metadata) if metadata.is_dir() => {
+            if fs::read_dir(&mountpoint)?.next().is_some() {
+                bail!(
+                    "refusing to hide existing data at managed Codex credential mountpoint {}",
+                    mountpoint.display()
+                )
+            }
+        }
+        Ok(_) => bail!(
+            "Codex credential mountpoint is not a directory: {}",
+            mountpoint.display()
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir_all(&mountpoint)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+
+    let auth_target = spec.project_path.join(".codex/auth.json");
+    let link_target = Path::new("host/auth.json");
+    match fs::symlink_metadata(&auth_target) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            if fs::read_link(&auth_target)? != link_target {
+                bail!(
+                    "refusing to replace unmanaged Codex credential symlink at {}",
+                    auth_target.display()
+                )
+            }
+        }
+        Ok(metadata) if metadata.is_file() && metadata.len() == 0 => {
+            fs::remove_file(&auth_target)?;
+            std::os::unix::fs::symlink(link_target, &auth_target)?;
+        }
+        Ok(_) => bail!(
+            "refusing to hide existing Codex credential data at {}; move it, use it on the host, or disable the managed credential mount",
+            auth_target.display()
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir_all(
+                auth_target
+                    .parent()
+                    .expect("managed Codex credential target has a parent"),
+            )?;
+            std::os::unix::fs::symlink(link_target, &auth_target)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
 }
 fn prepare_credential_mountpoint(
     spec: &LaneSpec,
@@ -675,7 +742,9 @@ fn append_credential_mounts(args: &mut Vec<String>, spec: &LaneSpec) -> Result<(
         );
     }
     for (tool, source, target) in mounts {
-        if !source.exists() {
+        if tool == "Codex" {
+            prepare_codex_credential_mountpoint(spec, &source, &target)?;
+        } else if !source.exists() {
             bail!(
                 "{tool} credentials were not found at {}; authenticate on host '{}' or disable the corresponding credential mount in the lane profile",
                 source.display(),
@@ -685,7 +754,13 @@ fn append_credential_mounts(args: &mut Vec<String>, spec: &LaneSpec) -> Result<(
         let mut source = source
             .canonicalize()
             .with_context(|| format!("resolve {tool} credential file {}", source.display()))?;
-        if !source.is_file() {
+        if tool == "Codex" && !source.is_dir() {
+            bail!(
+                "Codex credential source is not a directory: {}",
+                source.display()
+            )
+        }
+        if tool != "Codex" && !source.is_file() {
             bail!(
                 "{tool} credential source is not a regular file: {}",
                 source.display()
@@ -694,7 +769,7 @@ fn append_credential_mounts(args: &mut Vec<String>, spec: &LaneSpec) -> Result<(
         if tool == "GitHub CLI" {
             source = export_gh_credentials(spec, &source)?;
         }
-        if !prepare_credential_mountpoint(spec, tool, &source, &target)? {
+        if tool != "Codex" && !prepare_credential_mountpoint(spec, tool, &source, &target)? {
             continue;
         }
         args.extend([
@@ -2927,6 +3002,66 @@ mod tests {
             ]
         );
         assert_eq!(spec("local").session_name(), "test");
+    }
+
+    #[test]
+    fn codex_credentials_use_a_managed_directory_and_auth_symlink() {
+        let root = PathBuf::from("/home/dev/.tmp").join(format!(
+            "worklane-codex-credential-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let source = root.join("host-codex");
+        let project = root.join("project");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&project).unwrap();
+        fs::write(source.join("auth.json"), "credentials").unwrap();
+        let lane = LaneSpec::new(
+            "codex-credentials".into(),
+            "local".into(),
+            project.clone(),
+            Profile::default(),
+        )
+        .unwrap();
+        let target = lane.container_home().join(".codex/host");
+
+        prepare_codex_credential_mountpoint(&lane, &source, &target).unwrap();
+        assert!(project.join(".codex/host").is_dir());
+        assert_eq!(
+            fs::read_link(project.join(".codex/auth.json")).unwrap(),
+            PathBuf::from("host/auth.json")
+        );
+        prepare_codex_credential_mountpoint(&lane, &source, &target).unwrap();
+
+        fs::remove_file(project.join(".codex/auth.json")).unwrap();
+        fs::write(project.join(".codex/auth.json"), "").unwrap();
+        prepare_codex_credential_mountpoint(&lane, &source, &target).unwrap();
+        assert_eq!(
+            fs::read_link(project.join(".codex/auth.json")).unwrap(),
+            PathBuf::from("host/auth.json")
+        );
+
+        fs::remove_file(project.join(".codex/auth.json")).unwrap();
+        fs::write(project.join(".codex/auth.json"), "unmanaged").unwrap();
+        assert!(prepare_codex_credential_mountpoint(&lane, &source, &target)
+            .unwrap_err()
+            .to_string()
+            .contains("refusing to hide existing Codex credential data"));
+
+        fs::remove_file(project.join(".codex/auth.json")).unwrap();
+        std::os::unix::fs::symlink("elsewhere", project.join(".codex/auth.json")).unwrap();
+        assert!(prepare_codex_credential_mountpoint(&lane, &source, &target)
+            .unwrap_err()
+            .to_string()
+            .contains("refusing to replace unmanaged Codex credential symlink"));
+
+        fs::remove_file(project.join(".codex/auth.json")).unwrap();
+        fs::write(project.join(".codex/host/unmanaged"), "data").unwrap();
+        assert!(prepare_codex_credential_mountpoint(&lane, &source, &target)
+            .unwrap_err()
+            .to_string()
+            .contains("refusing to hide existing data"));
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

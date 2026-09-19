@@ -208,6 +208,9 @@ pub fn validate_profile(profile: &Profile, home: &Path, require_sources: bool) -
                 .mount_codex_credentials
                 .then(|| home.join(".codex/auth.json")),
             profile
+                .mount_codex_credentials
+                .then(|| home.join(".codex/host")),
+            profile
                 .mount_gh_credentials
                 .then(|| home.join(".config/gh/hosts.yml")),
         ];
