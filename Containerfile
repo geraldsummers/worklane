@@ -24,6 +24,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config procps psmisc python-is-python3 python3 python3-pip python3-venv systemd systemd-sysv \
     graphicsmagick pipx python3-tomlkit ripgrep rsync shellcheck socat sqlite3 strace tar tree unzip \
     tzdata valgrind vim wget xvfb xauth xz-utils yq zip zsh chromium \
+ && sed -i '/^[[:space:]]*SendEnv[[:space:]]/ s/ NO_COLOR//g' /etc/ssh/ssh_config \
  && rm -rf /var/lib/apt/lists/* \
  && ln -s /usr/bin/batcat /usr/local/bin/bat \
  && ln -s /usr/bin/fdfind /usr/local/bin/fd \
