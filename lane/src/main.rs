@@ -38,6 +38,10 @@ static FORCE_FULL_REDRAW: AtomicBool = AtomicBool::new(false);
 
 struct App {
     lanes: Vec<LaneStatus>,
+    storage: HashMap<String, String>,
+    storage_poll: Receiver<(String, String)>,
+    storage_sender: Sender<(String, String)>,
+    storage_pending: std::collections::HashSet<String>,
     selected: usize,
     filter: String,
     filtering: bool,
@@ -120,8 +124,13 @@ impl App {
     fn load() -> Result<Self> {
         let mut lanes = load_registered_lanes()?;
         sort_lanes(&mut lanes);
+        let (storage_sender, storage_poll) = mpsc::channel();
         let mut app = Self {
             lanes,
+            storage: HashMap::new(),
+            storage_poll,
+            storage_sender,
+            storage_pending: std::collections::HashSet::new(),
             selected: 0,
             filter: String::new(),
             filtering: false,
@@ -143,6 +152,7 @@ impl App {
             refresh_generations: HashMap::new(),
             next_refresh_generation: 0,
         };
+        start_storage_polls(&mut app);
         start_state_poll(&mut app);
         Ok(app)
     }
@@ -378,6 +388,28 @@ fn replace_lanes(app: &mut App, lanes: Vec<LaneStatus>) {
     }
     app.lanes = lanes;
     restore_selection(app, selected_id.as_deref());
+    start_storage_polls(app);
+}
+fn start_storage_polls(app: &mut App) {
+    for lane in &app.lanes {
+        if app.storage.contains_key(&lane.spec.id)
+            || !app.storage_pending.insert(lane.spec.id.clone())
+        {
+            continue;
+        }
+        let sender = app.storage_sender.clone();
+        let id = lane.spec.id.clone();
+        let path = lane.spec.project_path.clone();
+        let host = lane.spec.host.clone();
+        std::thread::spawn(move || {
+            let size = if host != "local" {
+                remote_disk_usage(&host, &path)
+            } else {
+                disk_usage(&path)
+            };
+            let _ = sender.send((id, size));
+        });
+    }
 }
 fn sync_registered_lanes(app: &mut App) -> Result<bool> {
     let lanes = load_registered_lanes()?;
@@ -1240,6 +1272,7 @@ fn run_app(
         }
         poll_jobs(app);
         poll_state(app)?;
+        poll_storage(app);
         if last_registry_sync.elapsed() >= Duration::from_secs(1) {
             match sync_registered_lanes(app) {
                 Ok(true) if app.state_poll_pending == 0 => start_state_poll(app),
@@ -1311,6 +1344,57 @@ fn run_app(
             UiAction::None => {}
         }
     }
+}
+fn poll_storage(app: &mut App) {
+    while let Ok((id, size)) = app.storage_poll.try_recv() {
+        app.storage_pending.remove(&id);
+        app.storage.insert(id, size);
+    }
+}
+fn disk_usage(path: &std::path::Path) -> String {
+    let output = Command::new("du").args(["-sk", "--"]).arg(path).output();
+    format_disk_usage(output.ok())
+}
+fn remote_disk_usage(host: &str, path: &std::path::Path) -> String {
+    let command = format!("du -sk -- {}", shell_quote(&path.to_string_lossy()));
+    let output = Command::new("ssh")
+        .args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=yes",
+            host,
+            &command,
+        ])
+        .output();
+    format_disk_usage(output.ok())
+}
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+fn format_disk_usage(output: Option<std::process::Output>) -> String {
+    let Some(output) = output else {
+        return "unavailable".into();
+    };
+    if !output.status.success() {
+        return "unavailable".into();
+    }
+    let Some(kib) = String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .next()
+        .and_then(|value| value.parse::<u64>().ok())
+    else {
+        return "unavailable".into();
+    };
+    let bytes = kib.saturating_mul(1024);
+    let units = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit + 1 < units.len() {
+        size /= 1024.0;
+        unit += 1;
+    }
+    format!("{size:.1} {}", units[unit])
 }
 fn column(value: &str, width: usize) -> String {
     if value.chars().count() > width {
@@ -1390,22 +1474,30 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         ])
         .split(f.area());
     let mut items = vec![ListItem::new(format!(
-        "{} {} {} {} {}",
+        "{} {} {} {} {} {}",
         column("NAME", 18),
         column("HOST", 14),
         column("STATE", 10),
         column("ALIVE", 7),
+        column("STORAGE", 10),
         "IMAGE"
     ))
     .style(Style::default().fg(Color::DarkGray))];
     items.extend(app.visible().iter().enumerate().map(|(i, x)| {
         let flag = if x.drift { " drift" } else { "" };
         ListItem::new(format!(
-            "{} {} {} {} {}{}",
+            "{} {} {} {} {} {}{}",
             column(&x.spec.name, 18),
             column(&x.spec.host, 14),
             column(&x.state, 10),
             column(&live_age(x), 7),
+            column(
+                app.storage
+                    .get(&x.spec.id)
+                    .map(String::as_str)
+                    .unwrap_or("…"),
+                10
+            ),
             x.spec.profile.image,
             flag
         ))
@@ -1485,6 +1577,7 @@ mod tests {
             Profile::default(),
         )
         .unwrap();
+        let (_, storage_poll) = mpsc::channel();
         App {
             lanes: vec![LaneStatus {
                 runtime: Default::default(),
@@ -1494,6 +1587,10 @@ mod tests {
                 cached_at: Utc::now(),
                 runtime_started_at: None,
             }],
+            storage: HashMap::new(),
+            storage_poll,
+            storage_sender: mpsc::channel().0,
+            storage_pending: std::collections::HashSet::new(),
             selected: 0,
             filter: String::new(),
             filtering: false,
@@ -1520,6 +1617,24 @@ mod tests {
     fn environment_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn storage_usage_formats_sizes_and_handles_measurement_failures() {
+        assert_eq!(format_disk_usage(None), "unavailable");
+        let successful = std::process::Output {
+            status: Command::new("true").status().unwrap(),
+            stdout: b"1024\t/some/path\n".to_vec(),
+            stderr: Vec::new(),
+        };
+        assert_eq!(format_disk_usage(Some(successful)), "1.0 MiB");
+        let unsuccessful = std::process::Output {
+            status: Command::new("false").status().unwrap(),
+            stdout: b"0\t/some/path\n".to_vec(),
+            stderr: Vec::new(),
+        };
+        assert_eq!(format_disk_usage(Some(unsuccessful)), "unavailable");
+        assert_eq!(shell_quote("a'b"), "'a'\\''b'");
     }
     fn inject_job(app: &mut App, receiver: Receiver<JobEvent>, verb: &str) {
         app.jobs.push(ActiveJob {
@@ -2217,8 +2332,13 @@ mod tests {
         assert_eq!(attach_redraws, 3);
         assert_eq!(app.message, "attach: failed");
         assert_eq!(app.detail, "attach exploded");
+        let (_, storage_poll) = mpsc::channel();
         let mut empty = App {
             lanes: vec![],
+            storage: HashMap::new(),
+            storage_poll,
+            storage_sender: mpsc::channel().0,
+            storage_pending: std::collections::HashSet::new(),
             selected: 0,
             filter: String::new(),
             filtering: false,
