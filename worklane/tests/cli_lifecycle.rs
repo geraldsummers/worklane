@@ -264,6 +264,16 @@ fn local_lifecycle_uses_podman_and_preserves_project() {
 printf '%s\n' "$*" >> "$0.log"
 case "$1:$2" in
   image:exists|pull:*|build:-f) exit 0 ;;
+  run:--rm)
+    case "$*" in
+      *"/etc/worklane/codex-version"*) printf '0.157.0\n' ;;
+      *"/usr/local/bin/codex-real"*)
+        if test -e "$0.version-mismatch"; then printf 'codex-cli 0.155.1\n'; else printf 'codex-cli 0.157.0\n'; fi
+        ;;
+      *) exit 1 ;;
+    esac
+    exit 0
+    ;;
   container:exists) test -e "$0.container.$3"; exit $? ;;
   stop:*) printf 'exited\n' > "$0.state.$2"; exit 0 ;;
   start:*) printf 'running\n' > "$0.state.$2"; exit 0 ;;
@@ -433,8 +443,8 @@ exit 1
     assert!(!create_log.contains("--init"));
     assert!(create_log.contains("--workdir /home/dev"));
     assert!(create_log.contains(&format!(
-        "src={},dst=/home/dev/.codex/auth.json,rw=true",
-        data.join("credentials/codex/auth.json").display()
+        "src={},dst=/run/worklane-host-codex,ro=true",
+        data.join("credentials/codex").display()
     )));
     assert!(create_log.contains(&format!(
         "src={},dst=/home/dev/.config/gh/hosts.yml,rw=true",
@@ -458,10 +468,8 @@ exit 1
         );
     }
     assert_eq!(
-        fs::metadata(project.join(".codex/auth.json"))
-            .unwrap()
-            .len(),
-        0
+        fs::read_link(project.join(".codex/auth.json")).unwrap(),
+        Path::new("/run/worklane-host-codex/auth.json")
     );
     assert_eq!(
         fs::metadata(project.join(".config/gh/hosts.yml"))
@@ -520,6 +528,18 @@ exit 1
         &["--json", "lane", "refresh", "--all"]
     )
     .contains("\"state\":\"exited\""));
+    fs::write(podman.with_extension("version-mismatch"), "").unwrap();
+    assert!(run_failure(
+        binary,
+        &data,
+        &bin_dir,
+        &["--json", "lane", "upgrade", "smoke", "--force"]
+    )
+    .contains("Codex version mismatch"));
+    assert!(podman
+        .with_extension(format!("container.worklane-smoke-{SMOKE_ID}"))
+        .exists());
+    fs::remove_file(podman.with_extension("version-mismatch")).unwrap();
     assert!(run(
         binary,
         &data,

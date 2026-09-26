@@ -208,6 +208,9 @@ pub fn validate_profile(profile: &Profile, home: &Path, require_sources: bool) -
                 .mount_codex_credentials
                 .then(|| home.join(".codex/auth.json")),
             profile
+                .mount_codex_credentials
+                .then(|| PathBuf::from("/run/worklane-host-codex")),
+            profile
                 .mount_gh_credentials
                 .then(|| home.join(".config/gh/hosts.yml")),
         ];
@@ -1641,6 +1644,8 @@ mod tests {
         assert!(validate_profile(&profile, Path::new("/home/gerald"), false).is_err());
         profile.mounts[0].target = PathBuf::from("/home/gerald/.codex");
         profile.mount_codex_credentials = true;
+        assert!(validate_profile(&profile, Path::new("/home/gerald"), false).is_err());
+        profile.mounts[0].target = PathBuf::from("/run/worklane-host-codex");
         assert!(validate_profile(&profile, Path::new("/home/gerald"), false).is_err());
         profile.mounts[0].target = PathBuf::from("/home/gerald/.config/gh/hosts.yml");
         profile.mount_codex_credentials = false;

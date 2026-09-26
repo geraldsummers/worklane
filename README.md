@@ -124,8 +124,9 @@ copies a versioned binary, verifies SHA-256 on the host, then atomically updates
 All control commands accept `--json`. `image build` and `image inspect` accept
 `--host`; `image push` is intentionally unavailable. Image builds use Podman's
 cache by default and accept `--no-cache` explicitly. Lane upgrades always rebuild
-the standard embedded image without cache and pull its base image so bundled
-tools such as Codex are actually refreshed. `lane upgrade --all` builds each
+the standard embedded image without cache and pull its base image. The build
+installs the Codex release pinned by the standard Containerfile, and
+verifies the installed CLI before replacing a lane. `lane upgrade --all` builds each
 distinct effective image once per host, then recreates its lanes so their
 immutable root filesystems are fresh. In the TUI, `u` upgrades one lane and `U`
 upgrades all effective images. For custom Containerfiles, pass `--no-cache` when
@@ -153,15 +154,21 @@ migrate to systemd through the normal `lane upgrade` flow.
 Profiles are named entries in `~/.config/worklane/profiles.toml`. The built-in
 `default` profile uses the embedded Containerfile, outbound networking, and
 mounts the owning host's Codex and GitHub CLI credentials at their standard
-paths. Codex `auth.json` is mounted directly. For GitHub CLI, Worklane asks the
+paths. Worklane mounts the host `CODEX_HOME` directory read only at
+`/run/worklane-host-codex` and links the lane's `.codex/auth.json` to it. Host
+credential replacements become visible on the next credential read; other host
+Codex files are also readable at that mount path. Sign in, sign out, and refresh
+credentials on the host: lane token refresh cannot write to the read only mount.
+An existing lane `auth.json` is preserved as a mode-0600
+`auth.json.worklane-backup-*` file when upgrading to this layout. For GitHub CLI, Worklane asks the
 host `gh` process to export active tokens—including tokens held in a desktop
 keyring—into a lane-specific managed file with mode 0600, then mounts that file.
 The export is refreshed whenever the lane container is created. Credential
 contents are never copied into the manifest, image, registry, or selected
 directory. Missing credentials stop container creation with authentication
 guidance; set the corresponding profile flag to `false` to opt out explicitly.
-Worklane creates empty, mode-0600 mountpoint files in the selected home and
-refuses to hide existing non-empty files. A profile is snapshotted when a lane
+Worklane creates an empty, mode-0600 GitHub mountpoint file in the selected home
+and refuses to hide an existing non-empty GitHub file. A profile is snapshotted when a lane
 is created.
 An omitted `build_context` follows the lane's selected directory when it is
 moved or imported; an explicit path remains fixed.

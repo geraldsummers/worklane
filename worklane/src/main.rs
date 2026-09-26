@@ -17,6 +17,7 @@ mod api;
 
 /// The standard lane image recipe travels with every `worklane` binary.
 const EMBEDDED_CONTAINERFILE: &str = include_str!("../../Containerfile");
+const HOST_CODEX_MOUNT: &str = "/run/worklane-host-codex";
 const STANDARD_CONTAINERFILE_MARKER: &str = "worklane-standard-containerfile";
 /// High enough for tool-heavy workloads while still bounding runaway process creation.
 const LANE_PIDS_LIMIT: &str = "16384";
@@ -452,6 +453,36 @@ fn build_local_image<R: Runner>(r: &R, spec: &LaneSpec, no_cache: bool) -> Resul
     )?;
     Ok(())
 }
+fn verify_standard_codex_version<R: Runner>(r: &R, image: &str) -> Result<String> {
+    let expected = podman(
+        r,
+        [
+            "run",
+            "--rm",
+            "--entrypoint",
+            "/usr/bin/cat",
+            image,
+            "/etc/worklane/codex-version",
+        ],
+    )?;
+    let installed = podman(
+        r,
+        [
+            "run",
+            "--rm",
+            "--entrypoint",
+            "/usr/local/bin/codex-real",
+            image,
+            "--version",
+        ],
+    )?;
+    if installed != format!("codex-cli {expected}") {
+        bail!(
+            "standard image Codex version mismatch: npm resolved {expected}, installed {installed}; existing lane was preserved"
+        )
+    }
+    Ok(expected)
+}
 fn timezone_from_localtime_link(link: &Path) -> Option<String> {
     let zoneinfo = Path::new("/usr/share/zoneinfo");
     link.strip_prefix(zoneinfo)
@@ -501,11 +532,7 @@ fn credential_mounts(spec: &LaneSpec) -> Result<Vec<(&'static str, PathBuf, Path
     if spec.profile.mount_codex_credentials {
         let codex_home =
             absolute_environment_dir("CODEX_HOME")?.unwrap_or_else(|| home.join(".codex"));
-        mounts.push((
-            "Codex",
-            codex_home.join("auth.json"),
-            spec.container_home().join(".codex/auth.json"),
-        ));
+        mounts.push(("Codex", codex_home, PathBuf::from(HOST_CODEX_MOUNT)));
     }
     if spec.profile.mount_gh_credentials {
         let gh_config = if let Some(path) = absolute_environment_dir("GH_CONFIG_DIR")? {
@@ -522,6 +549,67 @@ fn credential_mounts(spec: &LaneSpec) -> Result<Vec<(&'static str, PathBuf, Path
         ));
     }
     Ok(mounts)
+}
+fn prepare_codex_auth_link(spec: &LaneSpec) -> Result<()> {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let codex_home = spec.project_path.join(".codex");
+    match fs::symlink_metadata(&codex_home) {
+        Ok(metadata) if !metadata.file_type().is_dir() => bail!(
+            "lane Codex home is not a regular directory: {}",
+            codex_home.display()
+        ),
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir_all(&codex_home)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let destination = spec.project_path.join(".codex/auth.json");
+    let link_target = Path::new(HOST_CODEX_MOUNT).join("auth.json");
+    let legacy_link_target = Path::new("host/auth.json");
+    match fs::symlink_metadata(&destination) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            let existing_target = fs::read_link(&destination)?;
+            if existing_target == link_target {
+                return Ok(());
+            }
+            if existing_target == legacy_link_target {
+                fs::remove_file(&destination)?;
+            } else {
+                bail!(
+                    "Codex credential path has an unmanaged symlink: {}",
+                    destination.display()
+                )
+            }
+        }
+        Ok(metadata) if metadata.file_type().is_file() => {
+            if metadata.len() != 0 {
+                fs::set_permissions(&destination, fs::Permissions::from_mode(0o600))?;
+                let backup = destination.with_file_name(format!(
+                    "auth.json.worklane-backup-{}",
+                    uuid::Uuid::new_v4()
+                ));
+                fs::rename(&destination, &backup).with_context(|| {
+                    format!(
+                        "preserve existing lane Codex credentials at {}",
+                        backup.display()
+                    )
+                })?;
+            } else {
+                fs::remove_file(&destination)?;
+            }
+        }
+        Ok(_) => bail!(
+            "Codex credential path is not a regular file: {}",
+            destination.display()
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    symlink(&link_target, &destination)
+        .with_context(|| format!("link Codex credentials at {}", destination.display()))?;
+    Ok(())
 }
 fn prepare_credential_mountpoint(
     spec: &LaneSpec,
@@ -675,16 +763,40 @@ fn append_credential_mounts(args: &mut Vec<String>, spec: &LaneSpec) -> Result<(
         );
     }
     for (tool, source, target) in mounts {
-        if !source.exists() {
+        let credential_file = if tool == "Codex" {
+            source.join("auth.json")
+        } else {
+            source.clone()
+        };
+        if !credential_file.exists() {
             bail!(
                 "{tool} credentials were not found at {}; authenticate on host '{}' or disable the corresponding credential mount in the lane profile",
-                source.display(),
+                credential_file.display(),
                 spec.host
             )
         }
         let mut source = source
             .canonicalize()
-            .with_context(|| format!("resolve {tool} credential file {}", source.display()))?;
+            .with_context(|| format!("resolve {tool} credential source {}", source.display()))?;
+        if tool == "Codex" {
+            let auth = source.join("auth.json");
+            if !fs::symlink_metadata(&auth)?.file_type().is_file() {
+                bail!(
+                    "Codex credential source must be a regular file: {}",
+                    auth.display()
+                )
+            }
+            prepare_codex_auth_link(spec)?;
+            args.extend([
+                "--mount".into(),
+                format!(
+                    "type=bind,src={},dst={},ro=true",
+                    source.display(),
+                    target.display()
+                ),
+            ]);
+            continue;
+        }
         if !source.is_file() {
             bail!(
                 "{tool} credential source is not a regular file: {}",
@@ -2508,8 +2620,17 @@ fn main() -> Result<()> {
                                             upgrade_rebuild_without_cache(&s, no_cache);
                                         build_local_image(&r, &s, rebuild_without_cache)?;
                                     }
-                                    s.image_digest =
-                                        Some(image_identity(&r, &s.profile.image)?);
+                                    let image = image_identity(&r, &s.profile.image)?;
+                                    if s.profile.embedded_containerfile {
+                                        let version = verify_standard_codex_version(&r, &image)?;
+                                        report_phase(
+                                            Some((&s.id, &s.name)),
+                                            "running",
+                                            "verifying-codex",
+                                            &format!("verified Codex {version} in rebuilt image"),
+                                        );
+                                    }
+                                    s.image_digest = Some(image);
                                     let mut journal =
                                         OperationJournal::new(&s, "upgrade", "prepared")?;
                                     journal.runtime_was_running = Some(!matches!(
@@ -3224,7 +3345,7 @@ exit 0
     fn standard_containerfile_is_embedded() {
         assert!(EMBEDDED_CONTAINERFILE.starts_with("FROM debian:trixie-slim"));
         assert!(EMBEDDED_CONTAINERFILE.contains("@openai/codex"));
-        assert!(EMBEDDED_CONTAINERFILE.contains("CODEX_VERSION=latest"));
+        assert!(EMBEDDED_CONTAINERFILE.contains("CODEX_VERSION=0.157.0"));
         assert!(EMBEDDED_CONTAINERFILE.contains("HERDR_SHA256="));
         assert!(EMBEDDED_CONTAINERFILE.contains("RUSTUP_INIT_SHA256="));
         assert!(EMBEDDED_CONTAINERFILE.contains("sha256sum -c -"));
@@ -3232,6 +3353,7 @@ exit 0
         assert!(EMBEDDED_CONTAINERFILE.contains("/etc/codex/config.toml"));
         assert!(EMBEDDED_CONTAINERFILE.contains("approval_policy = \"never\""));
         assert!(EMBEDDED_CONTAINERFILE.contains("sandbox_mode = \"danger-full-access\""));
+        assert!(EMBEDDED_CONTAINERFILE.contains("check_for_update_on_startup = false"));
         assert!(EMBEDDED_CONTAINERFILE.contains("install -m 755 /tmp/herdr /usr/local/bin/herdr"));
         assert!(!EMBEDDED_CONTAINERFILE.contains("NOPASSWD:ALL"));
         assert!(EMBEDDED_CONTAINERFILE.contains("ripgrep"));
@@ -3473,6 +3595,103 @@ CMD ["sleep", "infinity"]
         custom.profile.embedded_containerfile = false;
         assert!(!upgrade_rebuild_without_cache(&custom, false));
         assert!(upgrade_rebuild_without_cache(&custom, true));
+    }
+
+    #[test]
+    fn managed_codex_auth_preserves_lane_file_and_reuses_link() {
+        let home =
+            std::env::temp_dir().join(format!("worklane-codex-auth-test-{}", uuid::Uuid::new_v4()));
+        let mut lane = spec("local");
+        lane.project_path = home.clone();
+        fs::create_dir_all(home.join(".codex")).unwrap();
+        fs::write(home.join(".codex/auth.json"), b"lane-only-auth").unwrap();
+
+        prepare_codex_auth_link(&lane).unwrap();
+        let auth = home.join(".codex/auth.json");
+        assert_eq!(
+            fs::read_link(&auth).unwrap(),
+            Path::new(HOST_CODEX_MOUNT).join("auth.json")
+        );
+        let backups: Vec<_> = fs::read_dir(home.join(".codex"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("auth.json.worklane-backup-")
+            })
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(fs::read(backups[0].path()).unwrap(), b"lane-only-auth");
+        prepare_codex_auth_link(&lane).unwrap();
+        assert_eq!(fs::read_dir(home.join(".codex")).unwrap().count(), 2);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn managed_codex_auth_handles_new_and_empty_homes_but_rejects_foreign_links() {
+        let home = std::env::temp_dir().join(format!(
+            "worklane-codex-auth-new-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut lane = spec("local");
+        lane.project_path = home.clone();
+        fs::create_dir_all(&home).unwrap();
+
+        prepare_codex_auth_link(&lane).unwrap();
+        let auth = home.join(".codex/auth.json");
+        assert_eq!(
+            fs::read_link(&auth).unwrap(),
+            Path::new(HOST_CODEX_MOUNT).join("auth.json")
+        );
+
+        fs::remove_file(&auth).unwrap();
+        fs::write(&auth, b"").unwrap();
+        prepare_codex_auth_link(&lane).unwrap();
+        assert_eq!(
+            fs::read_link(&auth).unwrap(),
+            Path::new(HOST_CODEX_MOUNT).join("auth.json")
+        );
+
+        fs::remove_file(&auth).unwrap();
+        std::os::unix::fs::symlink("host/auth.json", &auth).unwrap();
+        prepare_codex_auth_link(&lane).unwrap();
+        assert_eq!(
+            fs::read_link(&auth).unwrap(),
+            Path::new(HOST_CODEX_MOUNT).join("auth.json")
+        );
+
+        fs::remove_file(&auth).unwrap();
+        std::os::unix::fs::symlink("/tmp/unmanaged-auth", &auth).unwrap();
+        assert!(prepare_codex_auth_link(&lane)
+            .unwrap_err()
+            .to_string()
+            .contains("unmanaged symlink"));
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn standard_codex_version_mismatch_is_rejected() {
+        struct VersionRunner;
+        impl Runner for VersionRunner {
+            fn run(&self, _program: &str, args: &[String]) -> Result<String> {
+                if args
+                    .last()
+                    .is_some_and(|arg| arg == "/etc/worklane/codex-version")
+                {
+                    Ok("0.157.0".into())
+                } else {
+                    Ok("codex-cli 0.155.1".into())
+                }
+            }
+        }
+        assert!(
+            verify_standard_codex_version(&VersionRunner, "sha256:image")
+                .unwrap_err()
+                .to_string()
+                .contains("version mismatch")
+        );
     }
 
     #[test]

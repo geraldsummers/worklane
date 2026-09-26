@@ -1,6 +1,6 @@
 FROM debian:trixie-slim
 # worklane-standard-containerfile
-ARG CODEX_VERSION=latest
+ARG CODEX_VERSION=0.157.0
 ARG TYPESCRIPT_VERSION=7.0.2
 ARG PRETTIER_VERSION=3.9.5
 ARG RUST_VERSION=1.85.1
@@ -27,10 +27,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && rm -rf /var/lib/apt/lists/* \
  && ln -s /usr/bin/batcat /usr/local/bin/bat \
  && ln -s /usr/bin/fdfind /usr/local/bin/fd \
- && env NPM_CONFIG_PREFIX=/usr/local npm install -g "@openai/codex@${CODEX_VERSION}" "typescript@${TYPESCRIPT_VERSION}" "prettier@${PRETTIER_VERSION}" \
+ && codex_version="$(npm view "@openai/codex@${CODEX_VERSION}" version --fetch-retries=2)" \
+ && test -n "$codex_version" \
+ && env NPM_CONFIG_PREFIX=/usr/local npm install -g "@openai/codex@${codex_version}" "typescript@${TYPESCRIPT_VERSION}" "prettier@${PRETTIER_VERSION}" \
+ && install -d /etc/worklane \
+ && printf '%s\n' "$codex_version" > /etc/worklane/codex-version \
  && mv /usr/local/bin/codex /usr/local/bin/codex-real \
  && printf '%s\n' \
     '#!/bin/sh' \
+    'host_auth=/run/worklane-host-codex/auth.json' \
+    'if [ -f "$host_auth" ]; then' \
+    '  case "${1:-}" in' \
+    '    login|logout) echo "Codex credentials are managed on the host; sign in or out there" >&2; exit 2 ;;' \
+    '  esac' \
+    '  lane_auth="$HOME/.codex/auth.json"' \
+    '  if [ ! -e "$lane_auth" ] && [ ! -L "$lane_auth" ]; then ln -s "$host_auth" "$lane_auth"; fi' \
+    'fi' \
     'for arg do' \
     '  case "$arg" in' \
     '    --yolo|--dangerously-bypass-approvals-and-sandbox) exec /usr/local/bin/codex-real "$@" ;;' \
@@ -40,7 +52,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     > /usr/local/bin/codex \
  && chmod +x /usr/local/bin/codex \
  && mkdir -p /etc/codex \
- && printf '%s\n' 'approval_policy = "never"' 'sandbox_mode = "danger-full-access"' > /etc/codex/config.toml \
+ && printf '%s\n' 'approval_policy = "never"' 'sandbox_mode = "danger-full-access"' 'check_for_update_on_startup = false' > /etc/codex/config.toml \
  && curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs -o /tmp/rustup-init.sh \
  && echo "${RUSTUP_INIT_SHA256}  /tmp/rustup-init.sh" | sha256sum -c - \
  && env CARGO_HOME=/usr/local/cargo RUSTUP_HOME=/usr/local/rustup sh /tmp/rustup-init.sh -y --profile minimal \
