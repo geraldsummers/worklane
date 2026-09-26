@@ -31,6 +31,22 @@ pub enum RuntimeMode {
     PodmanInit,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentKind {
+    #[default]
+    Codex,
+    Pi,
+}
+impl AgentKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Pi => "pi",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Host {
     pub name: String,
@@ -44,6 +60,9 @@ pub struct Host {
 #[serde(deny_unknown_fields)]
 pub struct Profile {
     pub image: String,
+    /// Agent started in the lane's primary Herdr pane.
+    #[serde(default)]
+    pub agent: AgentKind,
     /// Host-native context used to rebuild this host-local image during upgrade.
     #[serde(default, with = "build_context_serde")]
     pub build_context: Option<PathBuf>,
@@ -121,6 +140,7 @@ impl Default for Profile {
     fn default() -> Self {
         Self {
             image: DEFAULT_IMAGE.into(),
+            agent: AgentKind::Codex,
             build_context: None,
             containerfile: default_containerfile(),
             embedded_containerfile: default_embedded_containerfile(),
@@ -183,6 +203,12 @@ pub fn load_profiles() -> Result<BTreeMap<String, Profile>> {
     Ok(profiles)
 }
 pub fn validate_profile(profile: &Profile, home: &Path, require_sources: bool) -> Result<()> {
+    if profile.agent == AgentKind::Pi && profile.embedded_containerfile {
+        bail!("Pi lanes require a custom Pi image; the embedded image contains Codex")
+    }
+    if profile.agent == AgentKind::Pi && profile.mount_codex_credentials {
+        bail!("Pi lanes must disable the Codex credential mount")
+    }
     if !matches!(profile.network.as_str(), "outbound" | "none") {
         bail!("profile network must be 'outbound' or 'none'")
     }
@@ -1554,10 +1580,28 @@ mod tests {
         assert_eq!(profile.containerfile, PathBuf::from("Containerfile"));
         assert!(profile.embedded_containerfile);
         assert_eq!(profile.runtime, RuntimeMode::Auto);
+        assert_eq!(profile.agent, AgentKind::Codex);
         assert!(profile.build_context.is_none());
         assert!(profile.mount_codex_credentials);
         assert!(profile.mount_gh_credentials);
         assert!(profile.devices.is_empty());
+    }
+
+    #[test]
+    fn pi_profile_is_explicit_and_never_mounts_codex_credentials() {
+        let profile: Profile = toml::from_str(
+            "image = 'localhost/worklane-pi-pilot:0.87.1'\nagent = 'pi'\nembedded_containerfile = false\ncontainerfile = 'Containerfile.pi'\nruntime = 'systemd'\nmount_codex_credentials = false",
+        )
+        .unwrap();
+        assert_eq!(profile.agent, AgentKind::Pi);
+        assert_eq!(profile.agent.as_str(), "pi");
+        assert!(validate_profile(&profile, Path::new("/tmp/pilot"), false).is_ok());
+        let mut invalid = profile.clone();
+        invalid.mount_codex_credentials = true;
+        assert!(validate_profile(&invalid, Path::new("/tmp/pilot"), false).is_err());
+        invalid.mount_codex_credentials = false;
+        invalid.embedded_containerfile = true;
+        assert!(validate_profile(&invalid, Path::new("/tmp/pilot"), false).is_err());
     }
 
     #[test]

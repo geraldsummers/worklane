@@ -112,14 +112,16 @@ fn termination_signals_restore_the_real_pseudoterminal() {
             .spawn()
             .expect("util-linux script must provide a pseudoterminal");
 
+        // Rootless Podman hosts can have substantial I/O latency while another
+        // image is being materialized; keep the PTY assertions event-based.
         assert!(
-            wait_until(Duration::from_secs(3), || shell_pid_path.exists()),
+            wait_until(Duration::from_secs(10), || shell_pid_path.exists()),
             "{name}: command shell did not start"
         );
         let shell_pid = fs::read_to_string(&shell_pid_path).unwrap();
         let children_path = format!("/proc/{shell_pid}/task/{shell_pid}/children");
         assert!(
-            wait_until(Duration::from_secs(3), || {
+            wait_until(Duration::from_secs(10), || {
                 fs::read_to_string(&children_path).is_ok_and(|children| !children.trim().is_empty())
                     && fs::read(&transcript_path).is_ok_and(|transcript| {
                         transcript.windows(6).any(|window| window == b"\x1b[?25l")
@@ -140,7 +142,7 @@ fn termination_signals_restore_the_real_pseudoterminal() {
         assert!(status.success(), "{name}: could not signal lane process");
 
         assert!(
-            wait_until(Duration::from_secs(3), || {
+            wait_until(Duration::from_secs(10), || {
                 wrapper.try_wait().unwrap().is_some()
             }),
             "{name}: lane did not terminate promptly"

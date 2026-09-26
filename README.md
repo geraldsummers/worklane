@@ -220,6 +220,48 @@ and native build tooling, as well as Codex, Herdr, Git, GitHub CLI, and systemd.
 such as Java, Kotlin, Gradle, and Maven are installed and updated by lane users through SDKMAN under
 `$HOME/.sdkman`, rather than being tied to Debian's package versions.
 
+## Isolated Pi pilot
+
+`Containerfile.pi` is an opt-in candidate image. It installs Pi and the
+`pi-web-access` extension but not Codex. The profile's `agent = "pi"` selector
+starts Pi in Herdr with OpenAI Codex as its model provider, limits its tools to
+`read`, `bash`, `edit`, `write`, `web_search`, `fetch_content`, and `questionnaire`, and seeds the
+extension to use OpenAI-backed search and HTTP-only page fetching. This does
+not change the default Codex profile or any existing lane.
+
+In the pilot, `/plan` toggles read-only planning. Pi can ask one or more
+selectable questions with a free-text answer, inspect files, and use web search,
+but cannot call shell or write tools while planning. A numbered `Plan:` proposal
+opens an explicit Execute / Refine / Stay choice; cancelling leaves planning
+active. Plan mode is off by default, and its state survives a session resume.
+
+Build the candidate image on the lane-owning host, then put this profile in a
+*separate* Worklane config directory for a disposable pilot:
+
+```sh
+worklane image build --file /path/to/worklane/Containerfile.pi \
+  --context /path/to/worklane --tag localhost/worklane-pi-pilot:0.87.1
+```
+
+```toml
+[profiles.pi-pilot]
+image = "localhost/worklane-pi-pilot:0.87.1"
+agent = "pi"
+build_context = "/path/to/worklane"
+containerfile = "Containerfile.pi"
+embedded_containerfile = false
+runtime = "systemd"
+network = "outbound"
+mount_codex_credentials = false
+mount_gh_credentials = false
+```
+
+Use an empty selected directory and isolated `XDG_CONFIG_HOME` and
+`XDG_DATA_HOME` when creating the pilot. Pi must be signed in separately with
+`/login` inside the pilot lane; the host Codex auth file is deliberately not
+mounted or copied. Search is not authenticated until that sign-in succeeds.
+Do not upgrade production lanes to this profile during the pilot.
+
 ## Development and release
 
 See [contributor instructions](AGENTS.md) for coordination, the local toolchain, and required
