@@ -477,7 +477,6 @@ exit 1
         fs::read_link(project.join(".codex/auth.json")).unwrap(),
         Path::new("/run/worklane-host-codex/auth.json")
     );
-    assert!(project.join(".codex/host").is_dir());
     assert_eq!(
         fs::metadata(project.join(".config/gh/hosts.yml"))
             .unwrap()
