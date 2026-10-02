@@ -3376,6 +3376,13 @@ esac
             std::env::temp_dir().join(format!("worklane-bell-bootstrap-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&home).unwrap();
         fs::create_dir_all(home.join(".config/herdr")).unwrap();
+        fs::create_dir_all(home.join("test-bin")).unwrap();
+        fs::write(home.join("test-bin/herdr"), "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(
+            home.join("test-bin/herdr"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
         fs::write(
             home.join(".config/herdr/config.toml"),
             "# keep this comment\nonboarding = false\n",
@@ -3388,6 +3395,14 @@ esac
                 .env("WORKLANE_NAME", "test")
                 .env("WORKLANE_SESSION", "test")
                 .env("WORKLANE_WORKSPACE", &home)
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}",
+                        home.join("test-bin").display(),
+                        std::env::var("PATH").unwrap()
+                    ),
+                )
                 .status()
                 .unwrap()
         };
@@ -3434,6 +3449,13 @@ esac
         let home =
             std::env::temp_dir().join(format!("worklane-pi-shell-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(home.join("test-bin")).unwrap();
+        fs::write(home.join("test-bin/herdr"), "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(
+            home.join("test-bin/herdr"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
         let run_bootstrap = || {
             Command::new("zsh")
                 .args(["-c", &bootstrap_shell_script()])
@@ -3442,6 +3464,14 @@ esac
                 .env("WORKLANE_NAME", "test")
                 .env("WORKLANE_SESSION", "test")
                 .env("WORKLANE_WORKSPACE", &home)
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}",
+                        home.join("test-bin").display(),
+                        std::env::var("PATH").unwrap()
+                    ),
+                )
                 .status()
                 .unwrap()
         };
