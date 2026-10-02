@@ -29,12 +29,14 @@ use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender, TryRecvError},
+        Mutex,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use worklane_core::{LaneStatus, Store};
 
 static FORCE_FULL_REDRAW: AtomicBool = AtomicBool::new(false);
+static ORIGINAL_TERMINAL_STATE: Mutex<Option<libc::termios>> = Mutex::new(None);
 
 struct App {
     lanes: Vec<LaneStatus>,
@@ -1181,6 +1183,30 @@ fn restore_terminal_state() {
         Show
     );
     let _ = stdout.flush();
+    restore_original_terminal_attributes();
+}
+fn capture_original_terminal_attributes() {
+    if !io::stdin().is_terminal() {
+        return;
+    }
+    let mut attributes = std::mem::MaybeUninit::<libc::termios>::uninit();
+    // SAFETY: tcgetattr initializes the termios value when it succeeds.
+    if unsafe { libc::tcgetattr(libc::STDIN_FILENO, attributes.as_mut_ptr()) } == 0 {
+        if let Ok(mut original) = ORIGINAL_TERMINAL_STATE.lock() {
+            // SAFETY: the successful tcgetattr above initialized attributes.
+            *original = Some(unsafe { attributes.assume_init() });
+        }
+    }
+}
+fn restore_original_terminal_attributes() {
+    let Ok(original) = ORIGINAL_TERMINAL_STATE.lock() else {
+        return;
+    };
+    let Some(attributes) = original.as_ref() else {
+        return;
+    };
+    // SAFETY: attributes was populated by tcgetattr for this process's controlling terminal.
+    let _ = unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, attributes) };
 }
 struct TerminalGuard;
 impl Drop for TerminalGuard {
@@ -1224,6 +1250,7 @@ fn is_interrupt_key(key: &KeyEvent) -> bool {
 fn run_tui() -> Result<RunExit> {
     let mut signals = Signals::new([SIGINT, SIGTERM, SIGHUP])?;
     let _guard = TerminalGuard;
+    capture_original_terminal_attributes();
     enter_terminal_state()?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
@@ -1584,6 +1611,7 @@ mod tests {
                 spec,
                 state: "running".into(),
                 drift: false,
+                drift_reasons: Vec::new(),
                 cached_at: Utc::now(),
                 runtime_started_at: None,
             }],
@@ -1955,6 +1983,7 @@ mod tests {
             .unwrap(),
             state: "unknown".into(),
             drift: false,
+            drift_reasons: Vec::new(),
             cached_at: Utc::now(),
             runtime_started_at: None,
         };
@@ -2433,6 +2462,7 @@ mod tests {
             .unwrap(),
             state: "stopped".into(),
             drift: true,
+            drift_reasons: vec!["writable-root:C /etc/example".into()],
             cached_at: Utc::now(),
             runtime_started_at: None,
         });
