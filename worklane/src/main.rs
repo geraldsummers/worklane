@@ -1446,10 +1446,16 @@ fn lane_attach_args(session: &str, shell: bool, runtime: RuntimeMode) -> Vec<Str
 
 fn bootstrap_herdr_script() -> &'static str {
     r#"set -eu
-marker="$HOME/.local/share/worklane/herdr-codex-integration-v1"
+agent="$(cat "$HOME/.config/worklane/agent" 2>/dev/null || printf codex)"
+case "$agent" in
+  codex|pi) ;;
+  *) echo "unsupported lane agent: $agent" >&2; exit 1 ;;
+esac
+marker="$HOME/.local/share/worklane/herdr-$agent-integration-v1"
 if [ ! -e "$marker" ]; then
-  mkdir -p "$HOME/.codex" "$(dirname "$marker")"
-  herdr integration install codex
+  mkdir -p "$(dirname "$marker")"
+  if [ "$agent" = codex ]; then mkdir -p "$HOME/.codex"; fi
+  herdr integration install "$agent"
   : > "$marker"
 fi
 mkdir -p "$HOME/.config/herdr"
@@ -1497,6 +1503,10 @@ fi"#
 fn bootstrap_herdr(spec: &LaneSpec) -> Result<()> {
     let session = spec.session_name();
     let script = bootstrap_herdr_script();
+    let agent_name = match spec.profile.agent {
+        AgentKind::Codex => "Codex",
+        AgentKind::Pi => "Pi",
+    };
     let (_, uid, _) = current_identity(&SystemRunner)?;
     let mut args = vec![
         "exec".into(),
@@ -1521,10 +1531,10 @@ fn bootstrap_herdr(spec: &LaneSpec) -> Result<()> {
     let output = Command::new("podman")
         .args(args)
         .output()
-        .context("bootstrap Herdr Codex integration")?;
+        .with_context(|| format!("bootstrap Herdr {agent_name} integration"))?;
     if !output.status.success() {
         bail!(
-            "Herdr Codex integration bootstrap failed: {}",
+            "Herdr {agent_name} integration bootstrap failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         )
     }
@@ -1535,6 +1545,17 @@ const HERDR_RECONCILE_SCRIPT: &str = r#"#!/bin/sh
 set -eu
 session="${WORKLANE_SESSION:-}"
 workspace="${WORKLANE_WORKSPACE:-$HOME}"
+# The Pi image starts its user manager before the first Worklane bootstrap.
+# Wait for bootstrap to seed the agent selector and web-search policy.
+if [ -f /etc/worklane/pi-version ] && [ ! -r "$HOME/.config/worklane/agent" ]; then
+  exit 0
+fi
+agent="$(cat "$HOME/.config/worklane/agent" 2>/dev/null || printf codex)"
+case "$agent" in
+  codex) agent_command="codex --dangerously-bypass-approvals-and-sandbox" ;;
+  pi) agent_command="pi --provider openai-codex --model gpt-6-sol --no-extensions --extension /opt/worklane/pi-web-access/dist --extension /usr/local/lib/node_modules/@earendil-works/pi-coding-agent/examples/extensions/questionnaire.ts --extension /usr/local/lib/node_modules/@earendil-works/pi-coding-agent/examples/extensions/worklane-plan/plan.ts --tools read,bash,edit,write,web_search,fetch_content,questionnaire" ;;
+  *) echo "unsupported lane agent: $agent" >&2; exit 1 ;;
+esac
 [ -n "$session" ] || exit 0
 i=0
 while ! herdr --session "$session" workspace list >/dev/null 2>&1; do
@@ -1550,14 +1571,14 @@ else
   workspace_id="$(herdr --session "$session" workspace list | jq -r --arg label "$session" '.result.workspaces[]? | select(.label == $label) | .workspace_id' | head -n 1)"
 fi
 [ -n "$workspace_id" ] || exit 1
-codex_pane="$(herdr --session "$session" agent list | jq -r --arg workspace "$workspace_id" '.result.agents[]? | select(.workspace_id == $workspace and .agent == "codex") | .pane_id' | head -n 1)"
-if [ -n "$codex_pane" ]; then
-  herdr --session "$session" agent focus "$codex_pane" >/dev/null
+agent_pane="$(herdr --session "$session" agent list | jq -r --arg workspace "$workspace_id" --arg agent "$agent" '.result.agents[]? | select(.workspace_id == $workspace and .agent == $agent) | .pane_id' | head -n 1)"
+if [ -n "$agent_pane" ]; then
+  herdr --session "$session" agent focus "$agent_pane" >/dev/null
   exit 0
 fi
 primary_pane="$(herdr --session "$session" pane list --workspace "$workspace_id" | jq -r '.result.panes[]? | select((.label // "") != "git diff" and (.agent // "") == "") | .pane_id' | head -n 1)"
 [ -n "$primary_pane" ] || exit 1
-herdr --session "$session" pane run "$primary_pane" "codex --dangerously-bypass-approvals-and-sandbox" >/dev/null
+herdr --session "$session" pane run "$primary_pane" "$agent_command" >/dev/null
 "#;
 
 fn agent_docs_bootstrap_script() -> String {
@@ -1576,6 +1597,15 @@ fn agent_docs_bootstrap_script() -> String {
 
 fn bootstrap_shell_script() -> String {
     let script = r#"set -eu
+mkdir -p "$HOME/.config/worklane"
+printf '%s\n' "${WORKLANE_AGENT:-codex}" > "$HOME/.config/worklane/agent"
+if [ "${WORKLANE_AGENT:-codex}" = pi ]; then
+  mkdir -p "$HOME/.pi/agent"
+  if [ ! -e "$HOME/.pi/agent/web-search.json" ]; then
+    printf '%s\n' '{"provider":"openai","fetchRouting":{"providers":["http"],"allowRemoteHostedProviders":false}}' > "$HOME/.pi/agent/web-search.json"
+    chmod 600 "$HOME/.pi/agent/web-search.json"
+  fi
+fi
 if [ ! -f "$HOME/.zshrc" ]; then
   cat > "$HOME/.zshrc" <<'ZSHRC'
 export EDITOR="${EDITOR:-vim}"
@@ -1719,7 +1749,10 @@ while :; do
 done
 WORKLANE_GIT_DIFF_PANE_MANAGER
 chmod 755 "$HOME/.local/share/worklane/bin/worklane-git-diff-pane-manager"
-{agent_docs}"#,
+{agent_docs}
+if [ "${{WORKLANE_AGENT:-codex}}" = pi ] && [ ! -e "$HOME/AGENTS.md" ] && [ ! -L "$HOME/AGENTS.md" ]; then
+  ln -s "$HOME/.local/share/worklane/agent-docs/current/lane.md" "$HOME/AGENTS.md"
+fi"#,
         agent_docs = agent_docs_bootstrap_script(),
     );
     script
@@ -1739,6 +1772,8 @@ fn bootstrap_shell(spec: &LaneSpec) -> Result<()> {
     args.extend([
         "--env".into(),
         format!("WORKLANE_NAME={}", spec.name),
+        "--env".into(),
+        format!("WORKLANE_AGENT={}", spec.profile.agent.as_str()),
         "--env".into(),
         format!("WORKLANE_SESSION={session}"),
         "--env".into(),
@@ -3051,19 +3086,24 @@ mod tests {
     }
 
     #[test]
-    fn herdr_bootstrap_starts_or_focuses_codex() {
+    fn herdr_bootstrap_starts_or_focuses_selected_agent() {
         let script = bootstrap_herdr_script();
+        assert!(script.contains("herdr integration install \"$agent\""));
         assert!(script.contains("systemctl --user start worklane-herdr.service"));
         assert!(script.contains("systemctl --user restart worklane-git-diff-pane-manager.service"));
         assert!(script.contains("[ ! -x \"$reconciler\" ] || \"$reconciler\""));
         assert!(HERDR_RECONCILE_SCRIPT.contains("agent list | jq"));
-        assert!(HERDR_RECONCILE_SCRIPT.contains(".agent == \"codex\""));
+        assert!(HERDR_RECONCILE_SCRIPT.contains("[ -f /etc/worklane/pi-version ]"));
+        assert!(HERDR_RECONCILE_SCRIPT.contains(".agent == $agent"));
         assert!(HERDR_RECONCILE_SCRIPT.contains("| .pane_id'"));
-        assert!(HERDR_RECONCILE_SCRIPT.contains("agent focus \"$codex_pane\""));
+        assert!(HERDR_RECONCILE_SCRIPT.contains("agent focus \"$agent_pane\""));
         assert!(HERDR_RECONCILE_SCRIPT.contains("pane list --workspace \"$workspace_id\""));
-        assert!(HERDR_RECONCILE_SCRIPT.contains(
-            "pane run \"$primary_pane\" \"codex --dangerously-bypass-approvals-and-sandbox\""
-        ));
+        assert!(HERDR_RECONCILE_SCRIPT.contains("pane run \"$primary_pane\" \"$agent_command\""));
+        assert!(HERDR_RECONCILE_SCRIPT.contains("--provider openai-codex --model gpt-6-sol"));
+        assert!(HERDR_RECONCILE_SCRIPT
+            .contains("--tools read,bash,edit,write,web_search,fetch_content,questionnaire"));
+        assert!(HERDR_RECONCILE_SCRIPT.contains("examples/extensions/questionnaire.ts"));
+        assert!(HERDR_RECONCILE_SCRIPT.contains("examples/extensions/worklane-plan/plan.ts"));
         assert!(!HERDR_RECONCILE_SCRIPT.contains("agent start"));
     }
 
@@ -3106,6 +3146,49 @@ exit 0
         let log = fs::read_to_string(home.join("herdr.log")).unwrap();
         assert!(log.contains("pane run w1:p1 codex --dangerously-bypass-approvals-and-sandbox"));
         assert!(!log.contains("agent start"));
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn herdr_bootstrap_reuses_the_initial_terminal_for_pi() {
+        let home = std::env::temp_dir().join(format!(
+            "worklane-herdr-pi-bootstrap-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let bin = home.join("bin");
+        fs::create_dir_all(home.join(".config/worklane")).unwrap();
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(home.join(".config/worklane/agent"), "pi\n").unwrap();
+        let herdr = bin.join("herdr");
+        fs::write(
+            &herdr,
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> "$HOME/herdr.log"
+case "$*" in
+  *"workspace list"*) printf '%s\n' '{"result":{"workspaces":[{"label":"alpha","workspace_id":"w1"}]}}' ;;
+  *"agent list"*) printf '%s\n' '{"result":{"agents":[]}}' ;;
+  *"pane list --workspace w1"*) printf '%s\n' '{"result":{"panes":[{"pane_id":"w1:p1","workspace_id":"w1"}]}}' ;;
+esac
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&herdr, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let status = Command::new("zsh")
+            .args(["-c", HERDR_RECONCILE_SCRIPT])
+            .env("HOME", &home)
+            .env("WORKLANE_SESSION", "alpha")
+            .env("WORKLANE_WORKSPACE", "/home/dev")
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let log = fs::read_to_string(home.join("herdr.log")).unwrap();
+        assert!(log.contains("pane run w1:p1 pi --provider openai-codex --model gpt-6-sol"));
+        assert!(log.contains("--extension /opt/worklane/pi-web-access/dist"));
         fs::remove_dir_all(home).unwrap();
     }
 
@@ -3342,6 +3425,59 @@ exit 0
     }
 
     #[test]
+    fn pi_shell_bootstrap_seeds_search_without_overwriting_user_configuration() {
+        let home =
+            std::env::temp_dir().join(format!("worklane-pi-shell-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&home).unwrap();
+        let run_bootstrap = || {
+            Command::new("zsh")
+                .args(["-c", &bootstrap_shell_script()])
+                .env("HOME", &home)
+                .env("WORKLANE_AGENT", "pi")
+                .env("WORKLANE_NAME", "test")
+                .env("WORKLANE_SESSION", "test")
+                .env("WORKLANE_WORKSPACE", &home)
+                .status()
+                .unwrap()
+        };
+
+        assert!(run_bootstrap().success());
+        let config = home.join(".pi/agent/web-search.json");
+        let search: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+        assert_eq!(search["provider"], "openai");
+        assert_eq!(
+            search["fetchRouting"]["providers"],
+            serde_json::json!(["http"])
+        );
+        assert_eq!(search["fetchRouting"]["allowRemoteHostedProviders"], false);
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&config).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let guidance = home.join("AGENTS.md");
+        assert!(guidance.is_symlink());
+        assert!(fs::read_to_string(&guidance)
+            .unwrap()
+            .starts_with(LANE_AGENTS_MD));
+
+        fs::write(&config, "{\"provider\":\"custom\"}\n").unwrap();
+        fs::remove_file(&guidance).unwrap();
+        fs::write(&guidance, "Keep my own lane instructions.\n").unwrap();
+        assert!(run_bootstrap().success());
+        assert_eq!(
+            fs::read_to_string(config).unwrap(),
+            "{\"provider\":\"custom\"}\n"
+        );
+        assert_eq!(
+            fs::read_to_string(guidance).unwrap(),
+            "Keep my own lane instructions.\n"
+        );
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
     fn standard_containerfile_is_embedded() {
         assert!(EMBEDDED_CONTAINERFILE.starts_with("FROM debian:trixie-slim"));
         assert!(EMBEDDED_CONTAINERFILE.contains("@openai/codex"));
@@ -3412,7 +3548,8 @@ exit 0
         assert!(SHOW_IMAGE_SCRIPT.contains("pane.graphics.info"));
         assert!(!shell.contains("WORKLANE_CODEX_WRAPPER"));
         assert!(!shell.contains("codex_config=\"$HOME/.codex/config.toml\""));
-        assert!(!shell.contains("$HOME/AGENTS.md"));
+        assert!(shell
+            .contains("if [ \"${WORKLANE_AGENT:-codex}\" = pi ] && [ ! -e \"$HOME/AGENTS.md\" ]"));
         assert!(shell.contains("$HOME/.local/share/worklane/bin/worklane-git-diff-pane"));
         assert!(shell.contains("$HOME/.local/share/worklane/bin/worklane-git-diff-pane-manager"));
         assert!(shell.contains("$HOME/.local/share/worklane/bin/worklane-terminal-bell"));

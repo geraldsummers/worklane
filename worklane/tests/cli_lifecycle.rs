@@ -287,7 +287,7 @@ case "$1:$2" in
   exec:--user)
     failure="$(cat "$0.fail" 2>/dev/null || true)"
     case "$failure:$*" in
-      shell:*WORKLANE_GIT_DIFF_PANE*|herdr:*herdr-codex-integration-v1*)
+      shell:*WORKLANE_GIT_DIFF_PANE*|herdr:*herdr-*-integration-v1*)
         printf 'injected bootstrap failure\n' >&2
         exit 23
         ;;
