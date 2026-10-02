@@ -1,4 +1,6 @@
-# Worklane
+<p align="center">
+  <img src="docs/assets/worklane-hero.svg" width="100%" alt="Worklane — disposable development environments with persistent work and agent sessions">
+</p>
 
 Rust-native management for disposable, rootless Podman development lanes. The
 directory selected for a lane is mounted once, as the container's `/home/dev`
