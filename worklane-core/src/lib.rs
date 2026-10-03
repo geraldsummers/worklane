@@ -203,12 +203,6 @@ pub fn load_profiles() -> Result<BTreeMap<String, Profile>> {
     Ok(profiles)
 }
 pub fn validate_profile(profile: &Profile, home: &Path, require_sources: bool) -> Result<()> {
-    if profile.agent == AgentKind::Pi && profile.embedded_containerfile {
-        bail!("Pi lanes require a custom Pi image; the embedded image contains Codex")
-    }
-    if profile.agent == AgentKind::Pi && profile.mount_codex_credentials {
-        bail!("Pi lanes must disable the Codex credential mount")
-    }
     if !matches!(profile.network.as_str(), "outbound" | "none") {
         bail!("profile network must be 'outbound' or 'none'")
     }
@@ -1588,7 +1582,7 @@ mod tests {
     }
 
     #[test]
-    fn pi_profile_is_explicit_and_never_mounts_codex_credentials() {
+    fn pi_profile_can_use_standard_image_and_codex_credentials() {
         let profile: Profile = toml::from_str(
             "image = 'localhost/worklane-pi-pilot:0.87.1'\nagent = 'pi'\nembedded_containerfile = false\ncontainerfile = 'Containerfile.pi'\nruntime = 'systemd'\nmount_codex_credentials = false",
         )
@@ -1598,10 +1592,10 @@ mod tests {
         assert!(validate_profile(&profile, Path::new("/tmp/pilot"), false).is_ok());
         let mut invalid = profile.clone();
         invalid.mount_codex_credentials = true;
-        assert!(validate_profile(&invalid, Path::new("/tmp/pilot"), false).is_err());
+        assert!(validate_profile(&invalid, Path::new("/tmp/pilot"), false).is_ok());
         invalid.mount_codex_credentials = false;
         invalid.embedded_containerfile = true;
-        assert!(validate_profile(&invalid, Path::new("/tmp/pilot"), false).is_err());
+        assert!(validate_profile(&invalid, Path::new("/tmp/pilot"), false).is_ok());
     }
 
     #[test]
