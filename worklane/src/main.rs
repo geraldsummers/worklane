@@ -1546,7 +1546,14 @@ fi
 agent="$(cat "$HOME/.config/worklane/agent" 2>/dev/null || printf codex)"
 case "$agent" in
   codex) agent_command="codex --dangerously-bypass-approvals-and-sandbox" ;;
-  pi) agent_command="pi --provider openai-codex --model gpt-6-sol --no-extensions --extension /opt/worklane/pi-web-access/dist --extension /usr/local/lib/node_modules/@earendil-works/pi-coding-agent/examples/extensions/questionnaire.ts --extension /usr/local/lib/node_modules/@earendil-works/pi-coding-agent/examples/extensions/worklane-plan/plan.ts --tools read,bash,edit,write,web_search,fetch_content,questionnaire" ;;
+  pi)
+    pi_model="$(cat "$HOME/.config/worklane/pi/model" 2>/dev/null || printf '~openai/gpt-sol-latest')"
+    case "$pi_model" in ''|*[!A-Za-z0-9_.~/-]*) echo "invalid OpenRouter model ID" >&2; exit 1 ;; esac
+    if [ ! -r "$HOME/.pi/agent/auth.json" ]; then
+      echo "OpenRouter key missing; run p0 model key-set for this user" >&2
+      exit 0
+    fi
+    agent_command="pi --provider openrouter --model $pi_model --no-extensions --extension /opt/worklane/pi-web-access/dist --extension /usr/local/lib/node_modules/@earendil-works/pi-coding-agent/examples/extensions/questionnaire.ts --extension /usr/local/lib/node_modules/@earendil-works/pi-coding-agent/examples/extensions/worklane-plan/plan.ts --tools read,bash,edit,write,web_search,fetch_content,questionnaire" ;;
   *) echo "unsupported lane agent: $agent" >&2; exit 1 ;;
 esac
 [ -n "$session" ] || exit 0
@@ -3089,7 +3096,9 @@ mod tests {
         assert!(HERDR_RECONCILE_SCRIPT.contains("agent focus \"$agent_pane\""));
         assert!(HERDR_RECONCILE_SCRIPT.contains("pane list --workspace \"$workspace_id\""));
         assert!(HERDR_RECONCILE_SCRIPT.contains("pane run \"$primary_pane\" \"$agent_command\""));
-        assert!(HERDR_RECONCILE_SCRIPT.contains("--provider openai-codex --model gpt-6-sol"));
+        assert!(HERDR_RECONCILE_SCRIPT.contains("--provider openrouter --model $pi_model"));
+        assert!(HERDR_RECONCILE_SCRIPT.contains(".config/worklane/pi/model"));
+        assert!(HERDR_RECONCILE_SCRIPT.contains(".pi/agent/auth.json"));
         assert!(HERDR_RECONCILE_SCRIPT
             .contains("--tools read,bash,edit,write,web_search,fetch_content,questionnaire"));
         assert!(HERDR_RECONCILE_SCRIPT.contains("examples/extensions/questionnaire.ts"));
@@ -3147,8 +3156,16 @@ exit 0
         ));
         let bin = home.join("bin");
         fs::create_dir_all(home.join(".config/worklane")).unwrap();
+        fs::create_dir_all(home.join(".config/worklane/pi")).unwrap();
+        fs::create_dir_all(home.join(".pi/agent")).unwrap();
         fs::create_dir_all(&bin).unwrap();
         fs::write(home.join(".config/worklane/agent"), "pi\n").unwrap();
+        fs::write(
+            home.join(".config/worklane/pi/model"),
+            "~openai/gpt-sol-latest\n",
+        )
+        .unwrap();
+        fs::write(home.join(".pi/agent/auth.json"), "{}\n").unwrap();
         let herdr = bin.join("herdr");
         fs::write(
             &herdr,
@@ -3177,7 +3194,9 @@ esac
             .unwrap();
         assert!(status.success());
         let log = fs::read_to_string(home.join("herdr.log")).unwrap();
-        assert!(log.contains("pane run w1:p1 pi --provider openai-codex --model gpt-6-sol"));
+        assert!(
+            log.contains("pane run w1:p1 pi --provider openrouter --model ~openai/gpt-sol-latest")
+        );
         assert!(log.contains("--extension /opt/worklane/pi-web-access/dist"));
         fs::remove_dir_all(home).unwrap();
     }
