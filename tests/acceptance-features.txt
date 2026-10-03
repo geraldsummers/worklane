@@ -58,6 +58,7 @@ runtime.herdr_graphics
 runtime.herdr_supervision
 runtime.tools
 runtime.user_manager
+runtime.user_mapping
 runtime.user_units
 runtime.user_units.persist
 tui.attach
