@@ -926,11 +926,7 @@ fn user_manager_environment() -> [String; 4] {
     ]
 }
 
-fn wait_for_systemd_user_manager<R: Runner>(
-    r: &R,
-    spec: &LaneSpec,
-    name: &str,
-) -> Result<()> {
+fn wait_for_systemd_user_manager<R: Runner>(r: &R, spec: &LaneSpec, name: &str) -> Result<()> {
     let mut last_error = String::new();
     for _ in 0..100 {
         let mut args = vec!["exec".into(), "--user".into(), CONTAINER_USER.into()];
@@ -3979,9 +3975,7 @@ CMD ["sleep", "infinity"]
         assert!(run.1.contains(&"--systemd=always".into()));
         assert!(run.1.contains(&"--cgroupns=private".into()));
         assert!(run.1.contains(&"--user=0".into()));
-        assert!(run
-            .1
-            .contains(&"--userns=keep-id:uid=1001,gid=1001".into()));
+        assert!(run.1.contains(&"--userns=keep-id:uid=1001,gid=1001".into()));
         assert!(run.1.contains(&"/sbin/init".into()));
         assert!(!run.1.contains(&"--init".into()));
         assert!(calls.iter().any(|(_, args)| {
