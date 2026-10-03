@@ -21,6 +21,9 @@ const HOST_CODEX_MOUNT: &str = "/run/worklane-host-codex";
 const STANDARD_CONTAINERFILE_MARKER: &str = "worklane-standard-containerfile";
 /// High enough for tool-heavy workloads while still bounding runaway process creation.
 const LANE_PIDS_LIMIT: &str = "16384";
+/// The standard image keeps a stable internal identity across host accounts.
+const CONTAINER_UID: &str = "1001";
+const CONTAINER_GID: &str = "1001";
 /// Generic lane guidance; repository contributor rules must never enter the global seed.
 const LANE_AGENTS_MD: &str = include_str!("../../docs/agents/lane.md");
 const AGENT_AUTOMATION_MD: &str = include_str!("../../docs/agents/automation.md");
@@ -371,7 +374,7 @@ fn is_worklane_standard_containerfile(content: &str) -> bool {
             && content.contains("CMD [\"sleep\", \"infinity\"]"))
 }
 fn image_build_args<R: Runner>(
-    runner: &R,
+    _runner: &R,
     file: Option<&PathBuf>,
     context: &std::path::Path,
     tag: &str,
@@ -382,15 +385,14 @@ fn image_build_args<R: Runner>(
         Some(path) => path.clone(),
         None => ensure_standard_containerfile()?,
     };
-    let (_, uid, gid) = current_identity(runner)?;
     let mut args = vec![
         "build".into(),
         "--build-arg".into(),
         format!("USERNAME={CONTAINER_USER}"),
         "--build-arg".into(),
-        format!("USER_UID={uid}"),
+        format!("USER_UID={CONTAINER_UID}"),
         "--build-arg".into(),
-        format!("USER_GID={gid}"),
+        format!("USER_GID={CONTAINER_GID}"),
         "-f".into(),
         file.display().to_string(),
         "-t".into(),
@@ -829,7 +831,6 @@ fn create_local_container<R: Runner>(r: &R, spec: &LaneSpec, name: &str) -> Resu
     fs::create_dir_all(&spec.project_path)?;
     let scratch_path = spec.project_path.join(".tmp");
     fs::create_dir_all(&scratch_path)?;
-    let (_, uid, _) = current_identity(r)?;
     let runtime = spec.profile.effective_runtime();
     let mut a = vec![
         "run".into(),
@@ -838,7 +839,7 @@ fn create_local_container<R: Runner>(r: &R, spec: &LaneSpec, name: &str) -> Resu
         name.into(),
         "--pids-limit".into(),
         LANE_PIDS_LIMIT.into(),
-        "--userns=keep-id".into(),
+        format!("--userns=keep-id:uid={CONTAINER_UID},gid={CONTAINER_GID}"),
         "--read-only".into(),
         "--volume".into(),
         format!("{}:/tmp:rw,nosuid,nodev", scratch_path.display()),
@@ -911,17 +912,17 @@ fn create_local_container<R: Runner>(r: &R, spec: &LaneSpec, name: &str) -> Resu
     }
     podman(r, a)?;
     if runtime == RuntimeMode::Systemd {
-        wait_for_systemd_user_manager(r, spec, name, &uid)?;
+        wait_for_systemd_user_manager(r, spec, name)?;
     }
     Ok(())
 }
 
-fn user_manager_environment(uid: &str) -> [String; 4] {
+fn user_manager_environment() -> [String; 4] {
     [
         "--env".into(),
-        format!("XDG_RUNTIME_DIR=/run/user/{uid}"),
+        format!("XDG_RUNTIME_DIR=/run/user/{CONTAINER_UID}"),
         "--env".into(),
-        format!("DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus"),
+        format!("DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{CONTAINER_UID}/bus"),
     ]
 }
 
@@ -929,12 +930,11 @@ fn wait_for_systemd_user_manager<R: Runner>(
     r: &R,
     spec: &LaneSpec,
     name: &str,
-    uid: &str,
 ) -> Result<()> {
     let mut last_error = String::new();
     for _ in 0..100 {
         let mut args = vec!["exec".into(), "--user".into(), CONTAINER_USER.into()];
-        args.extend(user_manager_environment(uid));
+        args.extend(user_manager_environment());
         args.extend([
             name.into(),
             "systemctl".into(),
@@ -971,16 +971,14 @@ fn ensure_local_started<R: Runner>(r: &R, spec: &LaneSpec) -> Result<()> {
     match host_runtime_state(r, spec)?.as_str() {
         "running" => {
             if spec.profile.effective_runtime() == RuntimeMode::Systemd {
-                let (_, uid, _) = current_identity(r)?;
-                wait_for_systemd_user_manager(r, spec, &spec.container_name(), &uid)?;
+                wait_for_systemd_user_manager(r, spec, &spec.container_name())?;
             }
         }
         "absent" => create_local_container(r, spec, &spec.container_name())?,
         "stopped" | "exited" | "created" => {
             podman(r, ["start", &spec.container_name()])?;
             if spec.profile.effective_runtime() == RuntimeMode::Systemd {
-                let (_, uid, _) = current_identity(r)?;
-                wait_for_systemd_user_manager(r, spec, &spec.container_name(), &uid)?;
+                wait_for_systemd_user_manager(r, spec, &spec.container_name())?;
             }
         }
         state => bail!(
@@ -1507,7 +1505,6 @@ fn bootstrap_herdr(spec: &LaneSpec) -> Result<()> {
         AgentKind::Codex => "Codex",
         AgentKind::Pi => "Pi",
     };
-    let (_, uid, _) = current_identity(&SystemRunner)?;
     let mut args = vec![
         "exec".into(),
         "--user".into(),
@@ -1515,7 +1512,7 @@ fn bootstrap_herdr(spec: &LaneSpec) -> Result<()> {
         "--workdir".into(),
         spec.container_home().display().to_string(),
     ];
-    args.extend(user_manager_environment(&uid));
+    args.extend(user_manager_environment());
     args.extend([
         "--env".into(),
         format!("WORKLANE_NAME={}", spec.name),
@@ -1760,7 +1757,6 @@ fi"#,
 fn bootstrap_shell(spec: &LaneSpec) -> Result<()> {
     let script = bootstrap_shell_script();
     let session = spec.session_name();
-    let (_, uid, _) = current_identity(&SystemRunner)?;
     let mut args = vec![
         "exec".into(),
         "--user".into(),
@@ -1768,7 +1764,7 @@ fn bootstrap_shell(spec: &LaneSpec) -> Result<()> {
         "--workdir".into(),
         spec.container_home().display().to_string(),
     ];
-    args.extend(user_manager_environment(&uid));
+    args.extend(user_manager_environment());
     args.extend([
         "--env".into(),
         format!("WORKLANE_NAME={}", spec.name),
@@ -1793,7 +1789,6 @@ fn bootstrap_shell(spec: &LaneSpec) -> Result<()> {
     Ok(())
 }
 fn herdr_snapshot(spec: &LaneSpec) -> Result<serde_json::Value> {
-    let (_, uid, _) = current_identity(&SystemRunner)?;
     let mut args = vec![
         "exec".into(),
         "--user".into(),
@@ -1801,7 +1796,7 @@ fn herdr_snapshot(spec: &LaneSpec) -> Result<serde_json::Value> {
         "--workdir".into(),
         spec.container_home().display().to_string(),
     ];
-    args.extend(user_manager_environment(&uid));
+    args.extend(user_manager_environment());
     args.extend([
         spec.container_name(),
         "herdr".into(),
@@ -2537,7 +2532,6 @@ fn main() -> Result<()> {
                     }
                     let session = s.session_name();
                     let command = lane_attach_args(&session, shell, s.profile.effective_runtime());
-                    let (_, uid, _) = current_identity(&runner)?;
                     let mut args = vec![
                         "exec".into(),
                         "-it".into(),
@@ -2546,7 +2540,7 @@ fn main() -> Result<()> {
                         "--workdir".into(),
                         s.container_home().display().to_string(),
                     ];
-                    args.extend(user_manager_environment(&uid));
+                    args.extend(user_manager_environment());
                     args.extend([
                         "--env".into(),
                         format!("WORKLANE_NAME={}", s.name),
@@ -3695,7 +3689,7 @@ CMD ["sleep", "infinity"]
     }
 
     #[test]
-    fn image_build_inherits_calling_identity() {
+    fn image_build_uses_stable_container_identity() {
         let runner = MockRunner::new();
         let args = image_build_args(
             &runner,
@@ -3708,8 +3702,8 @@ CMD ["sleep", "infinity"]
         .unwrap();
         assert!(!args.contains(&"--no-cache".into()));
         assert!(args.contains(&"USERNAME=dev".into()));
-        assert!(args.contains(&"USER_UID=1000".into()));
-        assert!(args.contains(&"USER_GID=1000".into()));
+        assert!(args.contains(&"USER_UID=1001".into()));
+        assert!(args.contains(&"USER_GID=1001".into()));
         let uncached = image_build_args(
             &runner,
             Some(&PathBuf::from("/tmp/Containerfile")),
@@ -3985,10 +3979,15 @@ CMD ["sleep", "infinity"]
         assert!(run.1.contains(&"--systemd=always".into()));
         assert!(run.1.contains(&"--cgroupns=private".into()));
         assert!(run.1.contains(&"--user=0".into()));
+        assert!(run
+            .1
+            .contains(&"--userns=keep-id:uid=1001,gid=1001".into()));
         assert!(run.1.contains(&"/sbin/init".into()));
         assert!(!run.1.contains(&"--init".into()));
         assert!(calls.iter().any(|(_, args)| {
-            args.first() == Some(&"exec".into()) && args.contains(&"show-environment".into())
+            args.first() == Some(&"exec".into())
+                && args.contains(&"show-environment".into())
+                && args.contains(&"XDG_RUNTIME_DIR=/run/user/1001".into())
         }));
         std::fs::remove_file(path).unwrap();
     }

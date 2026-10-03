@@ -203,6 +203,10 @@ verifies the user manager before committing creation or upgrade. The image must 
 directory without depending on host `systemd-logind` and pass `XDG_RUNTIME_DIR` and
 `DBUS_SESSION_BUS_ADDRESS` into `user@UID.service`; the standard image supplies container-specific
 drop-ins for both requirements.
+The lane account inside the image uses UID and GID 1001. Worklane maps each
+host owner's UID and GID to those values with rootless Podman `keep-id`, so
+different host accounts can use the same image and write their own lane homes.
+Custom images must provide `dev` with UID and GID 1001.
 
 ## Standard image
 
