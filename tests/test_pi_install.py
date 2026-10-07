@@ -69,6 +69,8 @@ class PiInstallTest(unittest.TestCase):
         (agent / 'sessions/example.jsonl').write_text('session data')
         settings = json.loads((agent / 'settings.json').read_text())
         settings['customKey'] = 'preserve'
+        settings['defaultProvider'] = 'openrouter'
+        settings['defaultModel'] = 'legacy-model'
         (agent / 'settings.json').write_text(json.dumps(settings))
         (self.seed / '@earendil-works/pi-coding-agent/new-release').write_text('new')
         self.install('--replace')
@@ -77,7 +79,9 @@ class PiInstallTest(unittest.TestCase):
         self.assertTrue((backup / 'pi/agent/auth.json').is_file())
         self.assertEqual((agent / 'auth.json').read_text(), '{"test":"private"}')
         self.assertEqual((agent / 'sessions/example.jsonl').read_text(), 'session data')
-        self.assertEqual(json.loads((agent / 'settings.json').read_text())['customKey'], 'preserve')
+        restored = json.loads((agent / 'settings.json').read_text())
+        self.assertEqual(restored['customKey'], 'preserve')
+        self.assertEqual((restored['defaultProvider'], restored['defaultModel'], restored['defaultThinkingLevel']), ('openai-codex', 'gpt-6-sol', 'medium'))
         self.assertTrue((self.home / '.local/lib/node_modules/@earendil-works/pi-coding-agent/new-release').exists())
 
     def test_resources_local_unique_and_policy_does_not_bypass_shell(self):
@@ -85,6 +89,11 @@ class PiInstallTest(unittest.TestCase):
         self.install()
         agent = self.home / '.pi/agent'
         settings = json.loads((agent / 'settings.json').read_text())
+        self.assertEqual((settings['defaultProvider'], settings['defaultModel'], settings['defaultThinkingLevel']), ('openai-codex', 'gpt-6-sol', 'medium'))
+        launcher = (ROOT / 'assets/worklane-pi-agent').read_text()
+        self.assertIn('--provider openai-codex --model "$model" --thinking medium', launcher)
+        self.assertNotIn('--provider openrouter', launcher)
+        self.assertNotIn('OPENROUTER_API_KEY', launcher)
         self.assertEqual(len(settings['packages']), 3)
         self.assertTrue(any('pi-lightpanda-extension' in p for p in settings['packages']))
         self.assertEqual(len(settings['extensions']), 3)

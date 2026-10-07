@@ -19,7 +19,9 @@ mod api;
 const EMBEDDED_CONTAINERFILE: &str = include_str!("../../Containerfile");
 const HOST_CODEX_MOUNT: &str = "/run/worklane-host-codex";
 const HOST_PI_MOUNT: &str = "/run/worklane-host-pi";
-const DEFAULT_PI_MODEL: &str = "xiaomi/mimo-v2.6-pro";
+const DEFAULT_PI_MODEL: &str = "gpt-6-sol";
+const PI_PROVIDER: &str = "openai-codex";
+const PI_THINKING_LEVEL: &str = "medium";
 const STANDARD_CONTAINERFILE_MARKER: &str = "worklane-standard-containerfile";
 /// High enough for tool-heavy workloads while still bounding runaway process creation.
 const LANE_PIDS_LIMIT: &str = "16384";
@@ -33,6 +35,7 @@ const AGENT_MIGRATION_MD: &str = include_str!("../../docs/agents/MIGRATE.md");
 const AGENT_DOCS_INSTALLER: &str = include_str!("../../assets/worklane-agent-docs.py");
 /// Lane-local presenter for Herdr's experimental pane graphics API.
 const SHOW_IMAGE_SCRIPT: &str = include_str!("../../assets/worklane-show-image");
+const HERDR_WRAPPER_SCRIPT: &str = include_str!("../../assets/worklane-herdr");
 const GIT_DIFF_PANE_SCRIPT: &str = include_str!("../../assets/worklane-git-diff-pane");
 static OPERATION_CONTEXT: OnceLock<(String, Instant)> = OnceLock::new();
 
@@ -642,6 +645,10 @@ fn host_home() -> Result<PathBuf> {
     absolute_environment_dir("HOME")?.context("HOME is not set; cannot locate host credentials")
 }
 fn pi_credentials_dir() -> Result<PathBuf> {
+    // Never mount legacy OpenRouter keys into a subscription-backed Pi lane.
+    Ok(host_home()?.join(".config/worklane/pi-codex"))
+}
+fn legacy_openrouter_credentials_dir() -> Result<PathBuf> {
     Ok(host_home()?.join(".config/worklane/pi"))
 }
 fn ensure_pi_credentials() -> Result<PathBuf> {
@@ -692,8 +699,7 @@ fn pi_model() -> Result<String> {
 }
 fn pi_models() -> Result<Vec<String>> {
     let output = Command::new("pi")
-        .env("OPENROUTER_API_KEY", "catalog-only")
-        .args(["--list-models", "openrouter"])
+        .args(["--list-models", PI_PROVIDER])
         .output()
         .context("Pi is not installed on this host")?;
     if !output.status.success() {
@@ -704,13 +710,13 @@ fn pi_models() -> Result<Vec<String>> {
         .skip(1)
         .filter_map(|line| {
             let mut columns = line.split_whitespace();
-            (columns.next() == Some("openrouter"))
+            (columns.next() == Some(PI_PROVIDER))
                 .then(|| columns.next().map(str::to_owned))
                 .flatten()
         })
         .collect::<Vec<_>>();
     if models.is_empty() {
-        bail!("Pi reported no OpenRouter models")
+        bail!("Pi reported no openai-codex models")
     }
     Ok(models)
 }
@@ -722,10 +728,12 @@ fn handle_credentials(command: &CredentialsAction, json: bool) -> Result<()> {
                 serde_json::from_slice(&fs::read(dir.join("auth.json"))?)?;
             emit(
                 json,
-                &serde_json::json!({"openrouter_configured": auth.get("openrouter").is_some(), "model": pi_model()?}),
+                &serde_json::json!({"codex_oauth_present": auth.get(PI_PROVIDER).is_some(), "model": pi_model()?, "provider": PI_PROVIDER, "thinking": PI_THINKING_LEVEL}),
             )
         }
         CredentialsAction::SetOpenrouter => {
+            // Retain this explicitly requested legacy command, but never write its
+            // billable key into the directory mounted by managed SSO Pi lanes.
             let mut key = String::new();
             if io::stdin().is_terminal() {
                 let output = Command::new("python3")
@@ -746,24 +754,41 @@ fn handle_credentials(command: &CredentialsAction, json: bool) -> Result<()> {
             if key.is_empty() || key.contains(char::is_whitespace) {
                 bail!("OpenRouter key must be nonempty and contain no whitespace")
             }
-            let mut auth: serde_json::Value =
-                serde_json::from_slice(&fs::read(dir.join("auth.json"))?)?;
+            let legacy = legacy_openrouter_credentials_dir()?;
+            fs::create_dir_all(&legacy)?;
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&legacy, fs::Permissions::from_mode(0o700))?;
+            let old = legacy.join("auth.json");
+            let mut auth: serde_json::Value = if old.exists() {
+                serde_json::from_slice(&fs::read(&old)?)?
+            } else {
+                serde_json::json!({})
+            };
             let object = auth
                 .as_object_mut()
-                .context("Pi auth file must be a JSON object")?;
+                .context("legacy OpenRouter auth file must be a JSON object")?;
             object.insert(
                 "openrouter".into(),
                 serde_json::json!({"type":"api_key","key":key}),
             );
-            atomic_pi_file("auth.json", &serde_json::to_vec(&auth)?)?;
+            let tmp = legacy.join(format!(".auth.json.{}", uuid::Uuid::new_v4()));
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)?;
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            serde_json::to_writer(&mut file, &auth)?;
+            file.write_all(b"\n")?;
+            file.sync_all()?;
+            fs::rename(&tmp, &old)?;
             emit(
                 json,
-                &serde_json::json!({"openrouter_configured":true,"restart_pi_to_apply":true}),
+                &serde_json::json!({"legacy_openrouter_configured":true,"managed_pi_uses_openrouter":false}),
             )
         }
         CredentialsAction::SetModel { model } => {
             if !pi_models()?.contains(model) {
-                bail!("model is not in Pi's OpenRouter catalog")
+                bail!("model is not in Pi's openai-codex catalog")
             }
             atomic_pi_file("model", model.as_bytes())?;
             emit(
@@ -1086,9 +1111,10 @@ fn append_credential_mounts(args: &mut Vec<String>, spec: &LaneSpec) -> Result<(
             args.extend([
                 "--mount".into(),
                 format!(
-                    "type=bind,src={},dst={},ro=true",
+                    "type=bind,src={},dst={},ro={}",
                     source.display(),
-                    target.display()
+                    target.display(),
+                    tool == "Codex"
                 ),
             ]);
             continue;
@@ -1937,6 +1963,12 @@ if [ -x /usr/local/lib/worklane/worklane-ide ]; then
   if [ -S "$ide_socket" ]; then
     timeout 3 nvim --server "$ide_socket" --remote-expr 'v:lua.WorklaneApplyPalette()' >/dev/null 2>&1 || true
   fi
+fi
+cat > "$HOME/.local/share/worklane/bin/worklane-herdr" <<'WORKLANE_HERDR'
+{HERDR_WRAPPER_SCRIPT}WORKLANE_HERDR
+chmod 755 "$HOME/.local/share/worklane/bin/worklane-herdr"
+if [ ! -e "$HOME/.local/bin/herdr" ] && [ ! -L "$HOME/.local/bin/herdr" ]; then
+  ln -s "$HOME/.local/share/worklane/bin/worklane-herdr" "$HOME/.local/bin/herdr"
 fi
 cat > "$HOME/.local/bin/worklane-show-image" <<'WORKLANE_SHOW_IMAGE'
 {SHOW_IMAGE_SCRIPT}WORKLANE_SHOW_IMAGE
@@ -3870,6 +3902,15 @@ esac
             .contains("printf '\\007' > /dev/tty"));
         let presenter = home.join(".local/bin/worklane-show-image");
         assert_eq!(fs::read_to_string(&presenter).unwrap(), SHOW_IMAGE_SCRIPT);
+        let herdr_wrapper = home.join(".local/share/worklane/bin/worklane-herdr");
+        assert_eq!(
+            fs::read_to_string(&herdr_wrapper).unwrap(),
+            HERDR_WRAPPER_SCRIPT
+        );
+        assert_eq!(
+            fs::read_link(home.join(".local/bin/herdr")).unwrap(),
+            herdr_wrapper
+        );
         let watcher = home.join(".local/share/worklane/bin/worklane-git-diff-pane");
         assert_eq!(fs::read_to_string(&watcher).unwrap(), GIT_DIFF_PANE_SCRIPT);
         use std::os::unix::fs::PermissionsExt;
@@ -4016,6 +4057,7 @@ esac
         assert!(shell.contains("touch \"$HOME/.zshenv\""));
         assert!(shell.contains("export PATH=\"$HOME/.local/bin:$PATH\""));
         assert!(shell.contains("$HOME/.local/bin/worklane-show-image"));
+        assert!(shell.contains("$HOME/.local/share/worklane/bin/worklane-herdr"));
         assert!(shell.contains("experimental[\"kitty_graphics\"] = True"));
         assert!(shell.contains("server reload-config"));
         assert!(SHOW_IMAGE_SCRIPT.contains("pane.graphics.set"));

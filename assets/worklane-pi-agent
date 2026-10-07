@@ -17,7 +17,7 @@ export TMPDIR="$HOME/.tmp"
 if [ -n "${WORKLANE_RUN_ID:-}" ]; then
   integration="$HOME/.pi/agent/extensions/herdr-agent-state.ts"
   test -f "$integration" || { echo 'Managed Pi requires its Herdr integration' >&2; exit 1; }
-  exec "$HOME/.local/bin/pi" --provider openrouter --model "$model" \
+  exec "$HOME/.local/bin/pi" --provider openai-codex --model "$model" --thinking medium \
     --offline --no-approve --no-extensions --no-skills --no-prompt-templates \
     --extension "$HOME/.local/lib/node_modules/pi-web-access" \
     --extension "$HOME/.local/lib/node_modules/pi-lightpanda-extension" \
@@ -27,4 +27,4 @@ if [ -n "${WORKLANE_RUN_ID:-}" ]; then
     --extension "$integration" "$@"
 fi
 # Interactive sessions retain their user-reviewed custom resources.
-exec "$HOME/.local/bin/pi" --provider openrouter --model "$model" "$@"
+exec "$HOME/.local/bin/pi" --provider openai-codex --model "$model" --thinking medium "$@"

@@ -410,7 +410,8 @@ impl App {
                 UiAction::None
             }
             KeyCode::Char('K') => {
-                self.openrouter_key_input = Some(String::new());
+                self.message =
+                    "Sign in inside Pi with /login openai-codex; no API key is needed".into();
                 UiAction::None
             }
             KeyCode::Char('M') => UiAction::LoadModels,
@@ -1687,7 +1688,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         )
     } else if let Some(index) = app.model_choice {
         format!(
-            "OpenRouter model {}/{} (j/k, Enter selects): {}",
+            "Codex subscription model {}/{} (j/k, Enter selects): {}",
             index + 1,
             app.model_choices.len(),
             app.model_choices[index]
@@ -1722,7 +1723,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     f.render_widget(
         Paragraph::new(format!(
             "{}\n\
-             a/S attach v IDE n rename D del F forget u/U up A agent K key M model",
+             a/S attach v IDE n rename D del F forget u/U up A agent K login M model",
             if app.message.is_empty() {
                 "ready"
             } else {
@@ -2668,28 +2669,11 @@ mod tests {
     }
 
     #[test]
-    fn openrouter_key_entry_never_renders_the_key() {
+    fn subscription_login_hint_does_not_request_an_api_key() {
         let mut app = app();
-        app.handle_key(KeyCode::Char('K'));
-        for c in "sk-secret".chars() {
-            app.handle_key(KeyCode::Char(c));
-        }
-        let backend = ratatui::backend::TestBackend::new(100, 20);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw(frame, &app)).unwrap();
-        let screen = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(!screen.contains("sk-secret"));
-        assert!(screen.contains("*********"));
-        assert_eq!(
-            app.handle_key(KeyCode::Enter),
-            UiAction::SetOpenrouter("sk-secret".into())
-        );
+        assert_eq!(app.handle_key(KeyCode::Char('K')), UiAction::None);
+        assert!(app.message.contains("/login openai-codex"));
+        assert!(app.message.contains("no API key"));
         assert!(app.openrouter_key_input.is_none());
     }
     #[test]
@@ -2706,7 +2690,7 @@ mod tests {
         let bin = root.join("bin");
         fs::create_dir_all(&bin).unwrap();
         let worklane = bin.join("worklane");
-        fs::write(&worklane, "#!/bin/sh\nprintf '%s\n' \"$*\" >> \"$TEST_ROOT/calls\"\ncase \"$*\" in\n  *'credentials models'*) printf '[\"~openai/gpt-sol-latest\",\"~anthropic/claude-sonnet-latest\"]\n' ;;\n  *'credentials set-openrouter'*) cat > \"$TEST_ROOT/key\" ;;\nesac\n").unwrap();
+        fs::write(&worklane, "#!/bin/sh\nprintf '%s\n' \"$*\" >> \"$TEST_ROOT/calls\"\ncase \"$*\" in\n  *'credentials models'*) printf '[\"gpt-6-sol\",\"gpt-6-luna\"]\n' ;;\n  *'credentials set-openrouter'*) cat > \"$TEST_ROOT/key\" ;;\nesac\n").unwrap();
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&worklane, fs::Permissions::from_mode(0o755)).unwrap();
         let old_path = env::var_os("PATH");
@@ -2725,11 +2709,8 @@ mod tests {
         assert_eq!(app.model_choices.len(), 2);
         app.handle_key(KeyCode::Down);
         let chosen = app.handle_key(KeyCode::Enter);
-        assert_eq!(
-            chosen,
-            UiAction::SetModel("~anthropic/claude-sonnet-latest".into())
-        );
-        set_pi_model(&mut app, "~anthropic/claude-sonnet-latest").unwrap();
+        assert_eq!(chosen, UiAction::SetModel("gpt-6-luna".into()));
+        set_pi_model(&mut app, "gpt-6-luna").unwrap();
         assert_eq!(
             fs::read_to_string(root.join("key")).unwrap(),
             "secret-value"
@@ -2748,11 +2729,7 @@ mod tests {
     #[test]
     fn account_and_agent_prompts_cancel_without_saving() {
         let mut app = app();
-        app.handle_key(KeyCode::Char('K'));
-        for c in "temporary-key".chars() {
-            app.handle_key(KeyCode::Char(c));
-        }
-        assert_eq!(app.handle_key(KeyCode::Esc), UiAction::None);
+        assert_eq!(app.handle_key(KeyCode::Char('K')), UiAction::None);
         assert!(app.openrouter_key_input.is_none());
         app.model_choices = vec!["first".into(), "second".into()];
         app.model_choice = Some(0);

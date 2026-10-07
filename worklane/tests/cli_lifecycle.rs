@@ -29,6 +29,7 @@ fn temp(name: &str) -> PathBuf {
 fn run(binary: &str, data: &Path, bin: &Path, args: &[&str]) -> String {
     let output = Command::new(binary)
         .args(args)
+        .env("HOME", data.parent().unwrap().join("home"))
         .env("XDG_DATA_HOME", data)
         .env("CODEX_HOME", data.join("credentials/codex"))
         .env("GH_CONFIG_DIR", data.join("credentials/gh"))
@@ -70,6 +71,7 @@ fn run_with_home(binary: &str, data: &Path, bin: &Path, home: &Path, args: &[&st
 fn run_failure(binary: &str, data: &Path, bin: &Path, args: &[&str]) -> String {
     let output = Command::new(binary)
         .args(args)
+        .env("HOME", data.parent().unwrap().join("home"))
         .env("XDG_DATA_HOME", data)
         .env("CODEX_HOME", data.join("credentials/codex"))
         .env("GH_CONFIG_DIR", data.join("credentials/gh"))
@@ -502,6 +504,19 @@ exit 1
         "src={},dst=/run/worklane-host-codex,ro=true",
         data.join("credentials/codex").display()
     )));
+    let pi_oauth = root.join("home/.config/worklane/pi-codex");
+    assert!(create_log.contains(&format!(
+        "src={},dst=/run/worklane-host-pi,ro=false",
+        pi_oauth.display()
+    )));
+    assert_eq!(
+        fs::read_to_string(pi_oauth.join("auth.json")).unwrap(),
+        "{}\n"
+    );
+    assert_eq!(
+        fs::read_to_string(pi_oauth.join("model")).unwrap(),
+        "gpt-6-sol"
+    );
     assert!(create_log.contains(&format!(
         "src={},dst=/home/dev/.config/gh/hosts.yml,rw=true",
         data.join(format!("worklane/credentials/gh/{SMOKE_ID}.hosts.yml"))
@@ -1293,7 +1308,7 @@ respond '{"spec":{"schema_version":5,"id":"00000000-0000-4000-8000-000000000005"
 }
 
 #[test]
-fn account_openrouter_credentials_are_private_and_replaceable() {
+fn subscription_defaults_and_legacy_key_are_isolated() {
     use std::os::unix::fs::PermissionsExt;
     let root = temp("pi-credentials");
     let home = root.join("home");
@@ -1301,7 +1316,7 @@ fn account_openrouter_credentials_are_private_and_replaceable() {
     fs::create_dir_all(&home).unwrap();
     fs::create_dir_all(&bin).unwrap();
     let pi = bin.join("pi");
-    fs::write(&pi, "#!/bin/sh\nprintf 'provider model context\nopenrouter ~openai/gpt-sol-latest 1M\nopenrouter ~anthropic/claude-sonnet-latest 1M\n'\n").unwrap();
+    fs::write(&pi, "#!/bin/sh\nprintf 'provider model context\nopenai-codex gpt-6-sol 272K\nopenai-codex gpt-6-luna 272K\n'\n").unwrap();
     fs::set_permissions(&pi, fs::Permissions::from_mode(0o755)).unwrap();
     let binary = env!("CARGO_BIN_EXE_worklane");
     let command = |args: &[&str], input: Option<&[u8]>| {
@@ -1330,8 +1345,16 @@ fn account_openrouter_credentials_are_private_and_replaceable() {
     assert!(initial.status.success());
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&initial.stdout).unwrap()
-            ["openrouter_configured"],
+            ["codex_oauth_present"],
         false
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&initial.stdout).unwrap()["model"],
+        "gpt-6-sol"
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&initial.stdout).unwrap()["thinking"],
+        "medium"
     );
     let models = command(&["--json", "credentials", "models"], None);
     assert!(models.status.success());
@@ -1343,15 +1366,7 @@ fn account_openrouter_credentials_are_private_and_replaceable() {
     );
     let invalid = command(&["credentials", "set-model", "not-in-catalog"], None);
     assert!(!invalid.status.success());
-    let selected = command(
-        &[
-            "--json",
-            "credentials",
-            "set-model",
-            "~anthropic/claude-sonnet-latest",
-        ],
-        None,
-    );
+    let selected = command(&["--json", "credentials", "set-model", "gpt-6-luna"], None);
     assert!(selected.status.success());
     let empty = command(&["credentials", "set-openrouter"], Some(b"  \n"));
     assert!(!empty.status.success());
@@ -1378,7 +1393,7 @@ fn account_openrouter_credentials_are_private_and_replaceable() {
             .windows(key.len())
             .any(|part| part == key.as_bytes()));
     }
-    let dir = home.join(".config/worklane/pi");
+    let dir = home.join(".config/worklane/pi-codex");
     assert_eq!(
         fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
         0o700
@@ -1401,22 +1416,23 @@ fn account_openrouter_credentials_are_private_and_replaceable() {
     );
     let auth: serde_json::Value =
         serde_json::from_slice(&fs::read(dir.join("auth.json")).unwrap()).unwrap();
-    assert_eq!(auth["openrouter"]["key"], "new-test-key");
-    assert_eq!(
-        fs::read_to_string(dir.join("model")).unwrap(),
-        "~anthropic/claude-sonnet-latest"
-    );
+    assert!(auth.get("openrouter").is_none());
+    assert_eq!(auth, serde_json::json!({}));
+    let legacy = home.join(".config/worklane/pi");
+    let legacy_auth: serde_json::Value =
+        serde_json::from_slice(&fs::read(legacy.join("auth.json")).unwrap()).unwrap();
+    assert_eq!(legacy_auth["openrouter"]["key"], "new-test-key");
+    assert_eq!(fs::read_to_string(dir.join("model")).unwrap(), "gpt-6-luna");
     let status = command(&["--json", "credentials", "status"], None);
     assert!(status.status.success());
     assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&status.stdout).unwrap()
-            ["openrouter_configured"],
-        true
+        serde_json::from_slice::<serde_json::Value>(&status.stdout).unwrap()["codex_oauth_present"],
+        false
     );
     fs::write(&pi, "#!/bin/sh\nprintf 'provider model\n'\n").unwrap();
     let empty_catalog = command(&["credentials", "models"], None);
     assert!(!empty_catalog.status.success());
-    assert!(String::from_utf8_lossy(&empty_catalog.stderr).contains("no OpenRouter models"));
+    assert!(String::from_utf8_lossy(&empty_catalog.stderr).contains("no openai-codex models"));
     fs::write(&pi, "#!/bin/sh\nexit 1\n").unwrap();
     let unavailable = command(&["credentials", "models"], None);
     assert!(!unavailable.status.success());

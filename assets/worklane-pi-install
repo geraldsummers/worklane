@@ -88,6 +88,9 @@ def merge(name, defaults):
         # Cold migration resets audited execution policy, not credentials/models
         # or unrelated settings; the old configuration remains in its backup.
         if name == 'settings.json':
+            data['defaultProvider'] = 'openai-codex'
+            data['defaultModel'] = 'gpt-6-sol'
+            data['defaultThinkingLevel'] = 'medium'
             data['defaultTools'] = defaults['defaultTools']
             data['cacheWarming'] = 'off'
             data.setdefault('compaction', {})['enabled'] = False
@@ -117,7 +120,7 @@ def merge(name, defaults):
         output.flush()
         os.fsync(output.fileno())
     temporary.replace(path)
-merge('settings.json', {'defaultTools': ['read','bash','edit','write','grep','find','ls'], 'cacheWarming': 'off', 'compaction': {'enabled': False}, 'retry': {'provider': {'maxRetries': 0}}})
+merge('settings.json', {'defaultProvider': 'openai-codex', 'defaultModel': 'gpt-6-sol', 'defaultThinkingLevel': 'medium', 'defaultTools': ['read','bash','edit','write','grep','find','ls'], 'cacheWarming': 'off', 'compaction': {'enabled': False}, 'retry': {'provider': {'maxRetries': 0}}})
 merge('pi-plan-mode.json', {'thinkingLevel': 'inherit', 'implementationPlanRetention': 'clear-after-first-run', 'defaultPlanTools': ['read','bash','grep','find','ls','web_search','fetch_content','get_search_content','source_check','agent_list_peers','goal_plan'], 'defaultPlanExportPath': 'PLAN.md'})
 merge('web-search.json', {'provider': 'exa', 'toolActivation': 'eager', 'fetchRouting': {'providers': ['http'], 'allowRemoteHostedProviders': False}, 'workflow': 'none', 'allowBrowserCookies': False, 'autoOpenBrowser': False, 'githubClone': {'clonePath': str(Path.home() / '.tmp/pi-github-repos')}, 'fetch': {'allowedModes': ['readable', 'raw']}, 'pdf': {'provider': 'unpdf'}, 'youtube': {'enabled': False}, 'video': {'enabled': False}})
 PY

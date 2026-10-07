@@ -8,9 +8,11 @@ case "$MODE" in
 esac
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
-if [[ -d /home/dev ]]; then
+if [[ -d /home/dev && -w /home/dev ]]; then
   mkdir -p /home/dev/.tmp
-  export TMPDIR=/home/dev/.tmp
+  if [[ -w /home/dev/.tmp ]]; then
+    export TMPDIR=/home/dev/.tmp
+  fi
 fi
 if [[ -n ${WORKLANE_RUST_TOOLCHAIN:-} ]]; then
   CARGO=(rustup run "$WORKLANE_RUST_TOOLCHAIN" cargo)

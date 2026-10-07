@@ -8,8 +8,10 @@ CANDIDATE_WORKLANE_MCP=${3:?usage: lab-acceptance WORKLANE_BIN LANE_BIN WORKLANE
 ARTIFACT_DIR=${4:?usage: lab-acceptance WORKLANE_BIN LANE_BIN WORKLANE_MCP_BIN ARTIFACT_DIR}
 LAB_SSH=${WORKLANE_LAB_SSH:-podman_lab@192.168.0.11}
 RUN_ID=${WORKLANE_ACCEPTANCE_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}
-mkdir -p /home/dev/.tmp
-LOCAL_ROOT=$(mktemp -d "/home/dev/.tmp/worklane-acceptance-${RUN_ID}.XXXXXX")
+LOCAL_TMPDIR=${TMPDIR:-/home/dev/.tmp}
+mkdir -p "$LOCAL_TMPDIR"
+[[ -w $LOCAL_TMPDIR ]] || { echo "acceptance temporary directory is not writable: $LOCAL_TMPDIR" >&2; exit 1; }
+LOCAL_ROOT=$(mktemp -d "$LOCAL_TMPDIR/worklane-acceptance-${RUN_ID}.XXXXXX")
 SSH_OPTIONS=(-o BatchMode=yes -o StrictHostKeyChecking=yes)
 REMOTE_HOME=$(/usr/bin/ssh "${SSH_OPTIONS[@]}" "$LAB_SSH" 'printf %s "$HOME"')
 [[ $REMOTE_HOME =~ ^/[A-Za-z0-9._/-]+$ ]] || { echo "unsafe remote home: $REMOTE_HOME" >&2; exit 1; }
@@ -164,6 +166,10 @@ remote "$R podman exec --user dev --workdir /home/dev \$(podman ps --filter 'lab
 remote "set -eu; container=\$(podman ps --filter 'label=io.worklane.name=$SESSION_NAME' --format '{{.Names}}'); expected_pi=\$(podman exec \"\$container\" cat /etc/worklane/pi-version); actual_pi=\$(podman exec \"\$container\" pi --version); test \"\$actual_pi\" = \"\$expected_pi\"; expected_web=\$(podman exec \"\$container\" cat /etc/worklane/pi-web-version); actual_web=\$(podman exec \"\$container\" node -p 'require(\"/opt/worklane/pi-seed/node_modules/pi-web-access/package.json\").version'); test \"\$actual_web\" = \"\$expected_web\""; pass runtime.pi_versions
 remote "set -eu; container=\$(podman ps --filter 'label=io.worklane.name=$SESSION_NAME' --format '{{.Names}}'); podman exec --user dev --env HOME=/home/dev \"\$container\" /usr/local/lib/worklane/worklane-pi-install; podman exec --user dev --env HOME=/home/dev \"\$container\" sh -c 'test -x /home/dev/.local/bin/pi && test -d /home/dev/.local/lib/node_modules/pi-web-access/dist && test -f /home/dev/.local/lib/node_modules/@narumitw/pi-plan-mode/dist/index.ts && test -x /usr/local/bin/worklane-collab && /home/dev/.local/bin/pi --version >/dev/null'"
 pass runtime.pi_lane_local
+# Subscription auth is per owning account, refreshable from the lane, and never
+# shares the legacy OpenRouter key; use only a synthetic write probe here.
+remote "set -eu; container=\$(podman ps --filter 'label=io.worklane.name=$SESSION_NAME' --format '{{.Names}}'); oauth='$REMOTE_HOME/.config/worklane/pi-codex'; test \"\$(stat -c %a \"\$oauth\")\" = 700; test \"\$(stat -c %a \"\$oauth/auth.json\")\" = 600; test \"\$(podman exec --user dev \"\$container\" readlink /home/dev/.pi/agent/auth.json)\" = /run/worklane-host-pi/auth.json; podman exec --user dev \"\$container\" sh -c 'test -w /run/worklane-host-pi/auth.json && printf synthetic-probe > /run/worklane-host-pi/.oauth-probe'; test \"\$(cat \"\$oauth/.oauth-probe\")\" = synthetic-probe; rm -- \"\$oauth/.oauth-probe\"; test \"\$(podman exec --user dev \"\$container\" jq -r .defaultProvider /home/dev/.pi/agent/settings.json)\" = openai-codex; test \"\$(podman exec --user dev \"\$container\" jq -r .defaultModel /home/dev/.pi/agent/settings.json)\" = gpt-6-sol; test \"\$(podman exec --user dev \"\$container\" jq -r .defaultThinkingLevel /home/dev/.pi/agent/settings.json)\" = medium; ! grep -q openrouter \"\$oauth/auth.json\""
+pass credentials.pi_subscription
 remote "$R podman exec --user dev --workdir /home/dev \$(podman ps --filter 'label=io.worklane.name=$SESSION_NAME' --format '{{.Names}}') sh -c 'set -eu; command -v worklane-show-image >/dev/null; command -v gm >/dev/null; python3 -c \"import tomlkit\"; test \"\$(python3 -c \"import tomllib; print(tomllib.load(open(\\\"/home/dev/.config/herdr/config.toml\\\", \\\"rb\\\"))[\\\"experimental\\\"][\\\"kitty_graphics\\\"])\")\" = True; herdr api schema --json | jq -e '\"'\"'.schemas.request.oneOf[] | select(.properties.method.const == \"pane.graphics.set\")'\"'\"' >/dev/null'"; pass runtime.herdr_graphics
 remote "$R podman exec --workdir /home/dev \$(podman ps --filter 'label=io.worklane.name=$SESSION_NAME' --format '{{.Names}}') sh -c 'set -eu; test \"\$(ps -p 1 -o comm= | tr -d \" \" )\" = systemd; before=\$(cat /sys/fs/cgroup/pids.current); test \"\$(cat /sys/fs/cgroup/pids.max)\" -eq 16384; i=0; while test \"\$i\" -lt 64; do sh -c \"sleep 0.05 &\"; i=\$((i + 1)); done; i=0; while test \"\$i\" -lt 50; do zombies=\$(ps -eo stat | awk '\"'\"'\$1 ~ /^Z/ {count++} END {print count+0}'\"'\"'); after=\$(cat /sys/fs/cgroup/pids.current); if test \"\$zombies\" -le 1 && test \"\$after\" -le \$((before + 5)); then break; fi; sleep 0.2; i=\$((i + 1)); done; test \"\$zombies\" -le 1; test \"\$after\" -le \$((before + 5))'"; pass runtime.process_reaping
 

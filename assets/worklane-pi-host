@@ -1,15 +1,11 @@
 #!/bin/sh
 set -eu
-settings="$HOME/.config/worklane/pi"
-if [ ! -r "$settings/model" ] || [ ! -r "$settings/auth.json" ]; then
-  echo "Pi account settings are missing; run worklane credentials set-openrouter" >&2
+settings="$HOME/.config/worklane/pi-codex"
+if [ ! -r "$settings/model" ]; then
+  echo "Pi model is missing; run worklane credentials status" >&2
   exit 2
 fi
 model="$(cat "$settings/model")"
-key="$(jq -r '.openrouter.key // empty' "$settings/auth.json")"
-if [ -z "$key" ]; then
-  echo "OpenRouter key is not configured for this account" >&2
-  exit 2
-fi
-export OPENROUTER_API_KEY="$key"
-exec /usr/local/bin/pi --provider openrouter --model "$model" "$@"
+# Authentication belongs to the owner. The host Pi CLI has its own agent
+# directory; do not load a legacy OpenRouter key as an implicit fallback.
+exec /usr/local/bin/pi --provider openai-codex --model "$model" --thinking medium "$@"

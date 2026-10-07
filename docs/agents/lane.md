@@ -104,8 +104,9 @@ session name. Outside a managed pane, discover and select the session explicitly
   --lines N` or `herdr agent read TARGET`. Use `herdr pane process-info PANE_ID` when ownership
   of a terminal is unclear.
 - Run a command in an existing shell with `herdr pane run PANE_ID 'COMMAND'`. To send a message to
-  Codex or another detected agent, use `herdr agent prompt TARGET 'TEXT'`; it submits the text with
-  Enter. `herdr pane send-text PANE_ID 'TEXT'` only types into the terminal and does not press
+  Codex or another detected agent, use `herdr agent prompt TARGET 'TEXT'`; Worklane's lane-local
+  `herdr` launcher adds your verified identity and return route to the message, then submits it
+  with Enter. `herdr pane send-text PANE_ID 'TEXT'` only types into the terminal and does not press
   Enter, so follow it with `herdr agent send-keys TARGET enter` or `herdr pane send-keys PANE_ID
   enter` when submission is intended. Never assume visible typed text was sent. Use raw key input
   only when the higher-level prompt or run commands cannot express the interaction.
@@ -122,12 +123,17 @@ session name. Outside a managed pane, discover and select the session explicitly
 
 ### Direct messages between agents
 
-Flag every direct message to another agent, including coordination requests, handoffs, and
-replies, with `[AGENT MESSAGE]` at the start. Put `From:` and `Reply-to:` on separate lines
-before the message body. `From:` identifies the sending agent. `Reply-to:` gives the exact
-route back to that agent, not just a display name or the currently focused pane. In Herdr,
-use the sender's injected session and pane IDs; outside Herdr, give the actual messaging
-transport and stable agent address. Never invent a return address.
+Every direct message to another agent, including coordination requests, handoffs, and
+replies, must identify itself as an agent message and identify the sender and return route.
+In a managed lane pane, pass the message body to `herdr agent prompt`; the lane-local launcher
+adds this header from live Herdr agent state and refuses a prompt when it cannot verify the
+sender. Other transports require you to include the header yourself.
+Start with `[AGENT MESSAGE]`, then put `From:` and `Reply-to:` on separate lines before the
+message body. `From:` names the sending agent. `Reply-to:` gives the exact route back to
+that agent, not just a display name or the currently focused pane. In Herdr, use the
+sender's injected session and pane IDs; outside Herdr, give the actual messaging transport
+and stable agent address. Discover missing identity or route details before sending; never
+invent them.
 
 ```text
 [AGENT MESSAGE]

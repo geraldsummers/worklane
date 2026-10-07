@@ -119,16 +119,19 @@ browsing. The `lightpanda` binary is on `PATH` (version recorded in
 `npx playwright install chromium`; Lightpanda's own `Page.captureScreenshot`
 returns a placeholder because it has no rendering engine.
 
-OpenRouter settings belong to the Linux account that owns the lanes. In the
-`lane` TUI, press `K` to enter or replace the account key in a masked prompt and
-`M` to select a model from Pi's installed OpenRouter catalog. The equivalent
-shell commands are `worklane credentials set-openrouter`,
-`worklane credentials models`, `worklane credentials set-model MODEL`, and
-`worklane credentials status`. The key prompt does not echo input. Account
-credentials are stored with mode `0600` under `~/.config/worklane/pi` and mounted
-read-only into that account's lanes. A running Pi process must be restarted to
-use a new key or model; existing sessions and workspace files remain on disk.
-Codex credentials and manual Codex access continue to work independently.
+Pi defaults to **openai-codex/gpt-6-sol** at **medium** thinking for new and
+resumed sessions. Each Linux account signs into its own Codex subscription with
+`/login openai-codex` inside Pi; the TUI `K` key displays this guidance, not
+an API-key prompt. OAuth state and the model selection live in the account's
+private `~/.config/worklane/pi-codex` directory (mode 0700, files 0600),
+mounted writable only into that account's lanes so Pi can refresh OAuth. `M`
+selects a model from the installed openai-codex catalog;
+`worklane credentials models`, `set-model MODEL` and `status` are the shell
+commands. A running Pi process retains its selected model until restarted.
+Legacy `set-openrouter` remains an explicit compatibility command, but writes
+only to `~/.config/worklane/pi` and is never mounted or automatically selected
+by managed Pi. No OpenRouter or metered OpenAI API-key fallback is installed.
+Codex CLI credentials remain separate; never copy credentials between owners.
 
 The lane's selected directory remains its `/home/dev`, so Pi reads the same
 project files and WIP notes as Codex. Existing Codex conversation files remain
