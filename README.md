@@ -18,9 +18,12 @@ worklane lane attach my-project
 ```
 
 `create` defaults the project and build context to the current directory and
-uses the `default` profile. If the declared image is missing, it is built automatically before
+uses the `default` profile. New standard lanes select Pi by default and include
+both Pi and Codex in the image. If the declared image is missing, it is built automatically before
 the lane starts. `lane attach` starts or reattaches the lane's default persistent Herdr session
-and starts Codex when that workspace does not already have a Codex agent.
+and starts the lane's selected agent when that workspace does not already have one.
+Each local lane inherits its host's time zone when its container is created; use
+`worklane lane upgrade --all` to apply this to existing lanes.
 Detach with `Ctrl-B q`; panes and agents keep running in the lane. Use
 `worklane lane attach my-project --shell` for a plain zsh login shell. Manage session lifecycle through Worklane; agents should not start a second
 Herdr server for the lane. On the first Herdr attach, Worklane installs Herdr's
@@ -34,6 +37,81 @@ For image review in Ghostty, run `worklane-show-image /absolute/path/to/image` f
 pane. Worklane enables Herdr's experimental Kitty graphics support and the helper opens a dedicated
 review workspace, converts common image formats when necessary, and presents the image through
 Herdr's native pane-graphics API.
+
+## Persistent terminal IDE
+
+`worklane lane ide my-project` opens the lane's Neovim IDE tab through the same
+Herdr and SSH path as `lane attach`. In the `lane` dashboard, press `v` on a
+lane. The editor tab is created on demand and reused after disconnecting or
+reattaching. It has a clickable file tree, buffer tabs, statusline actions,
+diagnostics, Git diffs, and debugger panels. Neovim requests mouse input from
+Herdr; use a terminal with true color. The
+terminal client controls font size. Pi and Codex remain in their own tabs.
+
+Inside a lane, agents and shell users can control the live IDE from another
+Herdr tab without changing the user's focus:
+
+```sh
+worklane-ide start
+worklane-ide open src/main.rs --line 42
+worklane-ide diagnostics
+worklane-ide task test
+worklane-ide debug Launch
+worklane-ide ex 'edit README.md'
+worklane-ide keys '<Esc>'
+worklane-ide focus
+```
+
+`open --focus` switches to the editor; other bridge commands leave focus where
+it is. `ex` and `keys` intentionally permit full control of the live editor.
+Project tasks are declared in `.worklane/ide.toml`, for example:
+
+```toml
+[tasks.test]
+command = "cargo test"
+cwd = "."
+```
+
+Tasks run in labeled Herdr tabs. DAP configurations use `.vscode/launch.json`;
+language servers and debugger adapters are optional user-space installations.
+Neovim and Tree-sitter are in the image, while the pinned editor plugins and
+parsers are installed into the persistent lane home on first use. The standard
+lane has outbound networking for this first setup. Later image upgrades keep
+the IDE's writable state.
+
+`worklane appearance status` and `worklane appearance set warm|cool` manage an
+account-wide dark theme; warm is the default. The shared palette updates the
+Worklane dashboard, Herdr, zsh, Neovim, Pi, and Codex's syntax theme without
+changing credentials or other agent settings. The two presets and generated
+settings live in writable lane homes; the host preference is
+`~/.config/worklane/theme`. Running Neovim editors refresh their palette when
+the account setting changes. Terminal font and point size remain device settings.
+
+## Agents and account credentials
+
+The `lane` TUI uses `A` to select Pi or Codex for the highlighted lane. The
+selection is stored in that lane's portable manifest. Switching starts or
+focuses the selected agent and leaves previous agent panes and sessions intact.
+Use `worklane lane agent NAME pi` or `worklane lane agent NAME codex` from a shell.
+The standard image contains both agents, so switching does not require a rebuild. Each image build resolves Pi and pi-web-access from npm’s `latest` tags and records the installed versions in `/etc/worklane/pi-version` and `/etc/worklane/pi-web-version`.
+Existing lanes must first be upgraded to an image containing Pi. A custom build
+context using the repository's `Containerfile` must also contain its `assets/`
+files; embedded standard builds seed those files automatically.
+
+OpenRouter settings belong to the Linux account that owns the lanes. In the
+`lane` TUI, press `K` to enter or replace the account key in a masked prompt and
+`M` to select a model from Pi's installed OpenRouter catalog. The equivalent
+shell commands are `worklane credentials set-openrouter`,
+`worklane credentials models`, `worklane credentials set-model MODEL`, and
+`worklane credentials status`. The key prompt does not echo input. Account
+credentials are stored with mode `0600` under `~/.config/worklane/pi` and mounted
+read-only into that account's lanes. A running Pi process must be restarted to
+use a new key or model; existing sessions and workspace files remain on disk.
+Codex credentials and manual Codex access continue to work independently.
+
+The lane's selected directory remains its `/home/dev`, so Pi reads the same
+project files and WIP notes as Codex. Existing Codex conversation files remain
+there but Pi does not automatically import or search them.
 
 ## Agent guidance
 
@@ -128,7 +206,8 @@ the standard embedded image without cache and pull its base image. The build
 installs the Codex release pinned by the standard Containerfile, and
 verifies the installed CLI before replacing a lane. `lane upgrade --all` builds each
 distinct effective image once per host, then recreates its lanes so their
-immutable root filesystems are fresh. In the TUI, `u` upgrades one lane and `U`
+immutable root filesystems are fresh. Use `lane upgrade --all --skip-running`
+to leave active agents running while refreshing idle lanes. In the TUI, `u` upgrades one lane and `U`
 upgrades all effective images. For custom Containerfiles, pass `--no-cache` when
 a completely fresh rebuild is required; local-only base images remain under the
 custom Containerfile's control.
@@ -220,14 +299,14 @@ and native build tooling, as well as Codex, Herdr, Git, GitHub CLI, and systemd.
 such as Java, Kotlin, Gradle, and Maven are installed and updated by lane users through SDKMAN under
 `$HOME/.sdkman`, rather than being tied to Debian's package versions.
 
-## Isolated Pi pilot
+## Historical isolated Pi pilot
 
-`Containerfile.pi` is an opt-in candidate image. It installs Pi and the
+`Containerfile.pi` remains as the original opt-in pilot image. It installs Pi and the
 `pi-web-access` extension but not Codex. The profile's `agent = "pi"` selector
 starts Pi in Herdr with OpenAI Codex as its model provider, limits its tools to
 `read`, `bash`, `edit`, `write`, `web_search`, `fetch_content`, and `questionnaire`, and seeds the
-extension to use OpenAI-backed search and HTTP-only page fetching. This does
-not change the default Codex profile or any existing lane.
+extension to use OpenAI-backed search and HTTP-only page fetching. The standard image now carries Pi and Codex together; this pilot image is kept
+only to reproduce the earlier isolated test.
 
 In the pilot, `/plan` toggles read-only planning. Pi can ask one or more
 selectable questions with a free-text answer, inspect files, and use web search,
@@ -289,10 +368,17 @@ worklane completions zsh > ~/.zfunc/_worklane
 
 ### Release validation
 
-Every distributable build must pass the local quality suite and the isolated full-feature
-acceptance matrix on the lab workstation. The harness uses a unique registry, project, lane,
-image, and remote state directory for each run. It verifies credential mounts with isolated
-fixture files and captures each TUI interaction from a real PTY as text, HTML, and PNG.
+During development, run `scripts/check-local --quick` (or `make test`) for local
+formatting, linting, Rust and Python tests, and script checks. It does not use the lab or
+build release binaries. `scripts/check-local --full` (or `make coverage`) replaces the
+Rust test run with one coverage-instrumented run and enforces the 90% line threshold.
+
+Every distributable build must also pass the isolated full-feature acceptance matrix on
+the lab workstation. The harness uses a unique registry, project, lane, image, and remote
+state directory for each run. It verifies credential mounts with isolated fixture files and
+captures each TUI interaction from a real PTY as text, HTML, and PNG. Each run uses a
+new cache key for one full image build; a tiny fixture checks `--no-cache` separately, and
+later lane upgrades reuse the full image cache. Phase durations go to `timings.tsv`.
 
 ```sh
 scripts/release-check

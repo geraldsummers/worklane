@@ -1,7 +1,7 @@
 .PHONY: test coverage
 
 test:
-	cargo test --workspace
+	scripts/check-local --quick
 
 coverage:
-	cargo llvm-cov --workspace --fail-under-lines 90
+	scripts/check-local --full

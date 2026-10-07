@@ -38,7 +38,34 @@ pub enum AgentKind {
     Codex,
     Pi,
 }
+pub struct AgentDescriptor {
+    pub kind: AgentKind,
+    pub id: &'static str,
+    pub display_name: &'static str,
+    pub executable: &'static str,
+}
+pub const AGENTS: [AgentDescriptor; 2] = [
+    AgentDescriptor {
+        kind: AgentKind::Pi,
+        id: "pi",
+        display_name: "Pi",
+        executable: "pi",
+    },
+    AgentDescriptor {
+        kind: AgentKind::Codex,
+        id: "codex",
+        display_name: "Codex",
+        executable: "codex",
+    },
+];
 impl AgentKind {
+    pub fn parse(value: &str) -> Result<Self> {
+        AGENTS
+            .iter()
+            .find(|agent| agent.id == value)
+            .map(|agent| agent.kind)
+            .with_context(|| format!("unknown agent '{value}'; available: pi, codex"))
+    }
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Codex => "codex",
@@ -140,7 +167,7 @@ impl Default for Profile {
     fn default() -> Self {
         Self {
             image: DEFAULT_IMAGE.into(),
-            agent: AgentKind::Codex,
+            agent: AgentKind::Pi,
             build_context: None,
             containerfile: default_containerfile(),
             embedded_containerfile: default_embedded_containerfile(),
@@ -203,12 +230,6 @@ pub fn load_profiles() -> Result<BTreeMap<String, Profile>> {
     Ok(profiles)
 }
 pub fn validate_profile(profile: &Profile, home: &Path, require_sources: bool) -> Result<()> {
-    if profile.agent == AgentKind::Pi && profile.embedded_containerfile {
-        bail!("Pi lanes require a custom Pi image; the embedded image contains Codex")
-    }
-    if profile.agent == AgentKind::Pi && profile.mount_codex_credentials {
-        bail!("Pi lanes must disable the Codex credential mount")
-    }
     if !matches!(profile.network.as_str(), "outbound" | "none") {
         bail!("profile network must be 'outbound' or 'none'")
     }
@@ -1051,9 +1072,9 @@ pub fn meaningful_drift_lines(diff: &str, container_home: &Path) -> Vec<String> 
         .collect()
 }
 
-/// NVIDIA's CDI hook injects its host driver libraries and metadata into the
-/// disposable root at container start. Those declared-device changes are
-/// runtime plumbing, while any unrelated writable-root change remains drift.
+/// Podman's `--tz=local` updates `/etc/localtime` at container creation. NVIDIA's
+/// CDI hook may also inject host driver files. These exact runtime changes are
+/// not user changes to the disposable root filesystem.
 pub fn meaningful_drift_lines_for_spec(diff: &str, spec: &LaneSpec) -> Vec<String> {
     let nvidia_cdi = spec
         .profile
@@ -1067,7 +1088,7 @@ pub fn meaningful_drift_lines_for_spec(diff: &str, spec: &LaneSpec) -> Vec<Strin
                 .split_once(' ')
                 .map(|(_, path)| path)
                 .unwrap_or_default();
-            !nvidia_cdi || !is_nvidia_cdi_runtime_path(path)
+            line != "C /etc/localtime" && (!nvidia_cdi || !is_nvidia_cdi_runtime_path(path))
         })
         .collect()
 }
@@ -1588,7 +1609,7 @@ mod tests {
     }
 
     #[test]
-    fn pi_profile_is_explicit_and_never_mounts_codex_credentials() {
+    fn pi_profile_can_share_standard_image_and_codex_credentials() {
         let profile: Profile = toml::from_str(
             "image = 'localhost/worklane-pi-pilot:0.87.1'\nagent = 'pi'\nembedded_containerfile = false\ncontainerfile = 'Containerfile.pi'\nruntime = 'systemd'\nmount_codex_credentials = false",
         )
@@ -1598,10 +1619,9 @@ mod tests {
         assert!(validate_profile(&profile, Path::new("/tmp/pilot"), false).is_ok());
         let mut invalid = profile.clone();
         invalid.mount_codex_credentials = true;
-        assert!(validate_profile(&invalid, Path::new("/tmp/pilot"), false).is_err());
-        invalid.mount_codex_credentials = false;
+        assert!(validate_profile(&invalid, Path::new("/tmp/pilot"), false).is_ok());
         invalid.embedded_containerfile = true;
-        assert!(validate_profile(&invalid, Path::new("/tmp/pilot"), false).is_err());
+        assert!(validate_profile(&invalid, Path::new("/tmp/pilot"), false).is_ok());
     }
 
     #[test]
@@ -1735,6 +1755,22 @@ mod tests {
                 home,
             ),
             Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn podman_local_timezone_change_is_not_drift() {
+        let spec = LaneSpec::new(
+            "timezone".into(),
+            "local".into(),
+            PathBuf::from("/tmp/timezone"),
+            Profile::default(),
+        )
+        .unwrap();
+        assert!(meaningful_drift_lines_for_spec("C /etc\nC /etc/localtime\n", &spec).is_empty());
+        assert_eq!(
+            meaningful_drift_lines_for_spec("C /etc/localtime\nA /etc/other\n", &spec),
+            vec!["A /etc/other"]
         );
     }
 

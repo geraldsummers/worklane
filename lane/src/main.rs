@@ -32,7 +32,7 @@ use std::{
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use worklane_core::{LaneStatus, Store};
+use worklane_core::{LaneStatus, Store, AGENTS};
 
 static FORCE_FULL_REDRAW: AtomicBool = AtomicBool::new(false);
 
@@ -52,6 +52,10 @@ struct App {
     confirming_forget: bool,
     confirming_reconcile: bool,
     rename_input: Option<String>,
+    agent_choice: Option<usize>,
+    openrouter_key_input: Option<String>,
+    model_choices: Vec<String>,
+    model_choice: Option<usize>,
     jobs: Vec<ActiveJob>,
     job_queue: VecDeque<JobRequest>,
     state_poll: Option<Receiver<StatePollResult>>,
@@ -110,6 +114,10 @@ enum UiAction {
     Quit,
     Command(&'static str, bool),
     Rename(String),
+    SetAgent(String),
+    SetOpenrouter(String),
+    LoadModels,
+    SetModel(String),
     UpgradeAll,
     Reload,
     EditContainerfile,
@@ -141,6 +149,10 @@ impl App {
             confirming_forget: false,
             confirming_reconcile: false,
             rename_input: None,
+            agent_choice: None,
+            openrouter_key_input: None,
+            model_choices: Vec::new(),
+            model_choice: None,
             jobs: Vec::new(),
             job_queue: VecDeque::new(),
             state_poll: None,
@@ -163,6 +175,73 @@ impl App {
             .collect()
     }
     fn handle_key(&mut self, key: KeyCode) -> UiAction {
+        if let Some(input) = &mut self.openrouter_key_input {
+            return match key {
+                KeyCode::Esc => {
+                    self.openrouter_key_input = None;
+                    self.message = "key entry cancelled".into();
+                    UiAction::None
+                }
+                KeyCode::Enter if !input.is_empty() => {
+                    let key = std::mem::take(input);
+                    self.openrouter_key_input = None;
+                    UiAction::SetOpenrouter(key)
+                }
+                KeyCode::Backspace => {
+                    input.pop();
+                    UiAction::None
+                }
+                KeyCode::Char(c) => {
+                    input.push(c);
+                    UiAction::None
+                }
+                _ => UiAction::None,
+            };
+        }
+        if let Some(index) = &mut self.agent_choice {
+            return match key {
+                KeyCode::Esc => {
+                    self.agent_choice = None;
+                    UiAction::None
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    *index = index.saturating_sub(1);
+                    UiAction::None
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    *index = (*index + 1).min(AGENTS.len() - 1);
+                    UiAction::None
+                }
+                KeyCode::Enter => {
+                    let agent = AGENTS[*index].id.to_owned();
+                    self.agent_choice = None;
+                    UiAction::SetAgent(agent)
+                }
+                _ => UiAction::None,
+            };
+        }
+        if let Some(index) = &mut self.model_choice {
+            return match key {
+                KeyCode::Esc => {
+                    self.model_choice = None;
+                    UiAction::None
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    *index = index.saturating_sub(1);
+                    UiAction::None
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    *index = (*index + 1).min(self.model_choices.len() - 1);
+                    UiAction::None
+                }
+                KeyCode::Enter => {
+                    let model = self.model_choices[*index].clone();
+                    self.model_choice = None;
+                    UiAction::SetModel(model)
+                }
+                _ => UiAction::None,
+            };
+        }
         if let Some(input) = &mut self.rename_input {
             return match key {
                 KeyCode::Esc => {
@@ -279,6 +358,7 @@ impl App {
             KeyCode::Char('u') => UiAction::Command("upgrade", false),
             KeyCode::Char('U') => UiAction::UpgradeAll,
             KeyCode::Char('a') => UiAction::Command("attach", false),
+            KeyCode::Char('v') => UiAction::Command("ide", false),
             KeyCode::Char('S') => UiAction::Command("attach", true),
             KeyCode::Char('d') => UiAction::Command("diff", false),
             KeyCode::Char('D') if self.visible().get(self.selected).is_some() => {
@@ -323,6 +403,17 @@ impl App {
                 UiAction::None
             }
             KeyCode::Char('e') => UiAction::EditContainerfile,
+            KeyCode::Char('A') if !self.visible().is_empty() => {
+                let selected = self.visible()[self.selected].spec.profile.agent;
+                self.agent_choice =
+                    Some(AGENTS.iter().position(|x| x.kind == selected).unwrap_or(0));
+                UiAction::None
+            }
+            KeyCode::Char('K') => {
+                self.openrouter_key_input = Some(String::new());
+                UiAction::None
+            }
+            KeyCode::Char('M') => UiAction::LoadModels,
             KeyCode::Char('/') => {
                 self.filter.clear();
                 self.filtering = true;
@@ -432,6 +523,58 @@ fn invalidate_lane_refresh(app: &mut App, lane_id: &str) {
     app.state_poll_queue
         .retain(|request| request.lane_id != lane_id);
 }
+fn set_openrouter_key(app: &mut App, key: String) -> Result<()> {
+    let mut child = Command::new("worklane")
+        .args(["--json", "credentials", "set-openrouter"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .context("key input unavailable")?
+        .write_all(key.as_bytes())?;
+    let output = child.wait_with_output()?;
+    app.message = if output.status.success() {
+        "OpenRouter key saved for this Linux account; restart Pi to apply".into()
+    } else {
+        "OpenRouter key update failed".into()
+    };
+    if !output.status.success() {
+        app.detail = command_error(&output.stderr, "credential update failed");
+    }
+    Ok(())
+}
+fn load_model_choices(app: &mut App) -> Result<()> {
+    let output = Command::new("worklane")
+        .args(["--json", "credentials", "models"])
+        .output()?;
+    if !output.status.success() {
+        app.message = "Pi model catalog unavailable".into();
+        app.detail = command_error(&output.stderr, "model catalog unavailable");
+        return Ok(());
+    }
+    app.model_choices = serde_json::from_slice(&output.stdout)?;
+    if !app.model_choices.is_empty() {
+        app.model_choice = Some(0);
+    }
+    Ok(())
+}
+fn set_pi_model(app: &mut App, model: &str) -> Result<()> {
+    let output = Command::new("worklane")
+        .args(["--json", "credentials", "set-model", model])
+        .output()?;
+    app.message = if output.status.success() {
+        "Pi model saved; restart Pi to apply".into()
+    } else {
+        "Pi model update failed".into()
+    };
+    if !output.status.success() {
+        app.detail = command_error(&output.stderr, "model update failed");
+    }
+    Ok(())
+}
 fn action(app: &mut App, verb: &str) -> Result<bool> {
     action_with_args(app, verb, &[])
 }
@@ -506,7 +649,7 @@ fn action_with_args(app: &mut App, verb: &str, extra: &[&str]) -> Result<bool> {
     invalidate_lane_refresh(app, &lane_id);
     let mut command = Command::new("worklane");
     command.args(["lane", verb, &lane_id]).args(extra);
-    if verb == "attach" {
+    if verb == "attach" || verb == "ide" {
         restore_terminal_state();
         let _resume = ResumeTui;
         let mut child = command
@@ -1313,8 +1456,8 @@ fn run_app(
             }
             UiAction::Command("upgrade", false) => start_upgrade(app, false)?,
             UiAction::Command(verb, false) => {
-                if verb == "attach" {
-                    app.message = "attach: connecting".into();
+                if verb == "attach" || verb == "ide" {
+                    app.message = format!("{verb}: connecting");
                     redraw(app)?;
                     if action(app, verb)? {
                         start_state_poll(app);
@@ -1324,6 +1467,10 @@ fn run_app(
                 }
             }
             UiAction::Rename(name) => start_job(app, "rename", &[name], false)?,
+            UiAction::SetAgent(agent) => start_job(app, "agent", &[agent], false)?,
+            UiAction::SetOpenrouter(key) => set_openrouter_key(app, key)?,
+            UiAction::LoadModels => load_model_choices(app)?,
+            UiAction::SetModel(model) => set_pi_model(app, &model)?,
             UiAction::Reload => {
                 refresh_all(app);
             }
@@ -1406,18 +1553,25 @@ fn column(value: &str, width: usize) -> String {
         format!("{value:<width$}")
     }
 }
+fn cool_theme() -> bool {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    home.and_then(|path| fs::read_to_string(path.join(".config/worklane/theme")).ok())
+        .is_some_and(|theme| theme.trim() == "cool")
+}
+fn theme_color(warm: (u8, u8, u8), cool: (u8, u8, u8)) -> Color {
+    let (r, g, b) = if cool_theme() { cool } else { warm };
+    Color::Rgb(r, g, b)
+}
 fn lane_style(state: &str, drift: bool) -> Style {
-    // Eight hues, each 45° apart around the HSL color wheel. Keeping this
-    // fixed makes a lane's lifecycle state recognizable at a glance.
     let palette = [
-        Color::Rgb(230, 69, 69),  // red
-        Color::Rgb(230, 190, 69), // amber
-        Color::Rgb(149, 230, 69), // lime
-        Color::Rgb(69, 230, 109), // green
-        Color::Rgb(69, 230, 230), // cyan
-        Color::Rgb(69, 109, 230), // blue
-        Color::Rgb(149, 69, 230), // violet
-        Color::Rgb(230, 69, 190), // magenta
+        theme_color((205, 141, 131), (207, 146, 150)), // red
+        theme_color((200, 173, 118), (211, 185, 137)), // amber
+        theme_color((175, 163, 152), (149, 167, 174)), // muted
+        theme_color((160, 184, 156), (158, 197, 176)), // green
+        theme_color((134, 175, 166), (137, 191, 194)), // teal
+        theme_color((158, 175, 199), (145, 181, 214)), // blue
+        theme_color((180, 154, 194), (170, 167, 210)), // violet
+        theme_color((228, 218, 207), (216, 227, 231)), // text
     ];
     let color = palette[match state {
         "exited" => 0,
@@ -1462,6 +1616,10 @@ fn visible_detail(app: &App) -> &str {
         .unwrap_or(&app.detail)
 }
 fn draw(f: &mut ratatui::Frame, app: &App) {
+    let bg = theme_color((30, 27, 25), (27, 34, 40));
+    let panel = theme_color((40, 36, 33), (34, 44, 52));
+    let muted = theme_color((175, 163, 152), (149, 167, 174));
+    f.render_widget(Block::default().style(Style::default().bg(bg)), f.area());
     let detail = visible_detail(app);
     let detail_height = if detail.is_empty() { 0 } else { 6 };
     let areas = Layout::default()
@@ -1482,7 +1640,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         column("STORAGE", 10),
         "IMAGE"
     ))
-    .style(Style::default().fg(Color::DarkGray))];
+    .style(Style::default().fg(muted).bg(bg))];
     items.extend(app.visible().iter().enumerate().map(|(i, x)| {
         let flag = if x.drift { " drift" } else { "" };
         ListItem::new(format!(
@@ -1503,7 +1661,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         ))
         .style(if i == app.selected {
             lane_style(&x.state, x.drift)
-                .bg(Color::DarkGray)
+                .bg(panel)
                 .add_modifier(Modifier::BOLD)
         } else {
             lane_style(&x.state, x.drift)
@@ -1517,7 +1675,24 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         ),
         areas[0],
     );
-    let input_line = if let Some(name) = &app.rename_input {
+    let input_line = if let Some(key) = &app.openrouter_key_input {
+        format!(
+            "OpenRouter key (masked; Enter saves, Esc cancels): {}",
+            "*".repeat(key.chars().count())
+        )
+    } else if let Some(index) = app.agent_choice {
+        format!(
+            "Agent (j/k, Enter selects, Esc cancels): {}",
+            AGENTS[index].display_name
+        )
+    } else if let Some(index) = app.model_choice {
+        format!(
+            "OpenRouter model {}/{} (j/k, Enter selects): {}",
+            index + 1,
+            app.model_choices.len(),
+            app.model_choices[index]
+        )
+    } else if let Some(name) = &app.rename_input {
         format!("Rename (typing; Enter saves, Esc cancels): {name}")
     } else {
         format!(
@@ -1547,7 +1722,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     f.render_widget(
         Paragraph::new(format!(
             "{}\n\
-             j/k  /  Esc q  a/S attach  s/x run  n rename  d diff  D del  F forget  i info  e edit  u/U up  r c/C fix",
+             a/S attach v IDE n rename D del F forget u/U up A agent K key M model",
             if app.message.is_empty() {
                 "ready"
             } else {
@@ -1601,6 +1776,10 @@ mod tests {
             confirming_forget: false,
             confirming_reconcile: false,
             rename_input: None,
+            agent_choice: None,
+            openrouter_key_input: None,
+            model_choices: Vec::new(),
+            model_choice: None,
             jobs: Vec::new(),
             job_queue: VecDeque::new(),
             state_poll: None,
@@ -1698,6 +1877,10 @@ mod tests {
         assert_eq!(
             app.handle_key(KeyCode::Char('a')),
             UiAction::Command("attach", false)
+        );
+        assert_eq!(
+            app.handle_key(KeyCode::Char('v')),
+            UiAction::Command("ide", false)
         );
         assert_eq!(
             app.handle_key(KeyCode::Char('S')),
@@ -1798,15 +1981,15 @@ mod tests {
         assert_eq!(app.handle_key(KeyCode::F(1)), UiAction::None);
         assert_eq!(
             lane_style("running", false).fg,
-            Some(Color::Rgb(69, 230, 109))
+            Some(Color::Rgb(160, 184, 156))
         );
         assert_eq!(
             lane_style("exited", false).fg,
-            Some(Color::Rgb(230, 69, 69))
+            Some(Color::Rgb(205, 141, 131))
         );
         assert_eq!(
             lane_style("unknown", true).fg,
-            Some(Color::Rgb(230, 69, 190))
+            Some(Color::Rgb(228, 218, 207))
         );
         assert_eq!(
             upgrade_detail(br#"[]"#).unwrap(),
@@ -2349,6 +2532,10 @@ mod tests {
             confirming_forget: false,
             confirming_reconcile: false,
             rename_input: None,
+            agent_choice: None,
+            openrouter_key_input: None,
+            model_choices: Vec::new(),
+            model_choice: None,
             jobs: Vec::new(),
             job_queue: VecDeque::new(),
             state_poll: None,
@@ -2466,5 +2653,115 @@ mod tests {
         )
         .unwrap();
         assert!(inspected.contains("Home: /home/dev"));
+    }
+    #[test]
+    fn agent_picker_selects_codex_without_changing_account_default() {
+        let mut app = app();
+        assert_eq!(app.handle_key(KeyCode::Char('A')), UiAction::None);
+        assert_eq!(app.agent_choice, Some(0));
+        app.handle_key(KeyCode::Down);
+        assert_eq!(
+            app.handle_key(KeyCode::Enter),
+            UiAction::SetAgent("codex".into())
+        );
+        assert!(app.agent_choice.is_none());
+    }
+
+    #[test]
+    fn openrouter_key_entry_never_renders_the_key() {
+        let mut app = app();
+        app.handle_key(KeyCode::Char('K'));
+        for c in "sk-secret".chars() {
+            app.handle_key(KeyCode::Char(c));
+        }
+        let backend = ratatui::backend::TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!screen.contains("sk-secret"));
+        assert!(screen.contains("*********"));
+        assert_eq!(
+            app.handle_key(KeyCode::Enter),
+            UiAction::SetOpenrouter("sk-secret".into())
+        );
+        assert!(app.openrouter_key_input.is_none());
+    }
+    #[test]
+    fn account_actions_pass_the_key_only_on_standard_input() {
+        let _guard = environment_lock().lock().unwrap();
+        let root = env::temp_dir().join(format!(
+            "lane-account-actions-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let bin = root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let worklane = bin.join("worklane");
+        fs::write(&worklane, "#!/bin/sh\nprintf '%s\n' \"$*\" >> \"$TEST_ROOT/calls\"\ncase \"$*\" in\n  *'credentials models'*) printf '[\"~openai/gpt-sol-latest\",\"~anthropic/claude-sonnet-latest\"]\n' ;;\n  *'credentials set-openrouter'*) cat > \"$TEST_ROOT/key\" ;;\nesac\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&worklane, fs::Permissions::from_mode(0o755)).unwrap();
+        let old_path = env::var_os("PATH");
+        env::set_var(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.display(),
+                old_path.as_ref().unwrap().to_string_lossy()
+            ),
+        );
+        env::set_var("TEST_ROOT", &root);
+        let mut app = app();
+        set_openrouter_key(&mut app, "secret-value".into()).unwrap();
+        load_model_choices(&mut app).unwrap();
+        assert_eq!(app.model_choices.len(), 2);
+        app.handle_key(KeyCode::Down);
+        let chosen = app.handle_key(KeyCode::Enter);
+        assert_eq!(
+            chosen,
+            UiAction::SetModel("~anthropic/claude-sonnet-latest".into())
+        );
+        set_pi_model(&mut app, "~anthropic/claude-sonnet-latest").unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join("key")).unwrap(),
+            "secret-value"
+        );
+        assert!(!fs::read_to_string(root.join("calls"))
+            .unwrap()
+            .contains("secret-value"));
+        if let Some(path) = old_path {
+            env::set_var("PATH", path);
+        } else {
+            env::remove_var("PATH");
+        }
+        env::remove_var("TEST_ROOT");
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn account_and_agent_prompts_cancel_without_saving() {
+        let mut app = app();
+        app.handle_key(KeyCode::Char('K'));
+        for c in "temporary-key".chars() {
+            app.handle_key(KeyCode::Char(c));
+        }
+        assert_eq!(app.handle_key(KeyCode::Esc), UiAction::None);
+        assert!(app.openrouter_key_input.is_none());
+        app.model_choices = vec!["first".into(), "second".into()];
+        app.model_choice = Some(0);
+        app.handle_key(KeyCode::Down);
+        assert_eq!(app.model_choice, Some(1));
+        assert_eq!(app.handle_key(KeyCode::Esc), UiAction::None);
+        assert!(app.model_choice.is_none());
+        app.handle_key(KeyCode::Char('A'));
+        assert_eq!(app.handle_key(KeyCode::Esc), UiAction::None);
+        assert!(app.agent_choice.is_none());
     }
 }

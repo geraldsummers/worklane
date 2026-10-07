@@ -35,7 +35,8 @@ toolchain, not the Rust version bundled in the standard image.
 The complete Worklane gate is intentionally heavy. Do not rerun the full test, coverage, and
 isolated acceptance suite after every small edit or exploratory iteration. During implementation,
 use the narrowest relevant unit test, compile check, lint, or static validation and batch related
-changes before advancing to another expensive checkpoint.
+changes before advancing to another expensive checkpoint. Run `scripts/check-local --quick`
+for the shared local suite; it does not build images or contact the lab.
 
 Coverage is not optional for substantive implementation changes: Worklane is mission-critical
 infrastructure, and its full coverage and acceptance evidence is worth the cost. Run the complete

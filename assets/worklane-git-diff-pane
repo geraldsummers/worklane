@@ -248,40 +248,62 @@ def health(value, interval):
     age = max(0, time.monotonic() - value["updated"])
     # Give an on-time background refresh one interval to publish its snapshot.
     if value["error"] or age > 3 * interval:
-        return f"stale {age:.0f}s" + (": " + value["error"] if value["error"] else "")
+        return "stale" + (": " + value["error"] if value["error"] else "")
     return ""
+
+
+def fit_line(value, width):
+    limit = max(1, width - 1)  # Leave the terminal's last column free to avoid auto-wrap.
+    return value if len(value) <= limit else value[:limit - 1] + "…"
 
 
 def render(watcher, width, height):
     discovery, repositories = watcher.read()
     lines = []
     if os.environ.get("WORKLANE_NAME"):
-        lines.append("lane: " + safe_text(os.environ["WORKLANE_NAME"]))
-    lines.extend([time.strftime("%Y-%m-%d %H:%M:%S %Z"), "scan: " + safe_text(watcher.root)])
+        lines.append(fit_line("lane: " + safe_text(os.environ["WORKLANE_NAME"]), width))
+    lines.extend([fit_line(time.strftime("%Y-%m-%d %H:%M %Z"), width),
+                  fit_line("scan: " + safe_text(watcher.root), width)])
     shown = [(repo, value) for repo, value in repositories
-             if health(value, watcher.interval) or value["data"]["paths"] or value["data"]["sync"] != "synced"]
-    lines.extend([f"watched: {len(repositories)}  shown: {len(shown)}", "─" * max(1, width - 1), ""])
-    discovery_health = health(discovery, watcher.interval)
-    if discovery_health:
-        lines.append("discovery: " + discovery_health)
-    if not shown and not discovery_health:
-        lines.append("\033[32mall clean and synced\033[0m")
+             if value and value["data"] and
+             (value["data"]["paths"] or value["data"]["sync"] not in ("synced", "no-upstream"))]
+    no_upstream = sum(bool(value and value["data"] and value["data"]["sync"] == "no-upstream")
+                      for _, value in repositories)
+    states = [health(value, watcher.interval) for value in
+              [discovery, *(value for _, value in repositories)]]
+    stale = sum(state.startswith("stale") for state in states)
+    loading = states.count("loading")
+    unavailable = sum(state.startswith("unavailable") for state in states)
+    lines.extend([fit_line(f"watched: {len(repositories)}  shown: {len(shown)}", width),
+                  "─" * max(1, width - 1), ""])
+    if stale or loading or unavailable:
+        parts = []
+        if stale:
+            parts.append(f"{stale} stale")
+        if loading:
+            parts.append(f"{loading} loading")
+        if unavailable:
+            parts.append(f"{unavailable} unavailable")
+        lines.append(fit_line("refresh: " + ", ".join(parts) + "; last known changes shown", width))
+    if discovery and discovery["error"]:
+        lines.append(fit_line("discovery: " + discovery["error"], width))
+    if no_upstream:
+        lines.append(fit_line(f"without upstream: {no_upstream}", width))
+    if not shown and not stale and not loading and not unavailable:
+        lines.append("\033[32mall clean and synced\033[0m" if not no_upstream else
+                     "\033[32mno working-tree changes\033[0m")
     for repo, value in shown:
         relative = os.path.relpath(repo, watcher.root) if repo.startswith(watcher.root + os.sep) else repo
-        lines.append("\033[1;36m" + safe_text(relative) + "\033[0m")
-        state = health(value, watcher.interval)
-        if state:
-            lines.append("  " + state)
-        data = value["data"] if value else None
-        if data:
-            lines.append(f"  branch: {data['branch']}  S:{data['staged']} U:{data['unstaged']} ?:{data['untracked']}  {data['sync']}")
-            lines.extend("  " + p for p in data["paths"][:12])
-            if len(data["paths"]) > 12:
-                lines.append(f"  ... {len(data['paths']) - 12} more")
+        lines.append("\033[1;36m" + fit_line(safe_text(relative), width) + "\033[0m")
+        data = value["data"]
+        lines.append(fit_line(f"  branch: {data['branch']}  S:{data['staged']} U:{data['unstaged']} ?:{data['untracked']}  {data['sync']}", width))
+        lines.extend(fit_line("  " + p, width) for p in data["paths"][:12])
+        if len(data["paths"]) > 12:
+            lines.append(fit_line(f"  ... {len(data['paths']) - 12} more", width))
         lines.append("")
     if len(lines) > height:
         visible = max(0, height - 1)
-        lines = lines[:visible] + [f"... {len(lines) - visible} more lines (increase pane height or reduce WORKLANE_GIT_DIFF_ROOT/MAX_DEPTH)"]
+        lines = lines[:visible] + [fit_line(f"... {len(lines) - visible} more lines", width)]
     return "\n".join(lines) + "\n"
 
 
@@ -324,8 +346,8 @@ def main():
             size = shutil.get_terminal_size((80, 24))
             frame = render(watcher, size.columns, size.lines)
             if frame != previous:
-                painted = frame.replace("\n", "\033[K\n")
-                print("\033[?2026h\033[H" + painted + "\033[J\033[?2026l", end="", flush=True)
+                painted = frame.rstrip("\n").replace("\n", "\033[K\n")
+                print("\033[?2026h\033[H" + painted + "\033[K\033[J\033[?2026l", end="", flush=True)
                 previous = frame
             delay = min(watcher.interval, 1)
             if future is None:

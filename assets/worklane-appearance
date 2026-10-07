@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""Apply Worklane's shared warm/cool dark palette in a lane home."""
+
+import json
+import os
+from pathlib import Path
+import plistlib
+import sys
+import tempfile
+
+import tomlkit
+
+PALETTES = {
+    "warm": dict(bg="#1e1b19", panel="#282421", text="#e4dacf", muted="#afa398",
+                 selection="#38302c", border="#584b43", teal="#86afa6",
+                 violet="#b49ac2", amber="#c8ad76", red="#cd8d83",
+                 green="#a0b89c", blue="#9eafc7"),
+    "cool": dict(bg="#1b2228", panel="#222c34", text="#d8e3e7", muted="#95a7ae",
+                 selection="#2b3b48", border="#435664", teal="#89bfc2",
+                 violet="#aaa7d2", amber="#d3b989", red="#cf9296",
+                 green="#9ec5b0", blue="#91b5d6"),
+}
+HOME = Path.home()
+
+
+def write(path, content):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="wb", dir=path.parent, delete=False) as output:
+        output.write(content if isinstance(content, bytes) else content.encode())
+        temporary = Path(output.name)
+    os.replace(temporary, path)
+
+
+def update_toml(path, edit):
+    document = tomlkit.parse(path.read_text()) if path.exists() else tomlkit.document()
+    edit(document)
+    write(path, tomlkit.dumps(document))
+
+
+def pi_theme(name, p):
+    colors = {
+        "accent": p["teal"], "border": p["border"], "borderAccent": p["violet"],
+        "borderMuted": p["muted"], "success": p["green"], "error": p["red"],
+        "warning": p["amber"], "muted": p["muted"], "dim": p["muted"],
+        "text": p["text"], "thinkingText": p["muted"], "selectedBg": p["selection"],
+        "scrollbarTrack": p["panel"], "scrollbarThumb": p["muted"],
+        "searchMatchBg": p["selection"], "searchMatchText": p["text"],
+        "userMessageBg": p["panel"], "userMessageText": p["text"],
+        "customMessageBg": p["selection"], "customMessageText": p["text"],
+        "customMessageLabel": p["violet"], "toolPendingBg": p["panel"],
+        "toolSuccessBg": p["selection"], "toolErrorBg": p["selection"],
+        "toolTitle": p["text"], "toolOutput": p["muted"],
+        "mdHeading": p["amber"], "mdLink": p["blue"], "mdLinkUrl": p["muted"],
+        "mdCode": p["violet"], "mdCodeBlock": p["green"],
+        "mdCodeBlockBorder": p["border"], "mdQuote": p["muted"],
+        "mdQuoteBorder": p["border"], "mdHr": p["border"],
+        "mdListBullet": p["violet"], "toolDiffAdded": p["green"],
+        "toolDiffRemoved": p["red"], "toolDiffContext": p["muted"],
+        "syntaxComment": p["muted"], "syntaxKeyword": p["violet"],
+        "syntaxFunction": p["blue"], "syntaxVariable": p["text"],
+        "syntaxString": p["green"], "syntaxNumber": p["amber"],
+        "syntaxType": p["teal"], "syntaxOperator": p["text"],
+        "syntaxPunctuation": p["muted"], "thinkingOff": p["muted"],
+        "thinkingMinimal": p["muted"], "thinkingLow": p["blue"],
+        "thinkingMedium": p["teal"], "thinkingHigh": p["violet"],
+        "thinkingXhigh": p["amber"], "thinkingMax": p["red"],
+        "bashMode": p["green"],
+    }
+    return {"name": f"worklane-{name}", "appearance": "dark", "colors": colors,
+            "export": {"pageBg": p["bg"], "cardBg": p["panel"],
+                       "infoBg": p["selection"]}}
+
+
+def codex_theme(name, p):
+    settings = [{"settings": {"background": p["bg"], "foreground": p["text"],
+                               "selection": p["selection"], "caret": p["text"]}}]
+    for scope, color in (("comment", "muted"), ("string", "green"),
+                         ("keyword", "violet"), ("entity.name.function", "blue"),
+                         ("storage.type", "teal"), ("constant.numeric", "amber"),
+                         ("invalid", "red")):
+        settings.append({"scope": scope, "settings": {"foreground": p[color]}})
+    return plistlib.dumps({"name": f"worklane-{name}", "settings": settings})
+
+
+def apply(name):
+    if name not in PALETTES:
+        raise ValueError("theme must be warm or cool")
+    p = PALETTES[name]
+    base = HOME / ".config/worklane"
+    write(base / "theme", name + "\n")
+    write(base / "palette.json", json.dumps(p, indent=2) + "\n")
+    write(base / "nvim/palette.lua", "return {\n" + "".join(
+        f"  {key} = {json.dumps(value)},\n" for key, value in p.items()) + "}\n")
+    write(base / "prompt.zsh", (
+        f'PROMPT="%F{{{p["teal"]}}}[${{WORKLANE_NAME:-lane}}]%f '
+        f'%F{{{p["green"]}}}%n%f:%F{{{p["blue"]}}}%~%f %# "\n'
+        'worklane_title() { print -Pn "\\e]2;${WORKLANE_NAME:-lane}\\a"; }\n'
+        'autoload -Uz add-zsh-hook\nadd-zsh-hook precmd worklane_title\n'))
+
+    def herdr(document):
+        theme = document.get("theme")
+        if theme is None:
+            theme = tomlkit.table()
+            document["theme"] = theme
+        theme["name"] = "gruvbox" if name == "warm" else "catppuccin"
+        custom = theme.get("custom")
+        if custom is None:
+            custom = tomlkit.table()
+            theme["custom"] = custom
+        for key, value in {"sidebar_bg": p["bg"], "active_row_bg": p["panel"],
+                           "selection_bg": p["selection"], "panel_bg": p["panel"],
+                           "accent": p["teal"], "red": p["red"],
+                           "green": p["green"]}.items():
+            custom[key] = value
+        ui = document.get("ui")
+        if ui is None:
+            ui = tomlkit.table()
+            document["ui"] = ui
+        ui["mouse_capture"] = True
+    update_toml(HOME / ".config/herdr/config.toml", herdr)
+
+    pi_dir = HOME / ".pi/agent"
+    write(pi_dir / "themes" / f"worklane-{name}.json",
+          json.dumps(pi_theme(name, p), indent=2) + "\n")
+    pi_settings = pi_dir / "settings.json"
+    settings = json.loads(pi_settings.read_text()) if pi_settings.exists() else {}
+    settings["theme"] = f"worklane-{name}"
+    write(pi_settings, json.dumps(settings, indent=2) + "\n")
+
+    codex = HOME / ".codex"
+    write(codex / "themes" / f"worklane-{name}.tmTheme", codex_theme(name, p))
+    def codex_config(document):
+        tui = document.get("tui")
+        if tui is None:
+            tui = tomlkit.table()
+            document["tui"] = tui
+        tui["theme"] = f"worklane-{name}"
+    update_toml(codex / "config.toml", codex_config)
+
+
+if __name__ == "__main__":
+    try:
+        selected = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("WORKLANE_THEME", "warm")
+        apply(selected)
+    except (ValueError, json.JSONDecodeError) as exc:
+        print(f"worklane-appearance: {exc}", file=sys.stderr)
+        sys.exit(1)

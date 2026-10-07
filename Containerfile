@@ -1,12 +1,20 @@
 FROM debian:trixie-slim
 # worklane-standard-containerfile
 ARG CODEX_VERSION=0.157.0
+ARG NODE_VERSION=24.21.0
+ARG NODE_SHA256=fd8e59d5a511510f6a298afb548f18c7d2b1be404d8b4a27d94fbe49f56cb2d6
+ARG PI_VERSION=latest
+ARG PI_WEB_VERSION=latest
 ARG TYPESCRIPT_VERSION=7.0.2
 ARG PRETTIER_VERSION=3.9.5
 ARG RUST_VERSION=1.85.1
 ARG RUSTUP_INIT_SHA256=7d0ea0f8eba7fa1ebfe998091cd7ec4501e33ec5ca6b884eb4d894d7da5170af
 ARG HERDR_VERSION=0.8.2
 ARG HERDR_SHA256=976150a14d490c94b243ea2e1a7eb2dfb67f12e36b182db90936f6728e6aecf4
+ARG NVIM_VERSION=0.12.5
+ARG NVIM_SHA256=bce0f56eda1f1b1db6eee8f4133d7a38813ea07933837dd1777411ca384c6875
+ARG TREE_SITTER_VERSION=0.26.1
+ARG TREE_SITTER_SHA256=d74182fffbf441f247371ad6af77d99b10ac9f788d7e068e4b44992d9d6d7c26
 ARG USERNAME=dev
 ARG USER_UID=1000
 ARG USER_GID=1000
@@ -20,18 +28,29 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     dbus-user-session dbus-x11 diffutils dnsutils fd-find file findutils fonts-liberation \
     fonts-noto-color-emoji fzf gawk gdb git git-lfs gnupg golang-go jq less \
     libffi-dev libsqlite3-dev libssl-dev lsof make man-db nano ncdu \
-    netcat-openbsd ninja-build nodejs npm openssh-client patch \
+    netcat-openbsd ninja-build openssh-client patch \
     pkg-config procps psmisc python-is-python3 python3 python3-pip python3-venv systemd systemd-sysv \
     graphicsmagick pipx python3-tomlkit ripgrep rsync shellcheck socat sqlite3 strace tar tree unzip \
     tzdata valgrind vim wget xvfb xauth xz-utils yq zip zsh chromium \
  && rm -rf /var/lib/apt/lists/* \
  && ln -s /usr/bin/batcat /usr/local/bin/bat \
  && ln -s /usr/bin/fdfind /usr/local/bin/fd \
+ && curl --proto '=https' --tlsv1.2 -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" -o /tmp/node.tar.xz \
+ && echo "${NODE_SHA256}  /tmp/node.tar.xz" | sha256sum -c - \
+ && tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 \
+ && rm -f /tmp/node.tar.xz \
  && codex_version="$(npm view "@openai/codex@${CODEX_VERSION}" version --fetch-retries=2)" \
- && test -n "$codex_version" \
- && env NPM_CONFIG_PREFIX=/usr/local npm install -g "@openai/codex@${codex_version}" "typescript@${TYPESCRIPT_VERSION}" "prettier@${PRETTIER_VERSION}" \
+ && pi_version="$(npm view "@earendil-works/pi-coding-agent@${PI_VERSION}" version --fetch-retries=2)" \
+ && pi_web_version="$(npm view "pi-web-access@${PI_WEB_VERSION}" version --fetch-retries=2)" \
+ && test -n "$codex_version" && test -n "$pi_version" && test -n "$pi_web_version" \
+ && env NPM_CONFIG_PREFIX=/usr/local npm install -g "@openai/codex@${codex_version}" "@earendil-works/pi-coding-agent@${pi_version}" "pi-web-access@${pi_web_version}" "typescript@${TYPESCRIPT_VERSION}" "prettier@${PRETTIER_VERSION}" \
  && install -d /etc/worklane \
  && printf '%s\n' "$codex_version" > /etc/worklane/codex-version \
+ && printf '%s\n' "$pi_version" > /etc/worklane/pi-version \
+ && printf '%s\n' "$pi_web_version" > /etc/worklane/pi-web-version \
+ && install -d /opt/worklane \
+ && ln -s /usr/local/lib/node_modules/pi-web-access /opt/worklane/pi-web-access \
+ && test "$(pi --version)" = "$pi_version" \
  && mv /usr/local/bin/codex /usr/local/bin/codex-real \
  && printf '%s\n' \
     '#!/bin/sh' \
@@ -69,6 +88,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && command -v herdr \
  && herdr --version \
  && rm -f /tmp/herdr \
+ && curl -fsSL "https://github.com/neovim/neovim/releases/download/v${NVIM_VERSION}/nvim-linux-x86_64.tar.gz" -o /tmp/nvim.tar.gz \
+ && echo "${NVIM_SHA256}  /tmp/nvim.tar.gz" | sha256sum -c - \
+ && tar -xzf /tmp/nvim.tar.gz -C /opt \
+ && ln -s /opt/nvim-linux-x86_64/bin/nvim /usr/local/bin/nvim \
+ && rm -f /tmp/nvim.tar.gz \
+ && curl -fsSL "https://github.com/tree-sitter/tree-sitter/releases/download/v${TREE_SITTER_VERSION}/tree-sitter-linux-x64.gz" -o /tmp/tree-sitter.gz \
+ && echo "${TREE_SITTER_SHA256}  /tmp/tree-sitter.gz" | sha256sum -c - \
+ && gzip -dc /tmp/tree-sitter.gz > /usr/local/bin/tree-sitter \
+ && chmod 755 /usr/local/bin/tree-sitter \
+ && rm -f /tmp/tree-sitter.gz \
+ && nvim --version | head -n 1 \
+ && tree-sitter --version \
  && python3 --version && python3 -c 'import tomlkit' && gm version && pip3 --version && node --version && npm --version \
  && tsc --version && prettier --version && rustc --version && cargo --version && rustfmt --version
 RUN groupadd --gid "${USER_GID}" "${USERNAME}" && useradd --uid "${USER_UID}" --gid "${USER_GID}" -m -s /usr/bin/zsh "${USERNAME}" \
@@ -136,6 +167,12 @@ RUN groupadd --gid "${USER_GID}" "${USERNAME}" && useradd --uid "${USER_UID}" --
     'RestartSec=2s' \
     'KillMode=mixed' \
     > /usr/lib/systemd/user/worklane-git-diff-pane-manager.service
+COPY assets/pi-pilot/plan.ts assets/pi-pilot/plan-utils.mjs /usr/local/lib/node_modules/@earendil-works/pi-coding-agent/examples/extensions/worklane-plan/
+RUN test -f /usr/local/lib/node_modules/@earendil-works/pi-coding-agent/examples/extensions/questionnaire.ts \
+ && test -f /usr/local/lib/node_modules/@earendil-works/pi-coding-agent/examples/extensions/worklane-plan/plan.ts
+COPY --chmod=755 assets/worklane-pi-agent /usr/local/bin/worklane-pi-agent
+COPY --chmod=755 assets/worklane-ide assets/worklane-appearance /usr/local/lib/worklane/
+COPY assets/worklane-ide-init.lua /usr/local/lib/worklane/ide-init.lua
 USER ${USERNAME}
 WORKDIR /home/${USERNAME}
 ENV container=podman

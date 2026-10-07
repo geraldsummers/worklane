@@ -154,7 +154,7 @@ class WatcherTests(unittest.TestCase):
         with mock.patch.object(module.time, "monotonic", return_value=102.1):
             self.assertEqual(module.health(snapshot, 1), "")
         with mock.patch.object(module.time, "monotonic", return_value=103.1):
-            self.assertEqual(module.health(snapshot, 1), "stale 3s")
+            self.assertEqual(module.health(snapshot, 1), "stale")
 
     def test_collector_death_releases_lock_without_removing_it(self):
         entered = MP.Event()
@@ -296,6 +296,7 @@ class WatcherTests(unittest.TestCase):
 
     def test_deleted_repository_and_display_sizes(self):
         repo = self.repository()
+        (repo / "tracked").write_text("changed\n")
         watcher = module.Watcher(repo, 4, 60, self.root / "shared", cwd=repo)
         self.assertIn("loading", module.render(watcher, 80, 24))
         watcher.refresh()
@@ -309,6 +310,25 @@ class WatcherTests(unittest.TestCase):
         self.assertIn("stale", frame)
         self.assertIn("scan failed", frame)
         self.assertNotIn("all clean and synced", frame)
+
+    def test_many_stale_clean_repositories_use_one_summary(self):
+        clean = dict(branch="main", sync="synced", paths=[], staged=0, unstaged=0, untracked=0)
+        changed = dict(branch="main", sync="synced", paths=[" M tracked"],
+                       staged=0, unstaged=1, untracked=0)
+        stale = lambda data: dict(data=data, updated=1, error="")
+        watcher = mock.Mock(root="/work", interval=1)
+        watcher.read.return_value = (stale([]),
+                                     [(f"/work/clean-{n}", stale(clean)) for n in range(55)] +
+                                     [("/work/changed", stale(changed))])
+        with mock.patch.object(module.time, "monotonic", return_value=100):
+            frame = module.render(watcher, 100, 24)
+        self.assertIn("watched: 56  shown: 1", frame)
+        self.assertIn("refresh: 57 stale", frame)
+        self.assertIn("changed", frame)
+        self.assertIn(" M tracked", frame)
+        self.assertNotIn("clean-0", frame)
+        self.assertEqual(frame.count("stale"), 1)
+        self.assertNotIn("more lines", frame)
 
     def test_settings_validation(self):
         with mock.patch.dict(os.environ, {}, clear=True):
@@ -393,6 +413,7 @@ class WatcherTests(unittest.TestCase):
             self.assertTrue(all(frame.endswith("\033[?2026l") for frame in redraws))
             self.assertTrue(all("\033[2J" not in frame and "\033[3J" not in frame for frame in redraws))
             self.assertTrue(all("\033[K\n" in frame for frame in redraws))
+            self.assertTrue(all("\033[K\n\033[J" not in frame for frame in redraws))
             self.assertIn("\033[?1049l", output.call_args_list[-1].args[0])
             with mock.patch.object(module, "render", side_effect=OSError("display failed")):
                 self.assertEqual(module.main(), 1)
@@ -403,6 +424,7 @@ class WatcherTests(unittest.TestCase):
 
     def test_real_pty_watcher_renders_and_exits_cleanly(self):
         repo = self.repository()
+        (repo / "tracked").write_text("changed\n")
         master, slave = pty.openpty()
         process = subprocess.Popen(
             ["python3", str(SCRIPT)], cwd=repo, stdin=slave, stdout=slave, stderr=slave,

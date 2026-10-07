@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+MODE=${1:---quick}
+case "$MODE" in
+  --quick|--full) ;;
+  *) echo "usage: scripts/check-local [--quick|--full]" >&2; exit 2 ;;
+esac
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+cd "$ROOT"
+if [[ -d /home/dev ]]; then
+  mkdir -p /home/dev/.tmp
+  export TMPDIR=/home/dev/.tmp
+fi
+if [[ -n ${WORKLANE_RUST_TOOLCHAIN:-} ]]; then
+  CARGO=(rustup run "$WORKLANE_RUST_TOOLCHAIN" cargo)
+else
+  CARGO=(cargo)
+fi
+
+"${CARGO[@]}" fmt --check
+"${CARGO[@]}" clippy --workspace --all-targets -- -D warnings
+if [[ $MODE == --full ]]; then
+  command -v cargo-llvm-cov >/dev/null || { echo "cargo-llvm-cov is required for --full" >&2; exit 1; }
+  "${CARGO[@]}" llvm-cov --workspace --fail-under-lines 90 -- --test-threads=1
+else
+  "${CARGO[@]}" test --workspace
+fi
+python3 -m unittest discover -s tests -p "test_*.py"
+bash -n scripts/lab-acceptance scripts/release-check scripts/check-local
+python3 -c "import ast, pathlib; ast.parse(pathlib.Path(\"scripts/tui_capture.py\").read_text())"
+shellcheck scripts/lab-acceptance scripts/release-check scripts/check-local

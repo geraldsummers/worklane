@@ -60,6 +60,18 @@ with the lane workspace at `/home/dev`. Use Herdr-managed sessions unless the us
 for a plain shell. The session name is fixed at lane creation; renaming the lane changes
 its display name, not its Herdr session identity.
 
+The lane also has a persistent Neovim IDE. `worklane lane ide NAME` opens it from
+the owning host; inside a managed lane, `worklane-ide start` creates its IDE tab
+without switching focus and `worklane-ide focus` switches to it. Agents in other
+tabs can use `worklane-ide open FILE --line N`, `diagnostics`, `task NAME`,
+`debug NAME`, `ex COMMAND`, and `keys KEYS`. `open --focus` is explicit. The
+bridge uses Neovim's lane-local socket and does not need to inject text into a
+terminal pane. Project tasks belong in `.worklane/ide.toml` under named
+`[tasks.NAME]` tables with a `command` string and optional workspace-relative
+`cwd`; DAP launch configurations use `.vscode/launch.json`. Install language
+servers and debugger adapters in user space. The IDE's config is managed by
+Worklane, while project tasks and tool configuration are workspace files.
+
 ## Operating Herdr from an agent
 
 Treat Herdr as a structured control plane for the lane's persistent terminals. Use its CLI

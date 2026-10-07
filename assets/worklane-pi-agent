@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+model_file=/run/worklane-host-pi/model
+if [ ! -r "$model_file" ]; then
+  echo "Pi model setting is missing; use the host lane TUI Credentials action" >&2
+  exit 2
+fi
+model="$(cat "$model_file")"
+case "$model" in
+  ""|*[!a-zA-Z0-9_./~:-]*) echo "invalid Pi model setting" >&2; exit 2 ;;
+esac
+exec pi --provider openrouter --model "$model" --no-extensions \
+  --extension /opt/worklane/pi-web-access/dist \
+  --extension /usr/local/lib/node_modules/@earendil-works/pi-coding-agent/examples/extensions/questionnaire.ts \
+  --extension /usr/local/lib/node_modules/@earendil-works/pi-coding-agent/examples/extensions/worklane-plan/plan.ts \
+  --tools read,bash,edit,write,web_search,fetch_content,questionnaire "$@"
