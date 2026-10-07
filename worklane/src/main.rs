@@ -28,6 +28,7 @@ const AGENT_MIGRATION_MD: &str = include_str!("../../docs/agents/MIGRATE.md");
 const AGENT_DOCS_INSTALLER: &str = include_str!("../../assets/worklane-agent-docs.py");
 /// Lane-local presenter for Herdr's experimental pane graphics API.
 const SHOW_IMAGE_SCRIPT: &str = include_str!("../../assets/worklane-show-image");
+const HERDR_WRAPPER_SCRIPT: &str = include_str!("../../assets/worklane-herdr");
 const GIT_DIFF_PANE_SCRIPT: &str = include_str!("../../assets/worklane-git-diff-pane");
 static OPERATION_CONTEXT: OnceLock<(String, Instant)> = OnceLock::new();
 
@@ -1597,6 +1598,12 @@ grep -qxF 'source "$HOME/.config/worklane/prompt.zsh"' "$HOME/.zshrc" || \
     let script = format!(
         r#"{script}
 mkdir -p "$HOME/.local/bin" "$HOME/.local/share/worklane/bin"
+cat > "$HOME/.local/share/worklane/bin/worklane-herdr" <<'WORKLANE_HERDR'
+{HERDR_WRAPPER_SCRIPT}WORKLANE_HERDR
+chmod 755 "$HOME/.local/share/worklane/bin/worklane-herdr"
+if [ ! -e "$HOME/.local/bin/herdr" ] && [ ! -L "$HOME/.local/bin/herdr" ]; then
+  ln -s "$HOME/.local/share/worklane/bin/worklane-herdr" "$HOME/.local/bin/herdr"
+fi
 cat > "$HOME/.local/bin/worklane-show-image" <<'WORKLANE_SHOW_IMAGE'
 {SHOW_IMAGE_SCRIPT}WORKLANE_SHOW_IMAGE
 chmod 755 "$HOME/.local/bin/worklane-show-image"
@@ -3313,6 +3320,15 @@ exit 0
             .contains("printf '\\007' > /dev/tty"));
         let presenter = home.join(".local/bin/worklane-show-image");
         assert_eq!(fs::read_to_string(&presenter).unwrap(), SHOW_IMAGE_SCRIPT);
+        let herdr_wrapper = home.join(".local/share/worklane/bin/worklane-herdr");
+        assert_eq!(
+            fs::read_to_string(&herdr_wrapper).unwrap(),
+            HERDR_WRAPPER_SCRIPT
+        );
+        assert_eq!(
+            fs::read_link(home.join(".local/bin/herdr")).unwrap(),
+            herdr_wrapper
+        );
         let watcher = home.join(".local/share/worklane/bin/worklane-git-diff-pane");
         assert_eq!(fs::read_to_string(&watcher).unwrap(), GIT_DIFF_PANE_SCRIPT);
         use std::os::unix::fs::PermissionsExt;
@@ -3406,6 +3422,7 @@ exit 0
         assert!(shell.contains("touch \"$HOME/.zshenv\""));
         assert!(shell.contains("export PATH=\"$HOME/.local/bin:$PATH\""));
         assert!(shell.contains("$HOME/.local/bin/worklane-show-image"));
+        assert!(shell.contains("$HOME/.local/share/worklane/bin/worklane-herdr"));
         assert!(shell.contains("experimental[\"kitty_graphics\"] = True"));
         assert!(shell.contains("server reload-config"));
         assert!(SHOW_IMAGE_SCRIPT.contains("pane.graphics.set"));

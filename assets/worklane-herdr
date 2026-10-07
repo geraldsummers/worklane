@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+"""Add verified sender provenance to Herdr agent prompts from managed panes."""
+
+import json
+import os
+import subprocess
+import sys
+
+
+REAL_HERDR = "/usr/local/bin/herdr"
+
+
+def prompt_text_index(args):
+    index = 0
+    if len(args) >= 2 and args[0] == "--session":
+        index = 2
+    if args[index:index + 2] != ["agent", "prompt"] or len(args) < index + 4:
+        return None
+    return index + 3
+
+
+def has_header(message):
+    lines = message.splitlines()
+    return (
+        len(lines) >= 3
+        and lines[0] == "[AGENT MESSAGE]"
+        and lines[1].startswith("From: ")
+        and lines[2].startswith("Reply-to: ")
+        and bool(lines[1][6:].strip())
+        and bool(lines[2][10:].strip())
+    )
+
+
+def sender_name(session, pane):
+    result = subprocess.run(
+        [REAL_HERDR, "--session", session, "agent", "list"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode:
+        raise ValueError("cannot verify the sender with Herdr agent list")
+    try:
+        agents = json.loads(result.stdout)["result"]["agents"]
+        sender = next(agent for agent in agents if agent["pane_id"] == pane)
+        name = sender["agent"]
+    except (ValueError, KeyError, TypeError, StopIteration) as error:
+        raise ValueError("current Herdr pane is not a recognized agent") from error
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("current Herdr pane has no agent name")
+    return name
+
+
+def prepared_args(args, environ):
+    args = list(args)
+    index = prompt_text_index(args)
+    if index is None:
+        return args
+    session = environ.get("HERDR_SESSION", "").strip()
+    pane = environ.get("HERDR_PANE_ID", "").strip()
+    message = args[index]
+    if not session or not pane:
+        if has_header(message):
+            return args
+        raise ValueError(
+            "agent prompt needs a Herdr sender pane or an explicit "
+            "[AGENT MESSAGE] / From: / Reply-to: header"
+        )
+    name = sender_name(session, pane)
+    route = f"Herdr session {session}, pane {pane}"
+    if has_header(message):
+        message = "\n".join(message.splitlines()[3:]).lstrip("\n")
+    args[index] = f"[AGENT MESSAGE]\nFrom: {name} ({route})\nReply-to: {route}\n{message}"
+    return args
+
+
+def main():
+    try:
+        args = prepared_args(sys.argv[1:], os.environ)
+    except ValueError as error:
+        print(f"herdr: {error}", file=sys.stderr)
+        return 2
+    os.execv(REAL_HERDR, [REAL_HERDR, *args])
+
+
+if __name__ == "__main__":
+    sys.exit(main())
