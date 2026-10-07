@@ -49,11 +49,14 @@ runtime.git_shared_scans
 runtime.immutable_root
 runtime.mounts
 runtime.network
+runtime.pi_lane_local
+runtime.pi_versions
 runtime.process_reaping
 runtime.system_scope_denied
 runtime.systemd
 runtime.task_limits
 runtime.timestamp
+runtime.timezone
 runtime.herdr_graphics
 runtime.herdr_supervision
 runtime.tools

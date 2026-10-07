@@ -1,0 +1,15 @@
+{
+  "name": "worklane-pi-bundle",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Locked seed for persistent lane-local Worklane Pi runtimes",
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "1.0.2",
+    "pi-web-access": "0.35.0",
+    "@narumitw/pi-plan-mode": "0.58.4",
+    "pi-lightpanda-extension": "0.1.0"
+  },
+  "devDependencies": {
+    "typescript": "7.0.2"
+  }
+}

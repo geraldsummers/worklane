@@ -1,0 +1,19 @@
+[Unit]
+Description=Worklane lane-local durable Pi collaboration
+Wants=worklane-herdr.service
+After=worklane-herdr.service
+ConditionPathExists=%h/.local/bin/pi
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+UMask=0077
+ExecStart=/usr/local/bin/worklane-collab serve
+Restart=on-failure
+RestartSec=3s
+TasksMax=512
+MemoryHigh=256M
+MemoryMax=512M
+
+[Install]
+WantedBy=default.target

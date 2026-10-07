@@ -46,6 +46,27 @@ fn run(binary: &str, data: &Path, bin: &Path, args: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap()
 }
 
+fn run_with_home(binary: &str, data: &Path, bin: &Path, home: &Path, args: &[&str]) -> String {
+    let output = Command::new(binary)
+        .args(args)
+        .env("HOME", home)
+        .env("XDG_DATA_HOME", data)
+        .env("CODEX_HOME", data.join("credentials/codex"))
+        .env("GH_CONFIG_DIR", data.join("credentials/gh"))
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), env::var("PATH").unwrap()),
+        )
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
 fn run_failure(binary: &str, data: &Path, bin: &Path, args: &[&str]) -> String {
     let output = Command::new(binary)
         .args(args)
@@ -345,6 +366,25 @@ esac
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&podman, fs::Permissions::from_mode(0o755)).unwrap();
     }
+    let identity = bin_dir.join("id");
+    fs::write(
+        &identity,
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "$0.log"
+case "$1" in
+  -un) printf 'lane-owner\n' ;;
+  -u) printf '2007\n' ;;
+  -g) printf '3007\n' ;;
+  *) exit 1 ;;
+esac
+"#,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&identity, fs::Permissions::from_mode(0o755)).unwrap();
+    }
     let gh = bin_dir.join("gh");
     fs::write(
         &gh,
@@ -413,6 +453,13 @@ exit 1
         binary,
         &data,
         &bin_dir,
+        &["--json", "lane", "upgrade", "smoke", "--skip-running"]
+    )
+    .contains("skipped-running"));
+    assert!(run(
+        binary,
+        &data,
+        &bin_dir,
         &[
             "--json",
             "lane",
@@ -430,6 +477,7 @@ exit 1
     assert!(manifest.contains(&format!("id = \"{SMOKE_ID}\"")));
     assert!(manifest.contains(&format!("container_name = \"worklane-smoke-{SMOKE_ID}\"")));
     assert!(manifest.contains("session_name = \"smoke\""));
+    assert!(manifest.contains("agent = \"pi\""));
     assert!(manifest.contains("mount_codex_credentials = true"));
     assert!(manifest.contains("mount_gh_credentials = true"));
     assert!(manifest.contains("runtime = \"systemd\""));
@@ -440,6 +488,14 @@ exit 1
     assert!(create_log.contains(&format!("--label io.worklane.id={SMOKE_ID}")));
     assert!(create_log.contains("--label io.worklane.name=smoke"));
     assert!(create_log.contains("--systemd=always --cgroupns=private --user=0"));
+    assert!(create_log.contains("--userns=keep-id:uid=1001,gid=1001"));
+    assert!(!create_log.lines().any(|line| line
+        .split_whitespace()
+        .any(|argument| argument == "--userns=keep-id")));
+    assert!(create_log.contains("XDG_RUNTIME_DIR=/run/user/1001"));
+    assert!(create_log.contains("DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1001/bus"));
+    assert!(!create_log.contains("/run/user/2007"));
+    assert!(!identity.with_extension("log").exists());
     assert!(!create_log.contains("--init"));
     assert!(create_log.contains("--workdir /home/dev"));
     assert!(create_log.contains(&format!(
@@ -577,7 +633,7 @@ exit 1
         ("shell", "lane zsh bootstrap failed"),
         (
             "herdr",
-            "Herdr Codex integration bootstrap failed: injected bootstrap failure",
+            "Herdr Pi integration bootstrap failed: injected bootstrap failure",
         ),
         ("attach", "attach failed"),
     ] {
@@ -604,6 +660,35 @@ exit 1
     }
     fs::remove_file(podman.with_extension("fail")).unwrap();
     assert!(run(binary, &data, &bin_dir, &["lane", "attach", "smoke"]).is_empty());
+    assert!(run(binary, &data, &bin_dir, &["lane", "ide", "smoke"]).is_empty());
+    assert!(fs::read_to_string(podman.with_extension("log"))
+        .unwrap()
+        .lines()
+        .any(|line| line.contains("worklane-ide focus")));
+    assert!(
+        run_failure(binary, &data, &bin_dir, &["appearance", "set", "blue"])
+            .contains("appearance preset must be warm or cool")
+    );
+    assert!(run_with_home(
+        binary,
+        &data,
+        &bin_dir,
+        &root,
+        &["--json", "appearance", "status"]
+    )
+    .contains("warm"));
+    assert!(run_with_home(
+        binary,
+        &data,
+        &bin_dir,
+        &root,
+        &["--json", "appearance", "set", "cool"]
+    )
+    .contains("cool"));
+    assert_eq!(
+        fs::read_to_string(root.join(".config/worklane/theme")).unwrap(),
+        "cool\n"
+    );
     assert!(run(
         binary,
         &data,
@@ -648,6 +733,30 @@ exit 1
     assert!(full_upgrade_log
         .lines()
         .any(|line| line.starts_with("build --pull=always --no-cache ")));
+    assert!(run_failure(
+        binary,
+        &data,
+        &bin_dir,
+        &["lane", "agent", "smoke", "unknown"]
+    )
+    .contains("unknown agent"));
+    assert!(run(
+        binary,
+        &data,
+        &bin_dir,
+        &["--json", "lane", "agent", "smoke", "codex"]
+    )
+    .contains("\"agent\":\"codex\""));
+    assert!(fs::read_to_string(project.join(".worklane/lane.toml"))
+        .unwrap()
+        .contains("agent = \"codex\""));
+    assert!(run(
+        binary,
+        &data,
+        &bin_dir,
+        &["--json", "lane", "agent", "smoke", "pi"]
+    )
+    .contains("\"agent\":\"pi\""));
     assert!(run(
         binary,
         &data,
@@ -1121,6 +1230,23 @@ respond '{"spec":{"schema_version":5,"id":"00000000-0000-4000-8000-000000000005"
     )
     .contains("running"));
     assert!(run(binary, &data, &bin_dir, &["lane", "attach", "remote"]).contains(REMOTE_ID));
+    assert!(run(binary, &data, &bin_dir, &["lane", "ide", "remote"]).contains(REMOTE_ID));
+    assert!(run_with_home(
+        binary,
+        &data,
+        &bin_dir,
+        &root,
+        &["--json", "appearance", "set", "cool"]
+    )
+    .contains("cool"));
+    assert!(run_with_home(
+        binary,
+        &data,
+        &bin_dir,
+        &root,
+        &["--json", "appearance", "set", "warm", "--local-only"]
+    )
+    .contains("warm"));
     assert!(run(
         binary,
         &data,
@@ -1163,5 +1289,137 @@ respond '{"spec":{"schema_version":5,"id":"00000000-0000-4000-8000-000000000005"
         &["--json", "lane", "delete", "remote"]
     )
     .contains("deleted"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn account_openrouter_credentials_are_private_and_replaceable() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = temp("pi-credentials");
+    let home = root.join("home");
+    let bin = root.join("bin");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    let pi = bin.join("pi");
+    fs::write(&pi, "#!/bin/sh\nprintf 'provider model context\nopenrouter ~openai/gpt-sol-latest 1M\nopenrouter ~anthropic/claude-sonnet-latest 1M\n'\n").unwrap();
+    fs::set_permissions(&pi, fs::Permissions::from_mode(0o755)).unwrap();
+    let binary = env!("CARGO_BIN_EXE_worklane");
+    let command = |args: &[&str], input: Option<&[u8]>| {
+        let mut child = Command::new(binary)
+            .args(args)
+            .env("HOME", &home)
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), env::var("PATH").unwrap()),
+            )
+            .stdin(if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        if let Some(value) = input {
+            child.stdin.take().unwrap().write_all(value).unwrap();
+        }
+        child.wait_with_output().unwrap()
+    };
+    let initial = command(&["--json", "credentials", "status"], None);
+    assert!(initial.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&initial.stdout).unwrap()
+            ["openrouter_configured"],
+        false
+    );
+    let models = command(&["--json", "credentials", "models"], None);
+    assert!(models.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Vec<String>>(&models.stdout)
+            .unwrap()
+            .len(),
+        2
+    );
+    let invalid = command(&["credentials", "set-model", "not-in-catalog"], None);
+    assert!(!invalid.status.success());
+    let selected = command(
+        &[
+            "--json",
+            "credentials",
+            "set-model",
+            "~anthropic/claude-sonnet-latest",
+        ],
+        None,
+    );
+    assert!(selected.status.success());
+    let empty = command(&["credentials", "set-openrouter"], Some(b"  \n"));
+    assert!(!empty.status.success());
+    assert!(String::from_utf8_lossy(&empty.stderr).contains("key must be nonempty"));
+    let whitespace = command(&["credentials", "set-openrouter"], Some(b"two words"));
+    assert!(!whitespace.status.success());
+    assert!(!String::from_utf8_lossy(&whitespace.stderr).contains("two words"));
+    for key in ["old-test-key", "new-test-key"] {
+        let result = command(
+            &["--json", "credentials", "set-openrouter"],
+            Some(key.as_bytes()),
+        );
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(!result
+            .stdout
+            .windows(key.len())
+            .any(|part| part == key.as_bytes()));
+        assert!(!result
+            .stderr
+            .windows(key.len())
+            .any(|part| part == key.as_bytes()));
+    }
+    let dir = home.join(".config/worklane/pi");
+    assert_eq!(
+        fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::metadata(dir.join("auth.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    assert_eq!(
+        fs::metadata(dir.join("model"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    let auth: serde_json::Value =
+        serde_json::from_slice(&fs::read(dir.join("auth.json")).unwrap()).unwrap();
+    assert_eq!(auth["openrouter"]["key"], "new-test-key");
+    assert_eq!(
+        fs::read_to_string(dir.join("model")).unwrap(),
+        "~anthropic/claude-sonnet-latest"
+    );
+    let status = command(&["--json", "credentials", "status"], None);
+    assert!(status.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&status.stdout).unwrap()
+            ["openrouter_configured"],
+        true
+    );
+    fs::write(&pi, "#!/bin/sh\nprintf 'provider model\n'\n").unwrap();
+    let empty_catalog = command(&["credentials", "models"], None);
+    assert!(!empty_catalog.status.success());
+    assert!(String::from_utf8_lossy(&empty_catalog.stderr).contains("no OpenRouter models"));
+    fs::write(&pi, "#!/bin/sh\nexit 1\n").unwrap();
+    let unavailable = command(&["credentials", "models"], None);
+    assert!(!unavailable.status.success());
+    assert!(String::from_utf8_lossy(&unavailable.stderr).contains("catalog unavailable"));
     fs::remove_dir_all(root).unwrap();
 }

@@ -1,0 +1,124 @@
+#!/bin/sh
+# Seed complete Pi into persistent userspace; --replace is an explicit migration.
+set -eu
+umask 077
+prefix="$HOME/.local"
+packages="$prefix/lib/node_modules"
+seed_root="${WORKLANE_PI_SEED_ROOT:-/opt/worklane/pi-seed/node_modules}"
+bundle="$HOME/.local/share/worklane/pi-bundle"
+assets="${WORKLANE_PI_ASSETS:-/usr/local/lib/worklane/runtime}"
+replace=false
+case "${1:-}" in
+  '') ;;
+  --replace) replace=true ;;
+  *) echo 'usage: worklane-pi-install [--replace]' >&2; exit 2 ;;
+esac
+mkdir -p "$packages/@earendil-works" "$packages/@narumitw" "$prefix/bin" "$HOME/.local/share/worklane" "$HOME/.pi/agent/extensions/worklane"
+exec 9>"$HOME/.local/share/worklane/pi-install.lock"
+flock 9
+stage=
+cleanup() { [ -z "$stage" ] || rm -rf -- "$stage"; }
+trap cleanup EXIT HUP INT TERM
+if [ "$replace" = true ]; then
+  backup="$HOME/.local/share/worklane/pi-backups/$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  mkdir -p "$backup"
+  chmod 700 "$backup"
+  cp -a "$HOME/.pi" "$backup/pi"
+  if [ -e "$bundle" ] || [ -L "$bundle" ]; then
+    mv "$bundle" "$backup/pi-bundle"
+  fi
+  for package in @earendil-works/pi-coding-agent pi-web-access @narumitw/pi-plan-mode pi-lightpanda-extension; do
+    if [ -e "$packages/$package" ] || [ -L "$packages/$package" ]; then
+      mkdir -p "$backup/packages/$(dirname "$package")"
+      mv "$packages/$package" "$backup/packages/$package"
+    fi
+  done
+  if [ -e "$prefix/bin/pi" ] || [ -L "$prefix/bin/pi" ]; then
+    mv "$prefix/bin/pi" "$backup/pi-launcher"
+  fi
+  cp -a "$HOME/.pi/agent/extensions/worklane" "$backup/worklane-extensions"
+  rm -f "$HOME/.pi/agent/extensions/worklane/collab.ts" "$HOME/.pi/agent/extensions/worklane/p0.ts"
+  printf '%s\n' "$backup" > "$HOME/.local/share/worklane/pi-last-backup"
+fi
+if [ ! -e "$bundle" ] && [ ! -L "$bundle" ]; then
+  stage="$(mktemp -d "$HOME/.local/share/worklane/.pi-bundle.XXXXXXXX")"
+  # Copy the complete locked tree, including hoisted transitive dependencies.
+  cp -R "$seed_root" "$stage/node_modules"
+  test -f "$stage/node_modules/@earendil-works/pi-coding-agent/package.json"
+  mv "$stage" "$bundle"
+  stage=
+fi
+for package in @earendil-works/pi-coding-agent pi-web-access @narumitw/pi-plan-mode pi-lightpanda-extension; do
+  target="$packages/$package"
+  if [ ! -e "$target" ] && [ ! -L "$target" ]; then
+    test -f "$bundle/node_modules/$package/package.json"
+    ln -s "$bundle/node_modules/$package" "$target"
+  fi
+done
+core="$packages/@earendil-works/pi-coding-agent"
+test -f "$core/dist/bundle/cli.js" || { echo 'lane-local Pi is incomplete' >&2; exit 1; }
+test -d "$packages/pi-web-access/dist" || { echo 'lane-local web plugin is incomplete' >&2; exit 1; }
+test -f "$packages/@narumitw/pi-plan-mode/dist/index.ts" || { echo 'lane-local plan plugin is incomplete' >&2; exit 1; }
+test -f "$packages/pi-lightpanda-extension/index.ts" || { echo 'lane-local Lightpanda plugin is incomplete' >&2; exit 1; }
+if [ ! -e "$prefix/bin/pi" ] && [ ! -L "$prefix/bin/pi" ]; then
+  ln -s ../lib/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js "$prefix/bin/pi"
+fi
+test -x "$prefix/bin/pi" || { echo 'lane-local Pi executable is unavailable' >&2; exit 1; }
+for extension in collab.ts p0.ts complain.ts; do
+  destination="$HOME/.pi/agent/extensions/worklane/$extension"
+  if [ ! -e "$destination" ] && [ ! -L "$destination" ]; then
+    cp "$assets/$extension" "$destination"
+  fi
+done
+WORKLANE_PI_REPLACE="$replace" python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+root = Path.home() / '.pi/agent'
+def merge(name, defaults):
+    path = root / name
+    if path.is_symlink():
+        raise SystemExit('Refusing symlinked Pi settings: ' + name)
+    data = json.loads(path.read_text()) if path.exists() else {}
+    if not isinstance(data, dict):
+        raise SystemExit('Pi settings must be an object: ' + name)
+    for key, value in defaults.items():
+        data.setdefault(key, value)
+    if os.environ.get('WORKLANE_PI_REPLACE') == 'true':
+        # Cold migration resets audited execution policy, not credentials/models
+        # or unrelated settings; the old configuration remains in its backup.
+        if name == 'settings.json':
+            data['defaultTools'] = defaults['defaultTools']
+            data['cacheWarming'] = 'off'
+            data.setdefault('compaction', {})['enabled'] = False
+            data.setdefault('retry', {}).setdefault('provider', {})['maxRetries'] = 0
+        elif name == 'pi-plan-mode.json':
+            data['defaultPlanTools'] = defaults['defaultPlanTools']
+            data.pop('safeSubcommands', None)
+        elif name == 'web-search.json':
+            data['toolActivation'] = 'eager'
+    if name == 'settings.json':
+        packages = data.setdefault('packages', [])
+        packages[:] = [p for p in packages if not (isinstance(p, str) and (p.startswith('npm:pi-web-access') or p.startswith('npm:@narumitw/pi-plan-mode') or p.startswith('npm:pi-lightpanda-extension')))]
+        for package in ('pi-web-access', '@narumitw/pi-plan-mode', 'pi-lightpanda-extension'):
+            source = '../../.local/lib/node_modules/' + package
+            if source not in packages:
+                packages.append(source)
+        extensions = data.setdefault('extensions', [])
+        extensions[:] = [p for p in extensions if 'worklane-plan/plan.ts' not in str(p)]
+        for resource in ('./extensions/worklane/collab.ts', './extensions/worklane/p0.ts', './extensions/worklane/complain.ts'):
+            if resource not in extensions:
+                extensions.append(resource)
+    temporary = path.with_name(path.name + '.worklane-new')
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w') as output:
+        json.dump(data, output, indent=2)
+        output.write('\n')
+        output.flush()
+        os.fsync(output.fileno())
+    temporary.replace(path)
+merge('settings.json', {'defaultTools': ['read','bash','edit','write','grep','find','ls'], 'cacheWarming': 'off', 'compaction': {'enabled': False}, 'retry': {'provider': {'maxRetries': 0}}})
+merge('pi-plan-mode.json', {'thinkingLevel': 'inherit', 'implementationPlanRetention': 'clear-after-first-run', 'defaultPlanTools': ['read','bash','grep','find','ls','web_search','fetch_content','get_search_content','source_check','agent_list_peers','goal_plan'], 'defaultPlanExportPath': 'PLAN.md'})
+merge('web-search.json', {'provider': 'exa', 'toolActivation': 'eager', 'fetchRouting': {'providers': ['http'], 'allowRemoteHostedProviders': False}, 'workflow': 'none', 'allowBrowserCookies': False, 'autoOpenBrowser': False, 'githubClone': {'clonePath': str(Path.home() / '.tmp/pi-github-repos')}, 'fetch': {'allowedModes': ['readable', 'raw']}, 'pdf': {'provider': 'unpdf'}, 'youtube': {'enabled': False}, 'video': {'enabled': False}})
+PY
+"$prefix/bin/pi" --version >/dev/null

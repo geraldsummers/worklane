@@ -1,0 +1,10 @@
+[Unit]
+Description=Worklane durable goal queue health check
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=15s
+Unit=worklane-goal-runner.service
+
+[Install]
+WantedBy=timers.target

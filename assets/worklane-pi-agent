@@ -1,0 +1,30 @@
+#!/bin/sh
+set -eu
+/usr/local/lib/worklane/worklane-pi-install
+model_file=/run/worklane-host-pi/model
+if [ ! -r "$model_file" ]; then
+  echo "Pi model setting is missing; use the host lane TUI Credentials action" >&2
+  exit 2
+fi
+model="$(cat "$model_file")"
+case "$model" in
+  ""|*[!a-zA-Z0-9_./~:-]*) echo "invalid Pi model setting" >&2; exit 2 ;;
+esac
+# Managed runs load only audited extensions, not arbitrary project/MCP/autoload
+# code that could issue invisible nested model calls outside run accounting.
+mkdir -p "$HOME/.tmp"
+export TMPDIR="$HOME/.tmp"
+if [ -n "${WORKLANE_RUN_ID:-}" ]; then
+  integration="$HOME/.pi/agent/extensions/herdr-agent-state.ts"
+  test -f "$integration" || { echo 'Managed Pi requires its Herdr integration' >&2; exit 1; }
+  exec "$HOME/.local/bin/pi" --provider openrouter --model "$model" \
+    --offline --no-approve --no-extensions --no-skills --no-prompt-templates \
+    --extension "$HOME/.local/lib/node_modules/pi-web-access" \
+    --extension "$HOME/.local/lib/node_modules/pi-lightpanda-extension" \
+    --extension "$HOME/.local/lib/node_modules/@narumitw/pi-plan-mode" \
+    --extension "$HOME/.pi/agent/extensions/worklane/collab.ts" \
+    --extension "$HOME/.pi/agent/extensions/worklane/p0.ts" \
+    --extension "$integration" "$@"
+fi
+# Interactive sessions retain their user-reviewed custom resources.
+exec "$HOME/.local/bin/pi" --provider openrouter --model "$model" "$@"

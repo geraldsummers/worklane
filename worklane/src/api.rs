@@ -357,20 +357,21 @@ fn is_change_method(method: &str) -> bool {
     )
 }
 
+const API_WORKER_PROPERTIES: &[&str] = &[
+    "--property=Type=exec",
+    "--property=RuntimeMaxSec=6h",
+    "--property=TasksMax=4096",
+    // Podman's rootless network helper stays in this service cgroup after the
+    // worker exits. Killing the cgroup drops the lane's outbound route.
+    "--property=KillMode=process",
+];
+
 fn start_unit(id: &str) -> Result<()> {
     let executable = std::env::current_exe()?;
     let unit = format!("worklane-api-{id}");
     let mut command = Command::new("systemd-run");
-    command.args([
-        "--user",
-        "--collect",
-        "--quiet",
-        "--unit",
-        &unit,
-        "--property=Type=exec",
-        "--property=RuntimeMaxSec=6h",
-        "--property=TasksMax=4096",
-    ]);
+    command.args(["--user", "--collect", "--quiet", "--unit", &unit]);
+    command.args(API_WORKER_PROPERTIES);
     for name in [
         "XDG_DATA_HOME",
         "XDG_STATE_HOME",
@@ -781,6 +782,17 @@ pub fn print_schema() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn api_worker_preserves_rootless_helpers_after_exit() {
+        assert!(API_WORKER_PROPERTIES.contains(&"--property=KillMode=process"));
+        assert!(API_WORKER_PROPERTIES.contains(&"--property=Type=exec"));
+        assert!(API_WORKER_PROPERTIES.contains(&"--property=RuntimeMaxSec=6h"));
+        assert!(API_WORKER_PROPERTIES.contains(&"--property=TasksMax=4096"));
+        assert!(!API_WORKER_PROPERTIES.iter().any(|property| {
+            property.contains("KillMode=control-group") || property.contains("KillMode=mixed")
+        }));
+    }
 
     #[test]
     fn schema_separates_reads_changes_and_terminal_control() {

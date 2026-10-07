@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""Control the one persistent Neovim editor in a Worklane Herdr session."""
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import subprocess
+import sys
+import time
+import tomllib
+
+HOME = Path.home()
+STATE = HOME / ".local/state/worklane"
+SOCKET = STATE / "ide.sock"
+LOCK = STATE / "ide.lock"
+SESSION = os.environ.get("WORKLANE_SESSION") or os.environ.get("HERDR_SESSION")
+WORKSPACE = Path(os.environ.get("WORKLANE_WORKSPACE", str(HOME)))
+TAB_LABEL = "IDE"
+
+
+def call(*args, check=True, timeout=30):
+    return subprocess.run(args, text=True, capture_output=True, check=check,
+                          timeout=timeout)
+
+
+def herdr(*args):
+    if not SESSION:
+        raise RuntimeError("WORKLANE_SESSION is unavailable; run this inside a lane")
+    result = call("herdr", "--session", SESSION, *args)
+    if not result.stdout.strip():
+        return {}
+    try:
+        return json.loads(result.stdout)["result"]
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"invalid Herdr reply for {args}: {result.stdout[:200]!r}") from exc
+
+
+def editor_alive():
+    if not SOCKET.exists():
+        return False
+    try:
+        return call("nvim", "--server", str(SOCKET), "--remote-expr", "1",
+                    check=False, timeout=2).returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
+
+
+def editor_expr(expr):
+    if not editor_alive():
+        raise RuntimeError("IDE is not running; use 'worklane-ide start' first")
+    return call("nvim", "--server", str(SOCKET), "--remote-expr", expr).stdout.strip()
+
+
+def workspace_id():
+    workspaces = herdr("workspace", "list")["workspaces"]
+    for item in workspaces:
+        if item.get("label") == SESSION:
+            return item["workspace_id"]
+    raise RuntimeError("the lane's Herdr workspace is not ready; attach to the lane first")
+
+
+def prepare_editor():
+    init = HOME / ".config/worklane/nvim/init.lua"
+    if not init.is_file():
+        raise RuntimeError("Neovim configuration is missing; attach with the updated Worklane binary")
+    revision = hashlib.sha256(init.read_bytes()).hexdigest()
+    marker = STATE / "ide-init.sha256"
+    if marker.exists() and marker.read_text().strip() == revision:
+        return
+    env = {**os.environ, "WORKLANE_IDE_BOOTSTRAP": "1"}
+    result = subprocess.run(["nvim", "--headless", "-u", str(init), "+qa"],
+                            env=env, text=True, capture_output=True, timeout=360)
+    log = STATE / "ide-bootstrap.log"
+    log.write_text(result.stdout + result.stderr)
+    if result.returncode != 0:
+        raise RuntimeError(f"Neovim setup failed; inspect {log}")
+    marker.write_text(revision + "\n")
+
+
+def start(focus=False):
+    STATE.mkdir(parents=True, exist_ok=True)
+    with LOCK.open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        prepare_editor()
+        wid = workspace_id()
+        tabs = herdr("tab", "list", "--workspace", wid)["tabs"]
+        tab = next((t for t in tabs if t.get("label") == TAB_LABEL), None)
+        if tab is None:
+            created = herdr("tab", "create", "--workspace", wid,
+                            "--cwd", str(WORKSPACE), "--label", TAB_LABEL, "--no-focus")
+            tab = created["tab"]
+            pane = created["root_pane"]["pane_id"]
+        else:
+            panes = herdr("pane", "list", "--workspace", wid)["panes"]
+            pane = next((p["pane_id"] for p in panes
+                         if p.get("tab_id") == tab["tab_id"] and
+                         p.get("label") != "git diff"), None)
+            if pane is None:
+                raise RuntimeError("IDE tab has no usable pane")
+        if not editor_alive():
+            SOCKET.unlink(missing_ok=True)
+            init = HOME / ".config/worklane/nvim/init.lua"
+            command = " ".join(shlex.quote(part) for part in
+                               ("nvim", "-u", str(init), "--listen", str(SOCKET), str(WORKSPACE)))
+            herdr("pane", "run", pane, command)
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                if editor_alive():
+                    break
+                time.sleep(0.1)
+            else:
+                raise RuntimeError("Neovim did not start; inspect the IDE pane")
+        if focus:
+            herdr("tab", "focus", tab["tab_id"])
+        return tab["tab_id"]
+
+
+def run_task(name):
+    config = WORKSPACE / ".worklane/ide.toml"
+    if not config.exists():
+        raise RuntimeError(f"project task file is missing: {config}")
+    with config.open("rb") as stream:
+        tasks = tomllib.load(stream).get("tasks", {})
+    task = tasks.get(name)
+    if not isinstance(task, dict) or not isinstance(task.get("command"), str):
+        raise RuntimeError(f"unknown task: {name}")
+    command = task["command"]
+    if not command.strip():
+        raise RuntimeError(f"task {name} has an empty command")
+    cwd = (WORKSPACE / task.get("cwd", ".")).resolve()
+    if not cwd.is_dir() or not cwd.is_relative_to(WORKSPACE.resolve()):
+        raise RuntimeError(f"task {name} has an invalid working directory")
+    wid = workspace_id()
+    created = herdr("tab", "create", "--workspace", wid, "--cwd", str(cwd),
+                    "--label", f"task:{name}", "--no-focus")
+    herdr("pane", "run", created["root_pane"]["pane_id"], command)
+    return created["tab"]["tab_id"]
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+    for name in ("start", "focus", "diagnostics"):
+        sub.add_parser(name)
+    opening = sub.add_parser("open")
+    opening.add_argument("file")
+    opening.add_argument("--line", type=int)
+    opening.add_argument("--focus", action="store_true")
+    for name in ("ex", "keys", "task", "debug"):
+        action = sub.add_parser(name)
+        action.add_argument("value")
+    args = parser.parse_args()
+    if args.command in ("start", "focus"):
+        print(start(focus=args.command == "focus"))
+    elif args.command == "open":
+        start(focus=args.focus)
+        path = Path(args.file).expanduser().resolve()
+        call("nvim", "--server", str(SOCKET), "--remote", str(path))
+        if args.line is not None:
+            if args.line < 1:
+                parser.error("--line must be positive")
+            editor_expr(f"execute('normal! {args.line}G')")
+    elif args.command == "diagnostics":
+        print(editor_expr("v:lua.WorklaneDiagnostics()"))
+    elif args.command == "ex":
+        print(editor_expr("execute(" + json.dumps(args.value) + ")"))
+    elif args.command == "keys":
+        if not editor_alive():
+            raise RuntimeError("IDE is not running")
+        call("nvim", "--server", str(SOCKET), "--remote-send", args.value)
+    elif args.command in ("task", "debug"):
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", args.value):
+            parser.error("names may contain letters, digits, dots, hyphens, and underscores")
+        if args.command == "task":
+            print(run_task(args.value))
+        else:
+            print(editor_expr(f"v:lua.WorklaneDebug({json.dumps(args.value)})"))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (RuntimeError, subprocess.CalledProcessError, subprocess.TimeoutExpired,
+            KeyError, ValueError) as exc:
+        print(f"worklane-ide: {exc}", file=sys.stderr)
+        sys.exit(1)

@@ -1,0 +1,9 @@
+[Unit]
+Description=Inspect Worklane goal queue and budgets
+Requires=worklane-collab.service
+After=worklane-collab.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/worklane-collab tick
+TimeoutStartSec=30s

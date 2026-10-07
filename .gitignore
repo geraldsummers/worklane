@@ -1,5 +1,6 @@
 /target
 /dist/
 /artifacts/
+/.tmp/
 __pycache__/
 *.py[cod]

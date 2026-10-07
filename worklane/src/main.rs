@@ -5,7 +5,7 @@ use serde::Serialize;
 use std::collections::HashSet;
 use std::{
     fs,
-    io::{self, Read, Write},
+    io::{self, IsTerminal, Read, Write},
     path::{Path, PathBuf},
     process::Command,
     sync::OnceLock,
@@ -18,9 +18,14 @@ mod api;
 /// The standard lane image recipe travels with every `worklane` binary.
 const EMBEDDED_CONTAINERFILE: &str = include_str!("../../Containerfile");
 const HOST_CODEX_MOUNT: &str = "/run/worklane-host-codex";
+const HOST_PI_MOUNT: &str = "/run/worklane-host-pi";
+const DEFAULT_PI_MODEL: &str = "xiaomi/mimo-v2.6-pro";
 const STANDARD_CONTAINERFILE_MARKER: &str = "worklane-standard-containerfile";
 /// High enough for tool-heavy workloads while still bounding runaway process creation.
 const LANE_PIDS_LIMIT: &str = "16384";
+/// The standard image keeps a stable internal identity across host accounts.
+const CONTAINER_UID: &str = "1001";
+const CONTAINER_GID: &str = "1001";
 /// Generic lane guidance; repository contributor rules must never enter the global seed.
 const LANE_AGENTS_MD: &str = include_str!("../../docs/agents/lane.md");
 const AGENT_AUTOMATION_MD: &str = include_str!("../../docs/agents/automation.md");
@@ -72,6 +77,10 @@ enum Top {
     Image(ImageCmd),
     /// Create, inspect, and manage persistent lane homes and disposable containers.
     Lane(LaneCmd),
+    /// Manage this Linux account's Pi credentials and default model.
+    Credentials(CredentialsCmd),
+    /// Select the shared visual theme for this Linux account's lanes.
+    Appearance(AppearanceCmd),
     /// Initialize the controller registry without modifying lane homes.
     Registry(RegistryCmd),
     /// Generate shell completion scripts.
@@ -82,6 +91,38 @@ enum Top {
     },
     #[command(hide = true)]
     Executor,
+}
+#[derive(Args)]
+struct CredentialsCmd {
+    #[command(subcommand)]
+    command: CredentialsAction,
+}
+#[derive(Args)]
+struct AppearanceCmd {
+    #[command(subcommand)]
+    command: AppearanceAction,
+}
+#[derive(Subcommand)]
+enum AppearanceAction {
+    /// Show the current warm or cool dark preset.
+    Status,
+    /// Apply one dark preset to every lane owned by this account.
+    Set {
+        preset: String,
+        #[arg(long, hide = true)]
+        local_only: bool,
+    },
+}
+#[derive(Subcommand)]
+enum CredentialsAction {
+    /// Report whether OpenRouter is configured, without revealing the key.
+    Status,
+    /// Read an OpenRouter key from standard input and replace the account key.
+    SetOpenrouter,
+    /// Select a Pi model from the installed catalog.
+    SetModel { model: String },
+    /// List Pi's built-in OpenRouter models.
+    Models,
 }
 #[derive(Args)]
 struct ApiCmd {
@@ -190,6 +231,8 @@ enum LaneAction {
     },
     /// List registered entries.
     List,
+    /// Select the agent started by default in a lane.
+    Agent { lane: String, agent: String },
     /// Register a verified v5 manifest or directory containing one.
     Import { path: PathBuf },
     /// Inspect the selected resource on its owning host.
@@ -226,7 +269,12 @@ enum LaneAction {
         /// Bypass Herdr and open a plain login shell.
         #[arg(long)]
         shell: bool,
+        /// Focus the persistent Neovim IDE tab before attaching.
+        #[arg(long, conflicts_with = "shell")]
+        ide: bool,
     },
+    /// Open the persistent Neovim IDE in this lane.
+    Ide { lane: String },
     /// Rebuild the image and recreate the container, preserving the lane home.
     Upgrade {
         lane: Option<String>,
@@ -238,6 +286,9 @@ enum LaneAction {
         /// Disable image build cache (already automatic for standard-image lane upgrades).
         #[arg(long)]
         no_cache: bool,
+        /// Leave running lanes and their active agents untouched.
+        #[arg(long)]
+        skip_running: bool,
     },
     /// Remove the disposable container and lane record, preserving bind-mounted data.
     Delete { lane: String },
@@ -342,7 +393,102 @@ fn decode_executor_response(document: &str, request_id: &str) -> Result<String> 
 fn ensure_standard_containerfile() -> Result<PathBuf> {
     let path = containerfile_path();
     seed_containerfile(&path)?;
+    let context = path
+        .parent()
+        .context("standard Containerfile has no parent")?;
+    seed_embedded_asset(
+        context,
+        "assets/worklane-pi-agent",
+        include_str!("../../assets/worklane-pi-agent"),
+        true,
+    )?;
+    seed_embedded_asset(
+        context,
+        "assets/worklane-pi-install",
+        include_str!("../../assets/worklane-pi-install"),
+        true,
+    )?;
+    seed_embedded_asset(
+        context,
+        "assets/worklane-ide",
+        include_str!("../../assets/worklane-ide"),
+        true,
+    )?;
+    seed_embedded_asset(
+        context,
+        "assets/worklane-appearance",
+        include_str!("../../assets/worklane-appearance"),
+        true,
+    )?;
+    seed_embedded_asset(
+        context,
+        "assets/worklane-ide-init.lua",
+        include_str!("../../assets/worklane-ide-init.lua"),
+        false,
+    )?;
+    for (relative, content, executable) in [
+        (
+            "assets/pi-bundle/package.json",
+            include_str!("../../assets/pi-bundle/package.json"),
+            false,
+        ),
+        (
+            "assets/pi-bundle/package-lock.json",
+            include_str!("../../assets/pi-bundle/package-lock.json"),
+            false,
+        ),
+        (
+            "assets/worklane-runtime/collab.ts",
+            include_str!("../../assets/worklane-runtime/collab.ts"),
+            false,
+        ),
+        (
+            "assets/worklane-runtime/p0.ts",
+            include_str!("../../assets/worklane-runtime/p0.ts"),
+            false,
+        ),
+        (
+            "assets/worklane-runtime/runtime.py",
+            include_str!("../../assets/worklane-runtime/runtime.py"),
+            true,
+        ),
+        (
+            "assets/worklane-runtime/worklane-collab.service",
+            include_str!("../../assets/worklane-runtime/worklane-collab.service"),
+            false,
+        ),
+        (
+            "assets/worklane-runtime/worklane-goal-runner.service",
+            include_str!("../../assets/worklane-runtime/worklane-goal-runner.service"),
+            false,
+        ),
+        (
+            "assets/worklane-runtime/worklane-goal-runner.timer",
+            include_str!("../../assets/worklane-runtime/worklane-goal-runner.timer"),
+            false,
+        ),
+    ] {
+        seed_embedded_asset(context, relative, content, executable)?;
+    }
     Ok(path)
+}
+fn seed_embedded_asset(
+    context: &Path,
+    relative: &str,
+    content: &str,
+    executable: bool,
+) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let path = context.join(relative);
+    fs::create_dir_all(path.parent().expect("asset has parent"))?;
+    if fs::read_to_string(&path).ok().as_deref() != Some(content) {
+        fs::write(&path, content)?;
+    }
+    fs::set_permissions(
+        &path,
+        fs::Permissions::from_mode(if executable { 0o755 } else { 0o644 }),
+    )?;
+    Ok(())
 }
 fn standard_build_context() -> Result<PathBuf> {
     let path = ensure_standard_containerfile()?;
@@ -371,26 +517,25 @@ fn is_worklane_standard_containerfile(content: &str) -> bool {
             && content.contains("CMD [\"sleep\", \"infinity\"]"))
 }
 fn image_build_args<R: Runner>(
-    runner: &R,
+    _runner: &R,
     file: Option<&PathBuf>,
     context: &std::path::Path,
     tag: &str,
     no_cache: bool,
     pull: bool,
 ) -> Result<Vec<String>> {
-    let file = match file {
-        Some(path) => path.clone(),
-        None => ensure_standard_containerfile()?,
+    let (file, context) = match file {
+        Some(path) => (path.clone(), context.to_path_buf()),
+        None => (ensure_standard_containerfile()?, standard_build_context()?),
     };
-    let (_, uid, gid) = current_identity(runner)?;
     let mut args = vec![
         "build".into(),
         "--build-arg".into(),
         format!("USERNAME={CONTAINER_USER}"),
         "--build-arg".into(),
-        format!("USER_UID={uid}"),
+        format!("USER_UID={CONTAINER_UID}"),
         "--build-arg".into(),
-        format!("USER_GID={gid}"),
+        format!("USER_GID={CONTAINER_GID}"),
         "-f".into(),
         file.display().to_string(),
         "-t".into(),
@@ -483,33 +628,6 @@ fn verify_standard_codex_version<R: Runner>(r: &R, image: &str) -> Result<String
     }
     Ok(expected)
 }
-fn timezone_from_localtime_link(link: &Path) -> Option<String> {
-    let zoneinfo = Path::new("/usr/share/zoneinfo");
-    link.strip_prefix(zoneinfo)
-        .ok()
-        .and_then(|path| path.to_str())
-        .map(|value| value.trim_start_matches('/').to_string())
-        .filter(|value| {
-            !value.is_empty() && !value.starts_with("posix/") && !value.starts_with("right/")
-        })
-}
-fn host_timezone() -> Option<String> {
-    if let Ok(value) = std::env::var("TZ") {
-        let value = value.trim();
-        if !value.is_empty() {
-            return Some(value.to_string());
-        }
-    }
-    if let Ok(value) = fs::read_to_string("/etc/timezone") {
-        let value = value.trim();
-        if !value.is_empty() {
-            return Some(value.to_string());
-        }
-    }
-    fs::read_link("/etc/localtime")
-        .ok()
-        .and_then(|link| timezone_from_localtime_link(&link))
-}
 fn absolute_environment_dir(name: &str) -> Result<Option<PathBuf>> {
     let Some(value) = std::env::var_os(name) else {
         return Ok(None);
@@ -523,12 +641,142 @@ fn absolute_environment_dir(name: &str) -> Result<Option<PathBuf>> {
 fn host_home() -> Result<PathBuf> {
     absolute_environment_dir("HOME")?.context("HOME is not set; cannot locate host credentials")
 }
-fn credential_mounts(spec: &LaneSpec) -> Result<Vec<(&'static str, PathBuf, PathBuf)>> {
-    if !spec.profile.mount_codex_credentials && !spec.profile.mount_gh_credentials {
-        return Ok(Vec::new());
+fn pi_credentials_dir() -> Result<PathBuf> {
+    Ok(host_home()?.join(".config/worklane/pi"))
+}
+fn ensure_pi_credentials() -> Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = pi_credentials_dir()?;
+    fs::create_dir_all(&dir)?;
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+    for (name, content) in [("auth.json", "{}\n"), ("model", DEFAULT_PI_MODEL)] {
+        let file = dir.join(name);
+        if !file.exists() {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&file)
+            {
+                Ok(mut handle) => {
+                    handle.set_permissions(fs::Permissions::from_mode(0o600))?;
+                    handle.write_all(content.as_bytes())?;
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
     }
+    Ok(dir)
+}
+fn atomic_pi_file(name: &str, content: &[u8]) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = ensure_pi_credentials()?;
+    let tmp = dir.join(format!(".{name}.{}", uuid::Uuid::new_v4()));
+    let mut handle = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)?;
+    handle.set_permissions(fs::Permissions::from_mode(0o600))?;
+    handle.write_all(content)?;
+    handle.sync_all()?;
+    fs::rename(&tmp, dir.join(name))?;
+    Ok(())
+}
+fn pi_model() -> Result<String> {
+    let value = fs::read_to_string(ensure_pi_credentials()?.join("model"))?;
+    let model = value.trim();
+    if model.is_empty() || model.contains(char::is_whitespace) {
+        bail!("invalid Pi model setting")
+    }
+    Ok(model.to_owned())
+}
+fn pi_models() -> Result<Vec<String>> {
+    let output = Command::new("pi")
+        .env("OPENROUTER_API_KEY", "catalog-only")
+        .args(["--list-models", "openrouter"])
+        .output()
+        .context("Pi is not installed on this host")?;
+    if !output.status.success() {
+        bail!("Pi model catalog unavailable")
+    }
+    let models = String::from_utf8(output.stdout)?
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let mut columns = line.split_whitespace();
+            (columns.next() == Some("openrouter"))
+                .then(|| columns.next().map(str::to_owned))
+                .flatten()
+        })
+        .collect::<Vec<_>>();
+    if models.is_empty() {
+        bail!("Pi reported no OpenRouter models")
+    }
+    Ok(models)
+}
+fn handle_credentials(command: &CredentialsAction, json: bool) -> Result<()> {
+    let dir = ensure_pi_credentials()?;
+    match command {
+        CredentialsAction::Status => {
+            let auth: serde_json::Value =
+                serde_json::from_slice(&fs::read(dir.join("auth.json"))?)?;
+            emit(
+                json,
+                &serde_json::json!({"openrouter_configured": auth.get("openrouter").is_some(), "model": pi_model()?}),
+            )
+        }
+        CredentialsAction::SetOpenrouter => {
+            let mut key = String::new();
+            if io::stdin().is_terminal() {
+                let output = Command::new("python3")
+                    .args([
+                        "-c",
+                        "import getpass; print(getpass.getpass('OpenRouter key: '))",
+                    ])
+                    .output()
+                    .context("read hidden OpenRouter key")?;
+                if !output.status.success() {
+                    bail!("OpenRouter key entry cancelled")
+                }
+                key = String::from_utf8(output.stdout)?;
+            } else {
+                io::stdin().read_to_string(&mut key)?;
+            }
+            let key = key.trim();
+            if key.is_empty() || key.contains(char::is_whitespace) {
+                bail!("OpenRouter key must be nonempty and contain no whitespace")
+            }
+            let mut auth: serde_json::Value =
+                serde_json::from_slice(&fs::read(dir.join("auth.json"))?)?;
+            let object = auth
+                .as_object_mut()
+                .context("Pi auth file must be a JSON object")?;
+            object.insert(
+                "openrouter".into(),
+                serde_json::json!({"type":"api_key","key":key}),
+            );
+            atomic_pi_file("auth.json", &serde_json::to_vec(&auth)?)?;
+            emit(
+                json,
+                &serde_json::json!({"openrouter_configured":true,"restart_pi_to_apply":true}),
+            )
+        }
+        CredentialsAction::SetModel { model } => {
+            if !pi_models()?.contains(model) {
+                bail!("model is not in Pi's OpenRouter catalog")
+            }
+            atomic_pi_file("model", model.as_bytes())?;
+            emit(
+                json,
+                &serde_json::json!({"model":model,"restart_pi_to_apply":true}),
+            )
+        }
+        CredentialsAction::Models => emit(json, &pi_models()?),
+    }
+}
+fn credential_mounts(spec: &LaneSpec) -> Result<Vec<(&'static str, PathBuf, PathBuf)>> {
     let home = host_home()?;
-    let mut mounts = Vec::new();
+    let mut mounts = vec![("Pi", ensure_pi_credentials()?, PathBuf::from(HOST_PI_MOUNT))];
     if spec.profile.mount_codex_credentials {
         let codex_home =
             absolute_environment_dir("CODEX_HOME")?.unwrap_or_else(|| home.join(".codex"));
@@ -610,6 +858,50 @@ fn prepare_codex_auth_link(spec: &LaneSpec) -> Result<()> {
     symlink(&link_target, &destination)
         .with_context(|| format!("link Codex credentials at {}", destination.display()))?;
     Ok(())
+}
+fn prepare_pi_auth_link(spec: &LaneSpec) -> Result<()> {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let directory = spec.project_path.join(".pi/agent");
+    fs::create_dir_all(&directory)?;
+    let destination = directory.join("auth.json");
+    let target = Path::new(HOST_PI_MOUNT).join("auth.json");
+    match fs::symlink_metadata(&destination) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            if fs::read_link(&destination)? == target {
+                return Ok(());
+            }
+            bail!(
+                "Pi credential path has an unmanaged symlink: {}",
+                destination.display()
+            )
+        }
+        Ok(metadata) if metadata.file_type().is_file() => {
+            fs::set_permissions(&destination, fs::Permissions::from_mode(0o600))?;
+            fs::rename(
+                &destination,
+                directory.join(format!(
+                    "auth.json.worklane-backup-{}",
+                    uuid::Uuid::new_v4()
+                )),
+            )?;
+        }
+        Ok(_) => bail!(
+            "Pi credential path is not a regular file: {}",
+            destination.display()
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    match symlink(&target, &destination) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if error.kind() == io::ErrorKind::AlreadyExists
+                && fs::read_link(&destination).ok().as_deref() == Some(target.as_path()) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 fn prepare_credential_mountpoint(
     spec: &LaneSpec,
@@ -763,7 +1055,7 @@ fn append_credential_mounts(args: &mut Vec<String>, spec: &LaneSpec) -> Result<(
         );
     }
     for (tool, source, target) in mounts {
-        let credential_file = if tool == "Codex" {
+        let credential_file = if tool == "Codex" || tool == "Pi" {
             source.join("auth.json")
         } else {
             source.clone()
@@ -778,15 +1070,19 @@ fn append_credential_mounts(args: &mut Vec<String>, spec: &LaneSpec) -> Result<(
         let mut source = source
             .canonicalize()
             .with_context(|| format!("resolve {tool} credential source {}", source.display()))?;
-        if tool == "Codex" {
+        if tool == "Codex" || tool == "Pi" {
             let auth = source.join("auth.json");
             if !fs::symlink_metadata(&auth)?.file_type().is_file() {
                 bail!(
-                    "Codex credential source must be a regular file: {}",
+                    "{tool} credential source must be a regular file: {}",
                     auth.display()
                 )
             }
-            prepare_codex_auth_link(spec)?;
+            if tool == "Codex" {
+                prepare_codex_auth_link(spec)?;
+            } else {
+                prepare_pi_auth_link(spec)?;
+            }
             args.extend([
                 "--mount".into(),
                 format!(
@@ -829,7 +1125,6 @@ fn create_local_container<R: Runner>(r: &R, spec: &LaneSpec, name: &str) -> Resu
     fs::create_dir_all(&spec.project_path)?;
     let scratch_path = spec.project_path.join(".tmp");
     fs::create_dir_all(&scratch_path)?;
-    let (_, uid, _) = current_identity(r)?;
     let runtime = spec.profile.effective_runtime();
     let mut a = vec![
         "run".into(),
@@ -838,8 +1133,9 @@ fn create_local_container<R: Runner>(r: &R, spec: &LaneSpec, name: &str) -> Resu
         name.into(),
         "--pids-limit".into(),
         LANE_PIDS_LIMIT.into(),
-        "--userns=keep-id".into(),
+        format!("--userns=keep-id:uid={CONTAINER_UID},gid={CONTAINER_GID}"),
         "--read-only".into(),
+        "--tz=local".into(),
         "--volume".into(),
         format!("{}:/tmp:rw,nosuid,nodev", scratch_path.display()),
         "--tmpfs".into(),
@@ -874,9 +1170,6 @@ fn create_local_container<R: Runner>(r: &R, spec: &LaneSpec, name: &str) -> Resu
         RuntimeMode::PodmanInit | RuntimeMode::Auto => a.push("--init".into()),
     }
     a.extend(credential_args);
-    if let Some(timezone) = host_timezone() {
-        a.extend(["--env".into(), format!("TZ={timezone}")]);
-    }
     for mount in &spec.profile.mounts {
         a.extend([
             "--mount".into(),
@@ -911,30 +1204,25 @@ fn create_local_container<R: Runner>(r: &R, spec: &LaneSpec, name: &str) -> Resu
     }
     podman(r, a)?;
     if runtime == RuntimeMode::Systemd {
-        wait_for_systemd_user_manager(r, spec, name, &uid)?;
+        wait_for_systemd_user_manager(r, spec, name)?;
     }
     Ok(())
 }
 
-fn user_manager_environment(uid: &str) -> [String; 4] {
+fn user_manager_environment() -> [String; 4] {
     [
         "--env".into(),
-        format!("XDG_RUNTIME_DIR=/run/user/{uid}"),
+        format!("XDG_RUNTIME_DIR=/run/user/{CONTAINER_UID}"),
         "--env".into(),
-        format!("DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus"),
+        format!("DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{CONTAINER_UID}/bus"),
     ]
 }
 
-fn wait_for_systemd_user_manager<R: Runner>(
-    r: &R,
-    spec: &LaneSpec,
-    name: &str,
-    uid: &str,
-) -> Result<()> {
+fn wait_for_systemd_user_manager<R: Runner>(r: &R, spec: &LaneSpec, name: &str) -> Result<()> {
     let mut last_error = String::new();
     for _ in 0..100 {
         let mut args = vec!["exec".into(), "--user".into(), CONTAINER_USER.into()];
-        args.extend(user_manager_environment(uid));
+        args.extend(user_manager_environment());
         args.extend([
             name.into(),
             "systemctl".into(),
@@ -971,16 +1259,14 @@ fn ensure_local_started<R: Runner>(r: &R, spec: &LaneSpec) -> Result<()> {
     match host_runtime_state(r, spec)?.as_str() {
         "running" => {
             if spec.profile.effective_runtime() == RuntimeMode::Systemd {
-                let (_, uid, _) = current_identity(r)?;
-                wait_for_systemd_user_manager(r, spec, &spec.container_name(), &uid)?;
+                wait_for_systemd_user_manager(r, spec, &spec.container_name())?;
             }
         }
         "absent" => create_local_container(r, spec, &spec.container_name())?,
         "stopped" | "exited" | "created" => {
             podman(r, ["start", &spec.container_name()])?;
             if spec.profile.effective_runtime() == RuntimeMode::Systemd {
-                let (_, uid, _) = current_identity(r)?;
-                wait_for_systemd_user_manager(r, spec, &spec.container_name(), &uid)?;
+                wait_for_systemd_user_manager(r, spec, &spec.container_name())?;
             }
         }
         state => bail!(
@@ -1462,6 +1748,9 @@ mkdir -p "$HOME/.config/herdr"
 managed_user=false
 if systemctl --user show-environment >/dev/null 2>&1; then
   systemctl --user start worklane-herdr.service
+  if [ "$agent" = pi ] && [ -x /usr/local/bin/worklane-collab ]; then
+    systemctl --user start worklane-collab.service worklane-goal-runner.timer
+  fi
   managed_user=true
 elif ! herdr --session "$WORKLANE_SESSION" workspace list >/dev/null 2>&1; then
   herdr --session "$WORKLANE_SESSION" server >"$HOME/.config/herdr/server.log" 2>&1 &!
@@ -1507,7 +1796,6 @@ fn bootstrap_herdr(spec: &LaneSpec) -> Result<()> {
         AgentKind::Codex => "Codex",
         AgentKind::Pi => "Pi",
     };
-    let (_, uid, _) = current_identity(&SystemRunner)?;
     let mut args = vec![
         "exec".into(),
         "--user".into(),
@@ -1515,7 +1803,7 @@ fn bootstrap_herdr(spec: &LaneSpec) -> Result<()> {
         "--workdir".into(),
         spec.container_home().display().to_string(),
     ];
-    args.extend(user_manager_environment(&uid));
+    args.extend(user_manager_environment());
     args.extend([
         "--env".into(),
         format!("WORKLANE_NAME={}", spec.name),
@@ -1553,7 +1841,7 @@ fi
 agent="$(cat "$HOME/.config/worklane/agent" 2>/dev/null || printf codex)"
 case "$agent" in
   codex) agent_command="codex --dangerously-bypass-approvals-and-sandbox" ;;
-  pi) agent_command="pi --provider openai-codex --model gpt-6-sol --no-extensions --extension /opt/worklane/pi-web-access/dist --extension /usr/local/lib/node_modules/@earendil-works/pi-coding-agent/examples/extensions/questionnaire.ts --extension /usr/local/lib/node_modules/@earendil-works/pi-coding-agent/examples/extensions/worklane-plan/plan.ts --tools read,bash,edit,write,web_search,fetch_content,questionnaire" ;;
+  pi) agent_command="worklane-pi-agent" ;;
   *) echo "unsupported lane agent: $agent" >&2; exit 1 ;;
 esac
 [ -n "$session" ] || exit 0
@@ -1577,6 +1865,12 @@ if [ -n "$agent_pane" ]; then
   exit 0
 fi
 primary_pane="$(herdr --session "$session" pane list --workspace "$workspace_id" | jq -r '.result.panes[]? | select((.label // "") != "git diff" and (.agent // "") == "") | .pane_id' | head -n 1)"
+if [ -z "$primary_pane" ]; then
+  source_pane="$(herdr --session "$session" pane list --workspace "$workspace_id" | jq -r '.result.panes[0].pane_id // empty')"
+  [ -n "$source_pane" ] || exit 1
+  herdr --session "$session" pane split "$source_pane" --direction right --cwd "$workspace" --no-focus >/dev/null
+  primary_pane="$(herdr --session "$session" pane list --workspace "$workspace_id" | jq -r '.result.panes[]? | select((.label // "") != "git diff" and (.agent // "") == "") | .pane_id' | tail -n 1)"
+fi
 [ -n "$primary_pane" ] || exit 1
 herdr --session "$session" pane run "$primary_pane" "$agent_command" >/dev/null
 "#;
@@ -1586,6 +1880,9 @@ fn agent_docs_bootstrap_script() -> String {
         "lane.md": LANE_AGENTS_MD,
         "automation.md": AGENT_AUTOMATION_MD,
         "MIGRATE.md": AGENT_MIGRATION_MD,
+        "COLLAB.md": include_str!("../../docs/agents/COLLAB.md"),
+        "AUTONOMY.md": include_str!("../../docs/agents/AUTONOMY.md"),
+        "P0.md": include_str!("../../docs/agents/P0.md"),
     });
     // A JSON-encoded string is also a Python string literal. Encoding twice keeps
     // document text out of executable Python and the shell's heredoc delimiter.
@@ -1602,13 +1899,13 @@ printf '%s\n' "${WORKLANE_AGENT:-codex}" > "$HOME/.config/worklane/agent"
 if [ "${WORKLANE_AGENT:-codex}" = pi ]; then
   mkdir -p "$HOME/.pi/agent"
   if [ ! -e "$HOME/.pi/agent/web-search.json" ]; then
-    printf '%s\n' '{"provider":"openai","fetchRouting":{"providers":["http"],"allowRemoteHostedProviders":false}}' > "$HOME/.pi/agent/web-search.json"
+    printf '%s\n' '{"provider":"exa","fetchRouting":{"providers":["http"],"allowRemoteHostedProviders":false}}' > "$HOME/.pi/agent/web-search.json"
     chmod 600 "$HOME/.pi/agent/web-search.json"
   fi
 fi
 if [ ! -f "$HOME/.zshrc" ]; then
   cat > "$HOME/.zshrc" <<'ZSHRC'
-export EDITOR="${EDITOR:-vim}"
+export EDITOR="${EDITOR:-nvim}"
 cd "${WORKLANE_WORKSPACE:-$HOME}" 2>/dev/null || true
 ZSHRC
 fi
@@ -1627,6 +1924,20 @@ grep -qxF 'source "$HOME/.config/worklane/prompt.zsh"' "$HOME/.zshrc" || \
     let script = format!(
         r#"{script}
 mkdir -p "$HOME/.local/bin" "$HOME/.local/share/worklane/bin"
+if [ -x /usr/local/lib/worklane/worklane-ide ]; then
+  grep -qxF 'export EDITOR=nvim VISUAL=nvim' "$HOME/.zshrc" || \
+    printf '%s\n' 'export EDITOR=nvim VISUAL=nvim' >> "$HOME/.zshrc"
+  cp /usr/local/lib/worklane/worklane-ide "$HOME/.local/bin/worklane-ide"
+  cp /usr/local/lib/worklane/worklane-appearance "$HOME/.local/bin/worklane-appearance"
+  chmod 755 "$HOME/.local/bin/worklane-ide" "$HOME/.local/bin/worklane-appearance"
+  mkdir -p "$HOME/.config/worklane/nvim"
+  cp /usr/local/lib/worklane/ide-init.lua "$HOME/.config/worklane/nvim/init.lua"
+  "$HOME/.local/bin/worklane-appearance" "${{WORKLANE_THEME:-warm}}"
+  ide_socket="$HOME/.local/state/worklane/ide.sock"
+  if [ -S "$ide_socket" ]; then
+    timeout 3 nvim --server "$ide_socket" --remote-expr 'v:lua.WorklaneApplyPalette()' >/dev/null 2>&1 || true
+  fi
+fi
 cat > "$HOME/.local/bin/worklane-show-image" <<'WORKLANE_SHOW_IMAGE'
 {SHOW_IMAGE_SCRIPT}WORKLANE_SHOW_IMAGE
 chmod 755 "$HOME/.local/bin/worklane-show-image"
@@ -1671,6 +1982,10 @@ print("yes" if changed else "no")
 WORKLANE_HERDR_CONFIG
 )"
 herdr config check >/dev/null
+if [ -x "$HOME/.local/bin/worklane-appearance" ] && [ -n "${{WORKLANE_SESSION:-}}" ] && \
+   herdr --session "$WORKLANE_SESSION" workspace list >/dev/null 2>&1; then
+  herdr --session "$WORKLANE_SESSION" server reload-config >/dev/null
+fi
 if [ "$herdr_config_changed" = yes ] && [ -n "${{WORKLANE_SESSION:-}}" ] && \
    herdr --session "$WORKLANE_SESSION" workspace list >/dev/null 2>&1; then
   herdr --session "$WORKLANE_SESSION" server reload-config >/dev/null
@@ -1715,7 +2030,7 @@ run_existing_diff_panes() {{
 ensure_tab_diff_panes() {{
   state="$1"
   printf '%s\n' "$state" |
-    jq -r '.result.snapshot.tabs[]?.tab_id' 2>/dev/null |
+    jq -r '.result.snapshot.tabs[]? | select((.label // "") != "IDE" and ((.label // "") | startswith("task:") | not)) | .tab_id' 2>/dev/null |
     while IFS= read -r tab; do
       [ -n "$tab" ] || continue
       if printf '%s\n' "$state" |
@@ -1752,6 +2067,9 @@ chmod 755 "$HOME/.local/share/worklane/bin/worklane-git-diff-pane-manager"
 {agent_docs}
 if [ "${{WORKLANE_AGENT:-codex}}" = pi ] && [ ! -e "$HOME/AGENTS.md" ] && [ ! -L "$HOME/AGENTS.md" ]; then
   ln -s "$HOME/.local/share/worklane/agent-docs/current/lane.md" "$HOME/AGENTS.md"
+fi
+if [ "${{WORKLANE_AGENT:-codex}}" = pi ] && [ ! -e "$HOME/.pi/agent/AGENTS.md" ] && [ ! -L "$HOME/.pi/agent/AGENTS.md" ] && [ ! -e "$HOME/.pi/agent/AGENTS.override.md" ]; then
+  ln -s "$HOME/.local/share/worklane/agent-docs/current/lane.md" "$HOME/.pi/agent/AGENTS.md"
 fi"#,
         agent_docs = agent_docs_bootstrap_script(),
     );
@@ -1760,7 +2078,12 @@ fi"#,
 fn bootstrap_shell(spec: &LaneSpec) -> Result<()> {
     let script = bootstrap_shell_script();
     let session = spec.session_name();
-    let (_, uid, _) = current_identity(&SystemRunner)?;
+    let theme_path = host_home()?.join(".config/worklane/theme");
+    let theme = fs::read_to_string(theme_path).unwrap_or_else(|_| "warm".into());
+    let theme = theme.trim();
+    if theme != "warm" && theme != "cool" {
+        bail!("account Worklane theme must be warm or cool")
+    }
     let mut args = vec![
         "exec".into(),
         "--user".into(),
@@ -1768,12 +2091,14 @@ fn bootstrap_shell(spec: &LaneSpec) -> Result<()> {
         "--workdir".into(),
         spec.container_home().display().to_string(),
     ];
-    args.extend(user_manager_environment(&uid));
+    args.extend(user_manager_environment());
     args.extend([
         "--env".into(),
         format!("WORKLANE_NAME={}", spec.name),
         "--env".into(),
         format!("WORKLANE_AGENT={}", spec.profile.agent.as_str()),
+        "--env".into(),
+        format!("WORKLANE_THEME={theme}"),
         "--env".into(),
         format!("WORKLANE_SESSION={session}"),
         "--env".into(),
@@ -1790,10 +2115,53 @@ fn bootstrap_shell(spec: &LaneSpec) -> Result<()> {
     if !status.success() {
         bail!("lane zsh bootstrap failed")
     }
+    if spec.profile.agent == AgentKind::Pi {
+        let install_status = Command::new("podman")
+            .args([
+                "exec",
+                "--user",
+                CONTAINER_USER,
+                "--env",
+                "HOME=/home/dev",
+                &spec.container_name(),
+                "sh",
+                "-c",
+                "if [ -x /usr/local/lib/worklane/worklane-pi-install ]; then exec /usr/local/lib/worklane/worklane-pi-install; else echo 'Pi image lacks the writable bundle installer; upgrade the lane image' >&2; exit 1; fi",
+            ])
+            .status()
+            .context("install lane-local Pi")?;
+        if !install_status.success() {
+            bail!("lane-local Pi installation failed")
+        }
+    }
+    Ok(())
+}
+
+fn focus_ide(spec: &LaneSpec) -> Result<()> {
+    let mut args = vec!["exec".into(), "--user".into(), CONTAINER_USER.into()];
+    args.extend(user_manager_environment());
+    args.extend([
+        "--env".into(),
+        format!("WORKLANE_SESSION={}", spec.session_name()),
+        "--env".into(),
+        format!("WORKLANE_WORKSPACE={}", spec.container_home().display()),
+        spec.container_name(),
+        "worklane-ide".into(),
+        "focus".into(),
+    ]);
+    let output = Command::new("podman")
+        .args(args)
+        .output()
+        .context("start Worklane IDE")?;
+    if !output.status.success() {
+        bail!(
+            "Worklane IDE failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+    }
     Ok(())
 }
 fn herdr_snapshot(spec: &LaneSpec) -> Result<serde_json::Value> {
-    let (_, uid, _) = current_identity(&SystemRunner)?;
     let mut args = vec![
         "exec".into(),
         "--user".into(),
@@ -1801,7 +2169,7 @@ fn herdr_snapshot(spec: &LaneSpec) -> Result<serde_json::Value> {
         "--workdir".into(),
         spec.container_home().display().to_string(),
     ];
-    args.extend(user_manager_environment(&uid));
+    args.extend(user_manager_environment());
     args.extend([
         spec.container_name(),
         "herdr".into(),
@@ -1909,12 +2277,57 @@ fn main() -> Result<()> {
             &serde_json::json!({"schema":DATABASE_SCHEMA_VERSION,"initialized":true,"legacy_preserved":true}),
         );
     }
+    if let Top::Credentials(c) = &cli.command {
+        return handle_credentials(&c.command, cli.json);
+    }
     ensure_standard_containerfile()?;
     let store = Store::open_default()?;
     let runner = SystemRunner;
     match cli.command {
         Top::Api(_) => unreachable!("API handled before normal startup"),
         Top::Executor => run_executor(),
+        Top::Credentials(_) => unreachable!("credentials handled before store initialization"),
+        Top::Appearance(c) => match c.command {
+            AppearanceAction::Status => {
+                let path = host_home()?.join(".config/worklane/theme");
+                let theme = fs::read_to_string(path).unwrap_or_else(|_| "warm".into());
+                emit(cli.json, &serde_json::json!({"theme": theme.trim()}))
+            }
+            AppearanceAction::Set { preset, local_only } => {
+                if preset != "warm" && preset != "cool" {
+                    bail!("appearance preset must be warm or cool")
+                }
+                let path = host_home()?.join(".config/worklane/theme");
+                fs::create_dir_all(path.parent().context("theme has no parent")?)?;
+                fs::write(&path, format!("{preset}\n"))?;
+                let mut remote_hosts = HashSet::new();
+                for status in store.lanes()? {
+                    if status.spec.host == "local" {
+                        if status.state == "running" {
+                            bootstrap_shell(&status.spec)?;
+                        }
+                    } else if !local_only {
+                        remote_hosts.insert(status.spec.host);
+                    }
+                }
+                for host_name in remote_hosts {
+                    let host = store
+                        .hosts()?
+                        .into_iter()
+                        .find(|host| host.name == host_name)
+                        .with_context(|| format!("unknown host {host_name}"))?;
+                    let command =
+                        format!("~/.local/bin/worklane appearance set {preset} --local-only");
+                    let status = Command::new("ssh")
+                        .args(strict_ssh_args(&host.ssh_target, command))
+                        .status()?;
+                    if !status.success() {
+                        bail!("failed to apply {preset} theme on {host_name}")
+                    }
+                }
+                emit(cli.json, &serde_json::json!({"theme": preset}))
+            }
+        },
         Top::Registry(_) => unreachable!("registry initialization handled before normal startup"),
         Top::Completions { .. } => unreachable!("completions handled before store initialization"),
         Top::Host(c) => match c.command {
@@ -2257,6 +2670,47 @@ fn main() -> Result<()> {
                     emit(cli.json, &refresh(&runner, &store, &spec)?)
                 }
                 LaneAction::List => emit(cli.json, &store.lanes()?),
+                LaneAction::Agent { lane, agent } => {
+                    let mut spec = store.lane(&lane)?;
+                    let chosen = AgentKind::parse(&agent)?;
+                    if spec.host != "local" {
+                        bail!("agent selection currently requires a local lane controller")
+                    }
+                    ensure_no_pending_operation(&spec, "agent selection")?;
+                    let _lock = lock_lane_operation(&spec)?;
+                    let running =
+                        container_runtime_state(&runner, &spec.container_name())? == "running";
+                    if running {
+                        let executable = AGENTS
+                            .iter()
+                            .find(|entry| entry.kind == chosen)
+                            .expect("validated agent has a catalog entry")
+                            .executable;
+                        let status = Command::new("podman")
+                            .args([
+                                "exec",
+                                "--user",
+                                CONTAINER_USER,
+                                &spec.container_name(),
+                                "sh",
+                                "-c",
+                                &format!("command -v {executable} >/dev/null"),
+                            ])
+                            .status()?;
+                        if !status.success() {
+                            bail!("selected agent is not installed in this lane; upgrade its image first")
+                        }
+                    }
+                    spec.profile.agent = chosen;
+                    validate_profile(&spec.profile, &spec.container_home(), true)?;
+                    write_lane_spec(&spec)?;
+                    store.save_lane(&spec, "unknown", false)?;
+                    if running {
+                        bootstrap_shell(&spec)?;
+                        bootstrap_herdr(&spec)?;
+                    }
+                    emit(cli.json, &spec)
+                }
                 LaneAction::Import { path } => {
                     let manifest = if path.is_dir() {
                         path.join(".worklane").join("lane.toml")
@@ -2502,7 +2956,16 @@ fn main() -> Result<()> {
                         }),
                     )
                 }
-                LaneAction::Attach { lane, shell } => {
+                LaneAction::Ide { lane } => {
+                    let status = Command::new(std::env::current_exe()?)
+                        .args(["lane", "attach", &lane, "--ide"])
+                        .status()?;
+                    if !status.success() {
+                        bail!("IDE attach failed")
+                    }
+                    Ok(())
+                }
+                LaneAction::Attach { lane, shell, ide } => {
                     let mut s = store.lane(&lane)?;
                     ensure_no_pending_operation(&s, "attach")?;
                     if s.host != "local" {
@@ -2522,6 +2985,9 @@ fn main() -> Result<()> {
                         if shell {
                             args.push("--shell".into());
                         }
+                        if ide {
+                            args.push("--ide".into());
+                        }
                         let status = Command::new("ssh").args(args).status()?;
                         if !status.success() {
                             bail!("remote attach failed")
@@ -2535,9 +3001,11 @@ fn main() -> Result<()> {
                     if !shell {
                         bootstrap_herdr(&s)?;
                     }
+                    if ide {
+                        focus_ide(&s)?;
+                    }
                     let session = s.session_name();
                     let command = lane_attach_args(&session, shell, s.profile.effective_runtime());
-                    let (_, uid, _) = current_identity(&runner)?;
                     let mut args = vec![
                         "exec".into(),
                         "-it".into(),
@@ -2546,7 +3014,7 @@ fn main() -> Result<()> {
                         "--workdir".into(),
                         s.container_home().display().to_string(),
                     ];
-                    args.extend(user_manager_environment(&uid));
+                    args.extend(user_manager_environment());
                     args.extend([
                         "--env".into(),
                         format!("WORKLANE_NAME={}", s.name),
@@ -2571,6 +3039,7 @@ fn main() -> Result<()> {
                     all,
                     force,
                     no_cache,
+                    skip_running,
                 } => {
                     let specs = if all {
                         store.lanes()?.into_iter().map(|x| x.spec).collect()
@@ -2603,6 +3072,9 @@ fn main() -> Result<()> {
                             if no_cache {
                                 args.push("--no-cache".into());
                             }
+                            if skip_running {
+                                args.push("--skip-running".into());
+                            }
                             let value = remote_host(&runner, &store, &s.host, args)?
                                 .context("remote host unexpectedly treated as local")?;
                             match serde_json::from_str::<serde_json::Value>(&value)? {
@@ -2612,6 +3084,10 @@ fn main() -> Result<()> {
                             continue;
                         }
                         let before = refresh(&runner, &store, &s)?;
+                        if skip_running && before.state == "running" {
+                            out.push(serde_json::json!({"lane_id":s.id,"lane_name":s.name,"outcome":"skipped-running"}));
+                            continue;
+                        }
                         if before.drift && !force {
                             out.push(serde_json::json!({"lane_id":s.id,"lane_name":s.name,"outcome":"skipped-drift"}));
                             continue;
@@ -3099,11 +3575,8 @@ mod tests {
         assert!(HERDR_RECONCILE_SCRIPT.contains("agent focus \"$agent_pane\""));
         assert!(HERDR_RECONCILE_SCRIPT.contains("pane list --workspace \"$workspace_id\""));
         assert!(HERDR_RECONCILE_SCRIPT.contains("pane run \"$primary_pane\" \"$agent_command\""));
-        assert!(HERDR_RECONCILE_SCRIPT.contains("--provider openai-codex --model gpt-6-sol"));
-        assert!(HERDR_RECONCILE_SCRIPT
-            .contains("--tools read,bash,edit,write,web_search,fetch_content,questionnaire"));
-        assert!(HERDR_RECONCILE_SCRIPT.contains("examples/extensions/questionnaire.ts"));
-        assert!(HERDR_RECONCILE_SCRIPT.contains("examples/extensions/worklane-plan/plan.ts"));
+        assert!(HERDR_RECONCILE_SCRIPT.contains("worklane-pi-agent"));
+        assert!(EMBEDDED_CONTAINERFILE.contains("assets/worklane-pi-agent"));
         assert!(!HERDR_RECONCILE_SCRIPT.contains("agent start"));
     }
 
@@ -3114,7 +3587,9 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         let bin = home.join("bin");
+        fs::create_dir_all(home.join(".config/worklane")).unwrap();
         fs::create_dir_all(&bin).unwrap();
+        fs::write(home.join(".config/worklane/agent"), "codex\n").unwrap();
         let herdr = bin.join("herdr");
         fs::write(
             &herdr,
@@ -3187,8 +3662,7 @@ esac
             .unwrap();
         assert!(status.success());
         let log = fs::read_to_string(home.join("herdr.log")).unwrap();
-        assert!(log.contains("pane run w1:p1 pi --provider openai-codex --model gpt-6-sol"));
-        assert!(log.contains("--extension /opt/worklane/pi-web-access/dist"));
+        assert!(log.contains("pane run w1:p1 worklane-pi-agent"));
         fs::remove_dir_all(home).unwrap();
     }
 
@@ -3445,7 +3919,7 @@ esac
         let config = home.join(".pi/agent/web-search.json");
         let search: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
-        assert_eq!(search["provider"], "openai");
+        assert_eq!(search["provider"], "exa");
         assert_eq!(
             search["fetchRouting"]["providers"],
             serde_json::json!(["http"])
@@ -3559,27 +4033,12 @@ esac
         assert!(shell.contains("WORKLANE_GIT_DIFF_MANAGER_INTERVAL:-2"));
         assert!(shell.contains("session=\"${WORKLANE_SESSION:-}\""));
         assert!(shell.contains("herdr --session \"$session\" api snapshot"));
-        assert!(shell.contains(".result.snapshot.tabs[]?.tab_id"));
+        assert!(shell.contains("select((.label // \"\") != \"IDE\""));
         assert!(shell.contains("pane split \"$target\" --direction right --ratio 0.7"));
         assert!(shell.contains("pane run \"$diff_pane\" \"$watcher\""));
         assert!(shell.contains(GIT_DIFF_PANE_SCRIPT));
         assert!(shell.contains(AGENT_DOCS_INSTALLER));
         assert!(shell.contains(&agent_docs_bootstrap_script()));
-    }
-
-    #[test]
-    fn timezone_from_localtime_link_uses_zoneinfo_path() {
-        assert_eq!(
-            timezone_from_localtime_link(Path::new("/usr/share/zoneinfo/America/New_York"))
-                .as_deref(),
-            Some("America/New_York")
-        );
-        assert_eq!(
-            timezone_from_localtime_link(Path::new("/usr/share/zoneinfo/Etc/UTC")).as_deref(),
-            Some("Etc/UTC")
-        );
-        assert!(timezone_from_localtime_link(Path::new("/tmp/localtime")).is_none());
-        assert!(timezone_from_localtime_link(Path::new("/usr/share/zoneinfo/posix/UTC")).is_none());
     }
 
     #[test]
@@ -3695,8 +4154,28 @@ CMD ["sleep", "infinity"]
     }
 
     #[test]
-    fn image_build_inherits_calling_identity() {
+    fn image_build_uses_stable_container_identity() {
         let runner = MockRunner::new();
+        let embedded = image_build_args(
+            &runner,
+            None,
+            Path::new("/tmp/project"),
+            "localhost/test:latest",
+            false,
+            false,
+        )
+        .unwrap();
+        let build_context = PathBuf::from(embedded.last().unwrap());
+        assert!(build_context
+            .join("assets/pi-bundle/package-lock.json")
+            .is_file());
+        assert!(build_context
+            .join("assets/worklane-runtime/collab.ts")
+            .is_file());
+        assert!(build_context
+            .join("assets/worklane-runtime/runtime.py")
+            .is_file());
+        assert_ne!(build_context, Path::new("/tmp/project"));
         let args = image_build_args(
             &runner,
             Some(&PathBuf::from("/tmp/Containerfile")),
@@ -3708,8 +4187,8 @@ CMD ["sleep", "infinity"]
         .unwrap();
         assert!(!args.contains(&"--no-cache".into()));
         assert!(args.contains(&"USERNAME=dev".into()));
-        assert!(args.contains(&"USER_UID=1000".into()));
-        assert!(args.contains(&"USER_GID=1000".into()));
+        assert!(args.contains(&"USER_UID=1001".into()));
+        assert!(args.contains(&"USER_GID=1001".into()));
         let uncached = image_build_args(
             &runner,
             Some(&PathBuf::from("/tmp/Containerfile")),
@@ -3721,6 +4200,21 @@ CMD ["sleep", "infinity"]
         .unwrap();
         assert!(uncached.contains(&"--no-cache".into()));
         assert!(uncached.contains(&"--pull=always".into()));
+        assert!(runner.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn user_manager_environment_uses_stable_container_uid() {
+        assert_eq!(
+            user_manager_environment(),
+            [
+                "--env",
+                "XDG_RUNTIME_DIR=/run/user/1001",
+                "--env",
+                "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1001/bus",
+            ]
+            .map(String::from)
+        );
     }
 
     #[test]
@@ -3934,7 +4428,9 @@ CMD ["sleep", "infinity"]
             })
             .unwrap();
         assert!(run.1.contains(&"--read-only".into()));
+        assert!(run.1.contains(&"--tz=local".into()));
         assert!(run.1.contains(&"--init".into()));
+        assert!(run.1.contains(&"--userns=keep-id:uid=1001,gid=1001".into()));
         assert!(run
             .1
             .windows(2)
@@ -3985,10 +4481,14 @@ CMD ["sleep", "infinity"]
         assert!(run.1.contains(&"--systemd=always".into()));
         assert!(run.1.contains(&"--cgroupns=private".into()));
         assert!(run.1.contains(&"--user=0".into()));
+        assert!(run.1.contains(&"--userns=keep-id:uid=1001,gid=1001".into()));
         assert!(run.1.contains(&"/sbin/init".into()));
         assert!(!run.1.contains(&"--init".into()));
         assert!(calls.iter().any(|(_, args)| {
-            args.first() == Some(&"exec".into()) && args.contains(&"show-environment".into())
+            args.first() == Some(&"exec".into())
+                && args.contains(&"show-environment".into())
+                && args.contains(&"XDG_RUNTIME_DIR=/run/user/1001".into())
+                && args.contains(&"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1001/bus".into())
         }));
         std::fs::remove_file(path).unwrap();
     }
@@ -4002,6 +4502,49 @@ CMD ["sleep", "infinity"]
         assert!(!calls.iter().any(|(_, args)| {
             args.first() == Some(&"run".into()) || args.first() == Some(&"rm".into())
         }));
+    }
+
+    #[test]
+    fn systemd_start_and_resume_never_query_host_uid() {
+        struct StableIdentityRunner {
+            state: &'static str,
+            calls: Mutex<Vec<Vec<String>>>,
+        }
+        impl Runner for StableIdentityRunner {
+            fn run(&self, program: &str, args: &[String]) -> Result<String> {
+                if program == "id" {
+                    bail!("host identity must not determine the container user bus")
+                }
+                self.calls.lock().unwrap().push(args.into());
+                if args.first().is_some_and(|arg| arg == "inspect") {
+                    return Ok(self.state.into());
+                }
+                Ok(String::new())
+            }
+        }
+        for state in ["running", "stopped"] {
+            let runner = StableIdentityRunner {
+                state,
+                calls: Mutex::new(vec![]),
+            };
+            let mut lane = spec("local");
+            lane.profile.runtime = RuntimeMode::Systemd;
+            ensure_local_started(&runner, &lane).unwrap();
+            let calls = runner.calls.lock().unwrap();
+            assert!(calls.iter().any(|args| {
+                args.first().is_some_and(|arg| arg == "exec")
+                    && args.contains(&"show-environment".into())
+                    && args.contains(&"XDG_RUNTIME_DIR=/run/user/1001".into())
+                    && args
+                        .contains(&"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1001/bus".into())
+            }));
+            assert_eq!(
+                calls
+                    .iter()
+                    .any(|args| args.first().is_some_and(|arg| arg == "start")),
+                state == "stopped"
+            );
+        }
     }
 
     #[test]
@@ -4246,5 +4789,61 @@ CMD ["sleep", "infinity"]
                 stderr: String::new(),
             })
         }
+    }
+    #[test]
+    fn pi_auth_mount_preserves_existing_lane_credentials() {
+        let home = std::env::temp_dir().join(format!("worklane-pi-auth-{}", uuid::Uuid::new_v4()));
+        let directory = home.join(".pi/agent");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("auth.json"), b"existing-pi-auth").unwrap();
+        let mut lane = spec("local");
+        lane.project_path = home.clone();
+        prepare_pi_auth_link(&lane).unwrap();
+        assert_eq!(
+            fs::read_link(directory.join("auth.json")).unwrap(),
+            Path::new(HOST_PI_MOUNT).join("auth.json")
+        );
+        let backup = fs::read_dir(&directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("auth.json.worklane-backup-")
+            })
+            .unwrap();
+        assert_eq!(fs::read(backup).unwrap(), b"existing-pi-auth");
+        prepare_pi_auth_link(&lane).unwrap();
+        fs::remove_dir_all(home).unwrap();
+    }
+    #[test]
+    fn embedded_pi_assets_are_seeded_into_the_build_context() {
+        use std::os::unix::fs::PermissionsExt;
+        let context =
+            std::env::temp_dir().join(format!("worklane-assets-{}", uuid::Uuid::new_v4()));
+        seed_embedded_asset(
+            &context,
+            "assets/worklane-pi-agent",
+            "#!/bin/sh\nexit 0\n",
+            true,
+        )
+        .unwrap();
+        let path = context.join("assets/worklane-pi-agent");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "#!/bin/sh\nexit 0\n");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        seed_embedded_asset(
+            &context,
+            "assets/worklane-pi-agent",
+            "#!/bin/sh\nexit 1\n",
+            true,
+        )
+        .unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "#!/bin/sh\nexit 1\n");
+        fs::remove_dir_all(context).unwrap();
     }
 }

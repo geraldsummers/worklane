@@ -1,0 +1,15 @@
+#!/bin/sh
+set -eu
+settings="$HOME/.config/worklane/pi"
+if [ ! -r "$settings/model" ] || [ ! -r "$settings/auth.json" ]; then
+  echo "Pi account settings are missing; run worklane credentials set-openrouter" >&2
+  exit 2
+fi
+model="$(cat "$settings/model")"
+key="$(jq -r '.openrouter.key // empty' "$settings/auth.json")"
+if [ -z "$key" ]; then
+  echo "OpenRouter key is not configured for this account" >&2
+  exit 2
+fi
+export OPENROUTER_API_KEY="$key"
+exec /usr/local/bin/pi --provider openrouter --model "$model" "$@"

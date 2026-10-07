@@ -18,16 +18,29 @@ LANE_NAME="accept-${RUN_ID//[^A-Za-z0-9]/-}"; LANE_NAME=${LANE_NAME:0:48}
 SESSION_NAME="$LANE_NAME"
 REMOTE_PROJECT="$REMOTE_ROOT/project"
 REMOTE_DISCOVERY="$REMOTE_ROOT/discovery"
+REMOTE_SMOKE="$REMOTE_ROOT/image-smoke"
 DISCOVERY_NAME="${LANE_NAME}-discovery"
 IMAGE_TAG="localhost/worklane-acceptance:$RUN_ID"
-CACHED_IMAGE_TAG="${IMAGE_TAG}-cached"
-NO_CACHE_IMAGE_TAG="${IMAGE_TAG}-no-cache"
+SMOKE_IMAGE_TAG="localhost/worklane-acceptance-smoke:$RUN_ID"
 PASS_FILE="$ARTIFACT_DIR/passed-features.txt"
 LOG="$ARTIFACT_DIR/commands.log"
 ACCEPTANCE_SUCCEEDED=0
 OLD_DEPLOY_TARGET=
 mkdir -p "$ARTIFACT_DIR" "$LOCAL_ROOT/bin" "$LOCAL_ROOT/data" "$LOCAL_ROOT/config"
 : >"$PASS_FILE"; : >"$LOG"
+TIMING_FILE="$ARTIFACT_DIR/timings.tsv"
+printf 'phase\tstarted_utc\tended_utc\tduration_ms\n' >"$TIMING_FILE"
+phase_start() {
+  PHASE_NAME=$1
+  PHASE_START_NS=$(date +%s%N)
+  PHASE_START_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+}
+phase_end() {
+  local end_ns end_utc
+  end_ns=$(date +%s%N)
+  end_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  printf '%s\t%s\t%s\t%s\n' "$PHASE_NAME" "$PHASE_START_UTC" "$end_utc" "$(((end_ns - PHASE_START_NS) / 1000000))" >>"$TIMING_FILE"
+}
 
 redact() { sed -E 's/(gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)/<redacted>/g'; }
 run() { printf '$'; printf ' %q' "$@"; printf '\n' | tee -a "$LOG"; "$@" 2>&1 | redact | tee -a "$LOG"; }
@@ -37,7 +50,7 @@ remote() { run /usr/bin/ssh "${SSH_OPTIONS[@]}" "$LAB_SSH" "$@"; }
 cleanup() {
   set +e
   case "$REMOTE_ROOT" in "$REMOTE_HOME"/.local/share/worklane/acceptance/*) ;; *) return 1;; esac
-  remote "for lane in '$LANE_NAME' '$DISCOVERY_NAME'; do env XDG_DATA_HOME='$REMOTE_ROOT/data' XDG_CONFIG_HOME='$REMOTE_ROOT/config' PATH='$REMOTE_ROOT/bin:/usr/local/bin:/usr/bin:/bin' '$REMOTE_ROOT/bin/worklane' --json lane delete \"\$lane\" >/dev/null 2>&1 || true; for container in \$(/usr/bin/podman ps -aq --filter \"label=io.worklane.name=\$lane\"); do /usr/bin/podman rm -f \"\$container\" >/dev/null 2>&1 || true; done; done; /usr/bin/podman rmi '$IMAGE_TAG' '$CACHED_IMAGE_TAG' '$NO_CACHE_IMAGE_TAG' >/dev/null 2>&1 || true; if test -d '$REMOTE_ROOT/data/containers/storage'; then XDG_DATA_HOME='$REMOTE_ROOT/data' /usr/bin/podman system reset -f >/dev/null 2>&1 || true; fi; /usr/bin/podman unshare rm -rf -- '$REMOTE_ROOT'" >>"$LOG" 2>&1
+  remote "for lane in '$LANE_NAME' '$DISCOVERY_NAME'; do env XDG_DATA_HOME='$REMOTE_ROOT/data' XDG_CONFIG_HOME='$REMOTE_ROOT/config' PATH='$REMOTE_ROOT/bin:/usr/local/bin:/usr/bin:/bin' '$REMOTE_ROOT/bin/worklane' --json lane delete \"\$lane\" >/dev/null 2>&1 || true; for container in \$(/usr/bin/podman ps -aq --filter \"label=io.worklane.name=\$lane\"); do /usr/bin/podman rm -f \"\$container\" >/dev/null 2>&1 || true; done; done; /usr/bin/podman rmi '$IMAGE_TAG' '$SMOKE_IMAGE_TAG' >/dev/null 2>&1 || true; if test -d '$REMOTE_ROOT/data/containers/storage'; then XDG_DATA_HOME='$REMOTE_ROOT/data' /usr/bin/podman system reset -f >/dev/null 2>&1 || true; fi; /usr/bin/podman unshare rm -rf -- '$REMOTE_ROOT'" >>"$LOG" 2>&1
   if [[ $ACCEPTANCE_SUCCEEDED != 1 && -n $OLD_DEPLOY_TARGET ]]; then
     remote "ln -sfn -- '$OLD_DEPLOY_TARGET' \"\$HOME/.local/bin/worklane\"" >>"$LOG" 2>&1
   fi
@@ -45,10 +58,27 @@ cleanup() {
 }
 trap cleanup EXIT
 
-remote "set -eu; command -v podman; command -v gh; command -v script; test \"\$(df -Pk '$REMOTE_HOME' | awk 'NR==2 {print \$4}')\" -ge 8388608 || { echo 'lab requires at least 8 GiB free' >&2; exit 1; }; mkdir -p '$REMOTE_ROOT/bin' '$REMOTE_PROJECT' '$REMOTE_DISCOVERY' '$REMOTE_ROOT/data' '$REMOTE_ROOT/config/worklane' '$REMOTE_ROOT/credentials/codex' '$REMOTE_ROOT/credentials/gh'; printf '%s\n' '{\"OPENAI_API_KEY\":\"worklane-acceptance-fixture\"}' >'$REMOTE_ROOT/credentials/codex/auth.json'; printf '%s\n' 'github.com:' '    user: worklane-acceptance' '    oauth_token: worklane-acceptance-fixture' '    git_protocol: https' >'$REMOTE_ROOT/credentials/gh/hosts.yml'; printf '%s\n' '#!/bin/sh' 'unset XDG_DATA_HOME' 'exec /usr/bin/podman \"\$@\"' >'$REMOTE_ROOT/bin/podman'; chmod 755 '$REMOTE_ROOT/bin/podman'; printf '%s\n' '[profiles.acceptance]' 'image = \"$IMAGE_TAG\"' 'embedded_containerfile = false' 'runtime = \"systemd\"' 'network = \"outbound\"' 'mount_codex_credentials = true' 'mount_gh_credentials = true' >'$REMOTE_ROOT/config/worklane/profiles.toml'"
+phase_start remote_setup
+remote "set -eu; command -v podman; command -v gh; command -v script; test \"\$(df -Pk '$REMOTE_HOME' | awk 'NR==2 {print \$4}')\" -ge 8388608 || { echo 'lab requires at least 8 GiB free' >&2; exit 1; }; mkdir -p '$REMOTE_ROOT/bin' '$REMOTE_PROJECT' '$REMOTE_DISCOVERY' '$REMOTE_SMOKE' '$REMOTE_ROOT/data' '$REMOTE_ROOT/config/worklane' '$REMOTE_ROOT/credentials/codex' '$REMOTE_ROOT/credentials/gh'; printf '%s\n' '{\"OPENAI_API_KEY\":\"worklane-acceptance-fixture\"}' >'$REMOTE_ROOT/credentials/codex/auth.json'; printf '%s\n' 'github.com:' '    user: worklane-acceptance' '    oauth_token: worklane-acceptance-fixture' '    git_protocol: https' >'$REMOTE_ROOT/credentials/gh/hosts.yml'; printf '%s\n' '#!/bin/sh' 'unset XDG_DATA_HOME' 'exec /usr/bin/podman \"\$@\"' >'$REMOTE_ROOT/bin/podman'; chmod 755 '$REMOTE_ROOT/bin/podman'; printf '%s\n' '[profiles.acceptance]' 'image = \"$IMAGE_TAG\"' 'embedded_containerfile = false' 'runtime = \"systemd\"' 'network = \"outbound\"' 'mount_codex_credentials = true' 'mount_gh_credentials = true' >'$REMOTE_ROOT/config/worklane/profiles.toml'"
 run scp "${SSH_OPTIONS[@]}" -q "$CANDIDATE_WORKLANE" "$CANDIDATE_LANE" "$CANDIDATE_WORKLANE_MCP" "$LAB_SSH:$REMOTE_ROOT/bin/"
-run scp "${SSH_OPTIONS[@]}" -q "$ROOT/Containerfile" "$LAB_SSH:$REMOTE_PROJECT/Containerfile"
-run scp "${SSH_OPTIONS[@]}" -q "$ROOT/Containerfile" "$LAB_SSH:$REMOTE_DISCOVERY/Containerfile"
+# Change the build recipe before its package-install layer so every run resolves current tools.
+# The same recipe is reused by lane upgrades, allowing those later builds to use cache.
+python3 - "$ROOT/Containerfile" "$LOCAL_ROOT/Containerfile" "$RUN_ID" <<'PYCONTAINERFILE'
+from pathlib import Path
+import sys
+source, destination, run_id = sys.argv[1:]
+content = Path(source).read_text()
+needle = "RUN apt-get update"
+assert content.count(needle) == 1
+cache_key = f'ARG WORKLANE_ACCEPTANCE_RUN_ID={run_id}\nRUN test "$WORKLANE_ACCEPTANCE_RUN_ID" = "{run_id}"\n'
+Path(destination).write_text(content.replace(needle, cache_key + needle, 1))
+PYCONTAINERFILE
+run scp "${SSH_OPTIONS[@]}" -q "$LOCAL_ROOT/Containerfile" "$LAB_SSH:$REMOTE_PROJECT/Containerfile"
+remote "mkdir -p '$REMOTE_PROJECT/assets'"
+run scp "${SSH_OPTIONS[@]}" -qr "$ROOT/assets/pi-bundle" "$ROOT/assets/worklane-runtime" "$ROOT/assets/worklane-pi-agent" "$ROOT/assets/worklane-pi-install" \
+  "$ROOT/assets/worklane-ide" "$ROOT/assets/worklane-appearance" \
+  "$ROOT/assets/worklane-ide-init.lua" "$LAB_SSH:$REMOTE_PROJECT/assets/"
+remote "set -eu; cp '$REMOTE_PROJECT/Containerfile' '$REMOTE_DISCOVERY/Containerfile'; cp -a '$REMOTE_PROJECT/assets' '$REMOTE_DISCOVERY/assets'; printf '%s\n' 'FROM scratch' 'COPY marker /marker' >'$REMOTE_SMOKE/Containerfile'; printf '%s\n' acceptance-fixture >'$REMOTE_SMOKE/marker'"
 remote "chmod 755 '$REMOTE_ROOT/bin/worklane' '$REMOTE_ROOT/bin/lane' '$REMOTE_ROOT/bin/worklane-mcp'; '$REMOTE_ROOT/bin/worklane' --help >/dev/null; '$REMOTE_ROOT/bin/worklane-mcp' --help >/dev/null; podman --version; gh --version | head -1"
 
 export XDG_DATA_HOME="$LOCAL_ROOT/data" XDG_CONFIG_HOME="$LOCAL_ROOT/config"
@@ -68,16 +98,22 @@ pass host.status
 
 R="env XDG_DATA_HOME='$REMOTE_ROOT/data' XDG_CONFIG_HOME='$REMOTE_ROOT/config' CODEX_HOME='$REMOTE_ROOT/credentials/codex' GH_CONFIG_DIR='$REMOTE_ROOT/credentials/gh' PATH='$REMOTE_ROOT/bin:/usr/local/bin:/usr/bin:/bin'"
 remote "$R '$REMOTE_ROOT/bin/worklane' --json registry init --fresh"; pass registry.init
+phase_end
+phase_start image_no_cache_fixture
+remote "$R '$REMOTE_ROOT/bin/worklane' --json image build --file '$REMOTE_SMOKE/Containerfile' --context '$REMOTE_SMOKE' --tag '$SMOKE_IMAGE_TAG' --no-cache"; pass image.build.no_cache
+phase_end
+phase_start image_fresh
 remote "$R EDITOR=true '$REMOTE_ROOT/bin/worklane' --json image edit"; pass image.edit
-remote "$R '$REMOTE_ROOT/bin/worklane' --json image build --context '$REMOTE_PROJECT' --tag '$IMAGE_TAG'"; pass image.build
-remote "podman tag '$IMAGE_TAG' '$CACHED_IMAGE_TAG'"
-remote "$R '$REMOTE_ROOT/bin/worklane' --json image build --context '$REMOTE_PROJECT' --tag '$IMAGE_TAG' --no-cache"; pass image.build.no_cache
-remote "podman tag '$IMAGE_TAG' '$NO_CACHE_IMAGE_TAG'"
+remote "$R '$REMOTE_ROOT/bin/worklane' --json image build --file '$REMOTE_PROJECT/Containerfile' --context '$REMOTE_PROJECT' --tag '$IMAGE_TAG'"; pass image.build
 remote "$R '$REMOTE_ROOT/bin/worklane' --json image inspect '$IMAGE_TAG'"; pass image.inspect
+phase_end
+phase_start lane_create
 
 remote "$R '$REMOTE_ROOT/bin/worklane' --json lane create '$LANE_NAME' --project '$REMOTE_PROJECT' --profile acceptance"; pass lane.create
 remote "$R '$REMOTE_ROOT/bin/worklane' --json lane create '$LANE_NAME' --project '$REMOTE_PROJECT' --profile acceptance"; pass lane.create.retry
-remote "set -eu; mkdir -p '$REMOTE_PROJECT/.config/systemd/user' '$REMOTE_PROJECT/.local/state'; printf '%s\n' '[Unit]' 'Description=Worklane persistence acceptance' '' '[Service]' 'Type=oneshot' 'ExecStart=/usr/bin/touch /home/dev/.local/state/worklane-systemd-persisted' 'RemainAfterExit=yes' '' '[Install]' 'WantedBy=default.target' >'$REMOTE_PROJECT/.config/systemd/user/worklane-persistence-acceptance.service'; container=\$(podman ps --filter 'label=io.worklane.name=$SESSION_NAME' --format '{{.Names}}'); uid=\$(id -u); podman exec --user dev --env XDG_RUNTIME_DIR=/run/user/\$uid --env DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/\$uid/bus \"\$container\" systemctl --user daemon-reload; podman exec --user dev --env XDG_RUNTIME_DIR=/run/user/\$uid --env DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/\$uid/bus \"\$container\" systemctl --user enable --now worklane-persistence-acceptance.service"; pass runtime.user_units
+phase_end
+phase_start lane_lifecycle_and_upgrades
+remote "set -eu; mkdir -p '$REMOTE_PROJECT/.config/systemd/user' '$REMOTE_PROJECT/.local/state'; printf '%s\n' '[Unit]' 'Description=Worklane persistence acceptance' '' '[Service]' 'Type=oneshot' 'ExecStart=/usr/bin/touch /home/dev/.local/state/worklane-systemd-persisted' 'RemainAfterExit=yes' '' '[Install]' 'WantedBy=default.target' >'$REMOTE_PROJECT/.config/systemd/user/worklane-persistence-acceptance.service'; container=\$(podman ps --filter 'label=io.worklane.name=$SESSION_NAME' --format '{{.Names}}'); uid=1001; podman exec --user dev --env XDG_RUNTIME_DIR=/run/user/\$uid --env DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/\$uid/bus \"\$container\" systemctl --user daemon-reload; podman exec --user dev --env XDG_RUNTIME_DIR=/run/user/\$uid --env DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/\$uid/bus \"\$container\" systemctl --user enable --now worklane-persistence-acceptance.service"; pass runtime.user_units
 for feature in lane.list lane.inspect lane.refresh lane.diff lane.diff.raw lane.stop lane.start lane.reconcile lane.reconcile.apply; do
   case "$feature" in
     lane.list) args="lane list";; lane.inspect) args="lane inspect '$LANE_NAME'";; lane.refresh) args="lane refresh '$LANE_NAME'";;
@@ -95,7 +131,9 @@ remote "set -eu; docs='$REMOTE_PROJECT/.local/share/worklane/agent-docs/current'
 pass runtime.agent_guidance
 remote "$R '$REMOTE_ROOT/bin/worklane' --json lane upgrade '$LANE_NAME' --force"; pass lane.upgrade; pass lane.upgrade.force
 remote "$R '$REMOTE_ROOT/bin/worklane' --json lane upgrade --all"; pass lane.upgrade.all
-remote "set -eu; container=\$(podman ps --filter 'label=io.worklane.name=$SESSION_NAME' --format '{{.Names}}'); uid=\$(id -u); test -f '$REMOTE_PROJECT/.local/state/worklane-systemd-persisted'; podman exec --user dev --env XDG_RUNTIME_DIR=/run/user/\$uid --env DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/\$uid/bus \"\$container\" systemctl --user is-enabled worklane-persistence-acceptance.service; podman exec --user dev --env XDG_RUNTIME_DIR=/run/user/\$uid --env DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/\$uid/bus \"\$container\" systemctl --user is-active worklane-persistence-acceptance.service"; pass runtime.user_units.persist
+phase_end
+phase_start runtime_and_api
+remote "set -eu; container=\$(podman ps --filter 'label=io.worklane.name=$SESSION_NAME' --format '{{.Names}}'); uid=1001; test -f '$REMOTE_PROJECT/.local/state/worklane-systemd-persisted'; podman exec --user dev --env XDG_RUNTIME_DIR=/run/user/\$uid --env DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/\$uid/bus \"\$container\" systemctl --user is-enabled worklane-persistence-acceptance.service; podman exec --user dev --env XDG_RUNTIME_DIR=/run/user/\$uid --env DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/\$uid/bus \"\$container\" systemctl --user is-active worklane-persistence-acceptance.service"; pass runtime.user_units.persist
 
 remote "$R sh -c 'printf \"\\002q\" | script -qec \"$REMOTE_ROOT/bin/worklane lane attach $LANE_NAME\" /dev/null'"; pass lane.attach.herdr
 remote "$R sh -c 'printf \"\\002q\" | script -qec \"$REMOTE_ROOT/bin/worklane lane attach $LANE_NAME\" /dev/null'"; pass lane.attach.repeat
@@ -116,12 +154,16 @@ remote "set -eu; container=\$(podman ps --filter 'label=io.worklane.name=$SESSIO
 pass credentials.codex
 remote "set -eu; container=\$(podman ps --filter 'label=io.worklane.name=$SESSION_NAME' --format '{{.Names}}'); expected=\$(podman exec \"\$container\" cat /etc/worklane/codex-version); actual=\$(podman exec \"\$container\" codex-real --version); test \"\$actual\" = \"codex-cli \$expected\""
 remote "$R podman inspect --format '{{.State.StartedAt}}' \$(podman ps --filter 'label=io.worklane.name=$SESSION_NAME' --format '{{.Names}}')"; pass runtime.timestamp
+remote "set -eu; container=\$(podman ps --filter 'label=io.worklane.name=$SESSION_NAME' --format '{{.Names}}'); test \"\$(podman exec \"\$container\" readlink -f /etc/localtime)\" = \"\$(readlink -f /etc/localtime)\"; test \"\$(podman exec \"\$container\" date +%z)\" = \"\$(date +%z)\""; pass runtime.timezone
 remote "$R podman exec --workdir /home/dev \$(podman ps --filter 'label=io.worklane.name=$SESSION_NAME' --format '{{.Names}}') sh -c 'test -w /home/dev && ! test -w /usr'"; pass runtime.immutable_root; pass runtime.mounts
-remote "set -eu; container=\$(podman ps --filter 'label=io.worklane.name=$SESSION_NAME' --format '{{.Names}}'); uid=\$(id -u); test \"\$(podman exec \"\$container\" ps -p 1 -o comm= | tr -d ' ')\" = systemd; podman exec --user dev --env XDG_RUNTIME_DIR=/run/user/\$uid --env DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/\$uid/bus \"\$container\" systemctl --user is-active worklane-herdr.service; podman exec --user dev --env XDG_RUNTIME_DIR=/run/user/\$uid --env DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/\$uid/bus \"\$container\" systemd-run --user --wait --collect --unit worklane-acceptance-transient --property RuntimeMaxSec=30s --property TasksMax=32 /usr/bin/true; ! podman exec --user dev \"\$container\" systemctl --no-ask-password daemon-reload"; pass runtime.systemd; pass runtime.user_manager; pass runtime.system_scope_denied
-remote "set -eu; container=\$(podman ps --filter 'label=io.worklane.name=$SESSION_NAME' --format '{{.Names}}'); uid=\$(id -u); expected=14745; user_limit=\$(podman exec \"\$container\" systemctl show \"user-\$uid.slice\" --property TasksMax --value); herdr_limit=\$(podman exec --user dev --env XDG_RUNTIME_DIR=/run/user/\$uid --env DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/\$uid/bus \"\$container\" systemctl --user show worklane-herdr.service --property TasksMax --value); podman exec --user dev --env XDG_RUNTIME_DIR=/run/user/\$uid --env DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/\$uid/bus \"\$container\" systemd-run --user --unit worklane-acceptance-default-tasks --property RuntimeMaxSec=30s /usr/bin/sleep 30; transient_limit=\$(podman exec --user dev --env XDG_RUNTIME_DIR=/run/user/\$uid --env DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/\$uid/bus \"\$container\" systemctl --user show worklane-acceptance-default-tasks.service --property TasksMax --value); podman exec --user dev --env XDG_RUNTIME_DIR=/run/user/\$uid --env DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/\$uid/bus \"\$container\" systemctl --user stop worklane-acceptance-default-tasks.service; test \"\$user_limit\" -eq \"\$expected\"; test \"\$herdr_limit\" -eq \"\$expected\"; test \"\$transient_limit\" -eq \"\$expected\""; pass runtime.task_limits
-remote "set -eu; container=\$(podman ps --filter 'label=io.worklane.name=$SESSION_NAME' --format '{{.Names}}'); uid=\$(id -u); before=\$(podman exec --user dev --env XDG_RUNTIME_DIR=/run/user/\$uid --env DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/\$uid/bus \"\$container\" systemctl --user show --property MainPID --value worklane-herdr.service); test \"\$before\" -gt 0; podman exec --user dev --env XDG_RUNTIME_DIR=/run/user/\$uid --env DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/\$uid/bus \"\$container\" systemctl --user kill --signal=KILL --kill-whom=main worklane-herdr.service; i=0; while test \"\$i\" -lt 50; do after=\$(podman exec --user dev --env XDG_RUNTIME_DIR=/run/user/\$uid --env DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/\$uid/bus \"\$container\" systemctl --user show --property MainPID --value worklane-herdr.service); test \"\$after\" -gt 0 2>/dev/null && test \"\$after\" != \"\$before\" && break; sleep 0.2; i=\$((i + 1)); done; test \"\$after\" -gt 0; test \"\$after\" != \"\$before\""; pass runtime.herdr_supervision
-remote "$R podman exec --user dev --workdir /home/dev \$(podman ps --filter 'label=io.worklane.name=$SESSION_NAME' --format '{{.Names}}') sh -c 'i=0; s=; while test \"\$i\" -lt 30; do s=\$(herdr --session \"$SESSION_NAME\" api snapshot 2>/dev/null || true); primary=\$(printf %s \"\$s\" | jq \"[.result.snapshot.panes[]? | select((.label // \\\"\\\") != \\\"git diff\\\")] | length\" 2>/dev/null || true); diff=\$(printf %s \"\$s\" | jq \"[.result.snapshot.panes[]? | select((.label // \\\"\\\") == \\\"git diff\\\")] | length\" 2>/dev/null || true); test \"\$primary\" = 1 && test \"\$diff\" = 1 && exit 0; i=\$((i + 1)); sleep 1; done; printf \"Herdr layout did not recover:\\n%s\\n\" \"\$s\" >&2; exit 1'"; pass herdr.layout.two_panes
-remote "$R podman exec --user dev --workdir /home/dev \$(podman ps --filter 'label=io.worklane.name=$SESSION_NAME' --format '{{.Names}}') sh -c 'set -e; git --version; node --version; python3 --version; cargo --version; curl -fsSI https://github.com >/dev/null'"; pass runtime.tools; pass runtime.network
+remote "set -eu; container=\$(podman ps --filter 'label=io.worklane.name=$SESSION_NAME' --format '{{.Names}}'); uid=1001; test \"\$(podman exec \"\$container\" ps -p 1 -o comm= | tr -d ' ')\" = systemd; podman exec --user dev --env XDG_RUNTIME_DIR=/run/user/\$uid --env DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/\$uid/bus \"\$container\" systemctl --user is-active worklane-herdr.service; podman exec --user dev --env XDG_RUNTIME_DIR=/run/user/\$uid --env DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/\$uid/bus \"\$container\" systemd-run --user --wait --collect --unit worklane-acceptance-transient --property RuntimeMaxSec=30s --property TasksMax=32 /usr/bin/true; ! podman exec --user dev \"\$container\" systemctl --no-ask-password daemon-reload"; pass runtime.systemd; pass runtime.user_manager; pass runtime.system_scope_denied
+remote "set -eu; container=\$(podman ps --filter 'label=io.worklane.name=$SESSION_NAME' --format '{{.Names}}'); uid=1001; expected=14745; user_limit=\$(podman exec \"\$container\" systemctl show \"user-\$uid.slice\" --property TasksMax --value); herdr_limit=\$(podman exec --user dev --env XDG_RUNTIME_DIR=/run/user/\$uid --env DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/\$uid/bus \"\$container\" systemctl --user show worklane-herdr.service --property TasksMax --value); podman exec --user dev --env XDG_RUNTIME_DIR=/run/user/\$uid --env DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/\$uid/bus \"\$container\" systemd-run --user --unit worklane-acceptance-default-tasks --property RuntimeMaxSec=30s /usr/bin/sleep 30; transient_limit=\$(podman exec --user dev --env XDG_RUNTIME_DIR=/run/user/\$uid --env DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/\$uid/bus \"\$container\" systemctl --user show worklane-acceptance-default-tasks.service --property TasksMax --value); podman exec --user dev --env XDG_RUNTIME_DIR=/run/user/\$uid --env DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/\$uid/bus \"\$container\" systemctl --user stop worklane-acceptance-default-tasks.service; test \"\$user_limit\" -eq \"\$expected\"; test \"\$herdr_limit\" -eq \"\$expected\"; test \"\$transient_limit\" -eq \"\$expected\""; pass runtime.task_limits
+remote "set -eu; container=\$(podman ps --filter 'label=io.worklane.name=$SESSION_NAME' --format '{{.Names}}'); uid=1001; before=\$(podman exec --user dev --env XDG_RUNTIME_DIR=/run/user/\$uid --env DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/\$uid/bus \"\$container\" systemctl --user show --property MainPID --value worklane-herdr.service); test \"\$before\" -gt 0; podman exec --user dev --env XDG_RUNTIME_DIR=/run/user/\$uid --env DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/\$uid/bus \"\$container\" systemctl --user kill --signal=KILL --kill-whom=main worklane-herdr.service; i=0; while test \"\$i\" -lt 50; do after=\$(podman exec --user dev --env XDG_RUNTIME_DIR=/run/user/\$uid --env DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/\$uid/bus \"\$container\" systemctl --user show --property MainPID --value worklane-herdr.service); test \"\$after\" -gt 0 2>/dev/null && test \"\$after\" != \"\$before\" && break; sleep 0.2; i=\$((i + 1)); done; test \"\$after\" -gt 0; test \"\$after\" != \"\$before\""; pass runtime.herdr_supervision
+remote "$R podman exec --user dev --workdir /home/dev \$(podman ps --filter 'label=io.worklane.name=$SESSION_NAME' --format '{{.Names}}') sh -c 'i=0; s=; while test \"\$i\" -lt 30; do s=\$(herdr --session \"$SESSION_NAME\" api snapshot 2>/dev/null || true); primary=\$(printf %s \"\$s\" | jq \"[.result.snapshot.panes[]? | select((.label // \\\"\\\") != \\\"git diff\\\")] | length\" 2>/dev/null || true); diff=\$(printf %s \"\$s\" | jq \"[.result.snapshot.panes[]? | select((.label // \\\"\\\") == \\\"git diff\\\")] | length\" 2>/dev/null || true); test \"\$primary\" -ge 1 && test \"\$diff\" -ge 1 && exit 0; i=\$((i + 1)); sleep 1; done; printf \"Herdr layout did not recover:\\n%s\\n\" \"\$s\" >&2; exit 1'"; pass herdr.layout.two_panes
+remote "$R podman exec --user dev --workdir /home/dev \$(podman ps --filter 'label=io.worklane.name=$SESSION_NAME' --format '{{.Names}}') sh -c 'set -e; git --version; node --version; python3 --version; cargo --version; pi --version; codex --version; curl -fsSI https://github.com >/dev/null'"; pass runtime.tools; pass runtime.network
+remote "set -eu; container=\$(podman ps --filter 'label=io.worklane.name=$SESSION_NAME' --format '{{.Names}}'); expected_pi=\$(podman exec \"\$container\" cat /etc/worklane/pi-version); actual_pi=\$(podman exec \"\$container\" pi --version); test \"\$actual_pi\" = \"\$expected_pi\"; expected_web=\$(podman exec \"\$container\" cat /etc/worklane/pi-web-version); actual_web=\$(podman exec \"\$container\" node -p 'require(\"/opt/worklane/pi-seed/node_modules/pi-web-access/package.json\").version'); test \"\$actual_web\" = \"\$expected_web\""; pass runtime.pi_versions
+remote "set -eu; container=\$(podman ps --filter 'label=io.worklane.name=$SESSION_NAME' --format '{{.Names}}'); podman exec --user dev --env HOME=/home/dev \"\$container\" /usr/local/lib/worklane/worklane-pi-install; podman exec --user dev --env HOME=/home/dev \"\$container\" sh -c 'test -x /home/dev/.local/bin/pi && test -d /home/dev/.local/lib/node_modules/pi-web-access/dist && test -f /home/dev/.local/lib/node_modules/@narumitw/pi-plan-mode/dist/index.ts && test -x /usr/local/bin/worklane-collab && /home/dev/.local/bin/pi --version >/dev/null'"
+pass runtime.pi_lane_local
 remote "$R podman exec --user dev --workdir /home/dev \$(podman ps --filter 'label=io.worklane.name=$SESSION_NAME' --format '{{.Names}}') sh -c 'set -eu; command -v worklane-show-image >/dev/null; command -v gm >/dev/null; python3 -c \"import tomlkit\"; test \"\$(python3 -c \"import tomllib; print(tomllib.load(open(\\\"/home/dev/.config/herdr/config.toml\\\", \\\"rb\\\"))[\\\"experimental\\\"][\\\"kitty_graphics\\\"])\")\" = True; herdr api schema --json | jq -e '\"'\"'.schemas.request.oneOf[] | select(.properties.method.const == \"pane.graphics.set\")'\"'\"' >/dev/null'"; pass runtime.herdr_graphics
 remote "$R podman exec --workdir /home/dev \$(podman ps --filter 'label=io.worklane.name=$SESSION_NAME' --format '{{.Names}}') sh -c 'set -eu; test \"\$(ps -p 1 -o comm= | tr -d \" \" )\" = systemd; before=\$(cat /sys/fs/cgroup/pids.current); test \"\$(cat /sys/fs/cgroup/pids.max)\" -eq 16384; i=0; while test \"\$i\" -lt 64; do sh -c \"sleep 0.05 &\"; i=\$((i + 1)); done; i=0; while test \"\$i\" -lt 50; do zombies=\$(ps -eo stat | awk '\"'\"'\$1 ~ /^Z/ {count++} END {print count+0}'\"'\"'); after=\$(cat /sys/fs/cgroup/pids.current); if test \"\$zombies\" -le 1 && test \"\$after\" -le \$((before + 5)); then break; fi; sleep 0.2; i=\$((i + 1)); done; test \"\$zombies\" -le 1; test \"\$after\" -le \$((before + 5))'"; pass runtime.process_reaping
 
@@ -131,6 +173,8 @@ remote "set -eu; container=\$(podman ps --filter 'label=io.worklane.name=$SESSIO
 pass runtime.git_shared_scans
 pass runtime.git_index_safety
 
+phase_end
+phase_start tui_capture
 # TUI visual capture uses a real PTY and the candidate lane binary on the lab host.
 python3 - "$LOCAL_ROOT/scenario.json" "$LAB_SSH" "$R '$REMOTE_ROOT/bin/worklane' --json lane create '$DISCOVERY_NAME' --project '$REMOTE_ROOT/discovery' --profile acceptance" "$LANE_NAME" <<'PY'
 import json, sys
@@ -167,9 +211,13 @@ grep -Fq 'upgrade: finished — 1 lane outcome; details below' "$ARTIFACT_DIR/tu
 grep -Fq 'upgrade all: finished — 2 lane outcomes; details below' "$ARTIFACT_DIR/tui/28-upgrade-all.txt"
 LANE_NAME="${LANE_NAME}-tui"
 for f in tui.launch tui.registry_discovery tui.navigation tui.filter tui.inspect tui.diff tui.start_stop tui.rename tui.reconcile tui.confirmations tui.attach tui.upgrade tui.editor; do pass "$f"; done
+phase_end
+phase_start png_render
 
 # Render every captured terminal frame to PNG for mandatory agent inspection.
 for html in "$ARTIFACT_DIR"/tui/*.html; do chromium --headless --no-sandbox --disable-gpu --window-size=1600,900 --screenshot="${html%.html}.png" "file://$html" >/dev/null 2>&1; done
+phase_end
+phase_start cleanup_and_report
 
 # Exercise forget/import/delete after interactive checks.
 remote "$R '$REMOTE_ROOT/bin/worklane' --json lane forget '$LANE_NAME'"; pass lane.forget
@@ -188,3 +236,4 @@ if ! diff -u "$ARTIFACT_DIR/expected-features.txt" "$ARTIFACT_DIR/actual-feature
 fi
 printf '{"run_id":"%s","lab":"%s","lane":"%s","status":"passed"}\n' "$RUN_ID" "$LAB_SSH" "$LANE_NAME" >"$ARTIFACT_DIR/report.json"
 ACCEPTANCE_SUCCEEDED=1
+phase_end
