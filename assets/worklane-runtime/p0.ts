@@ -17,7 +17,7 @@ export function redact(value: unknown): unknown {
   return value;
 }
 
-export type HelperOperation = "mail.list" | "mail.read" | "mail.send" | "matrix.whoami" | "matrix.rooms" | "matrix.sync" | "matrix.send" | "matrix.join" | "matrix.create_room" | "memory.add" | "memory.search";
+export type HelperOperation = "mail.list" | "mail.read" | "mail.send" | "matrix.whoami" | "matrix.rooms" | "matrix.sync" | "matrix.send" | "matrix.join" | "matrix.create_room" | "memory.add" | "memory.search" | "notify.send";
 export function helperCommand(operation: HelperOperation, args: Fields): { file: string; argv: string[]; input?: string; mutation: boolean } {
   switch (operation) {
     case "mail.list": return { file: "mail.py", argv: ["list", "--limit", String(args.limit ?? 20)], mutation: false };
@@ -33,6 +33,7 @@ export function helperCommand(operation: HelperOperation, args: Fields): { file:
     case "matrix.create_room": return { file: "matrix.py", argv: ["create-room", String(args.name)], mutation: true };
     case "memory.add": return { file: "memory.py", argv: ["add", String(args.content)], mutation: true };
     case "memory.search": return { file: "memory.py", argv: ["search", String(args.query)], mutation: false };
+    case "notify.send": return { file: "notify.py", argv: ["send"], input: JSON.stringify({ title: redact(String(args.title)) }), mutation: true };
     default: throw new Error("Unsupported P0 helper operation");
   }
 }
@@ -105,13 +106,15 @@ export default function p0(pi: ExtensionAPI) {
     return toolData(await runHelper(command.file, command.argv, command.input, signal, operation === "memory.search" ? 95000 : 60000));
   };
   pi.registerTool({ name: "p0_status", label: "P0 capabilities", description: "Report available lane-scoped helper files only. Never reads or returns identity secrets.", parameters: Type.Object({}), async execute() {
-    const capabilities = await Promise.all(["mail", "matrix", "memory"].map(async name => [name, (await stat(join(HELPER_HOME, `${name}.py`)).catch(() => undefined))?.isFile() ?? false]));
+    const capabilities = await Promise.all(["mail", "matrix", "memory", "notify"].map(async name => [name, (await stat(join(HELPER_HOME, `${name}.py`)).catch(() => undefined))?.isFile() ?? false]));
     let memorySearch = false;
     try {
       const info = await runHelper("memory.py", ["capabilities"], undefined, undefined, 5000) as {actions?: string[]};
       memorySearch = info.actions?.includes("search") === true;
     } catch { /* Older/unprovisioned scoped helpers do not imply search authority. */ }
-    return toolData({ helpers: Object.fromEntries(capabilities), memory_search: memorySearch });
+    let notify = false;
+    try { notify = (await runHelper("notify.py", ["capabilities"], undefined, undefined, 5000) as {notify?: boolean}).notify === true; } catch { /* Unprovisioned notifications are not advertised as ready. */ }
+    return toolData({ helpers: Object.fromEntries(capabilities), memory_search: memorySearch, notifications: notify });
   } });
   pi.registerTool({ name: "p0_mail_list", label: "List agent inbox", description: "Read the lane agent mailbox through existing .p0/mail.py.", parameters: Type.Object({ limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })) }), async execute(_id, args, signal, _update, ctx) { return run("mail.list", { limit: args.limit ?? 20 }, signal, ctx); } });
   pi.registerTool({ name: "p0_mail_read", label: "Read agent mail", description: "Read one lane agent mailbox UID without marking it read.", parameters: Type.Object({ uid: Type.Integer({ minimum: 1 }) }), async execute(_id, args, signal, _update, ctx) { return run("mail.read", args, signal, ctx); } });
@@ -125,9 +128,11 @@ export default function p0(pi: ExtensionAPI) {
   pi.registerTool({ name: "p0_memory_add", label: "Queue project memory", description: "Queue a memory using existing .p0/memory.py add; requires p0.memory.add approval or human TUI confirmation.", parameters: Type.Object({ content: Type.String({ minLength: 1, maxLength: 4000 }) }), async execute(_id, args, signal, _update, ctx) { return run("memory.add", args, signal, ctx); } });
   pi.registerTool({ name: "p0_memory_search", label: "Search scoped memory", description: "Search owner personal and this exact lane's project memories through .p0/memory.py search. No owner/project routing options; fails closed if helper/drain is unavailable.", parameters: Type.Object({ query: Type.String({ minLength: 1, maxLength: 4000 }) }), async execute(_id, args, signal, _update, ctx) { return run("memory.search", args, signal, ctx); } });
 
+  pi.registerTool({ name: "p0_notify", label: "Notify lane owner", description: "Send a short notification to this lane's configured owner. No recipient/topic override; manual sends require confirmation or exact p0.notify.send approval. Automatic lifecycle alerts are separate.", parameters: Type.Object({ title: Type.String({ minLength: 1, maxLength: 200 }) }), async execute(_id, args, signal, _update, ctx) { return run("notify.send", args, signal, ctx); } });
+
   const digest = Type.String({ pattern: "^[a-f0-9]{64}$" });
   const identifier = Type.String({ pattern: "^[a-f0-9]{32}$" });
-  const broker = async (action: string, args: Fields, signal?: AbortSignal) => toolData(redact(await socketRequest("/run/platform-zero/host-broker.sock", action, args, signal, 180000)));
+  const broker = async (action: string, args: Fields, signal?: AbortSignal) => toolData(redact(await socketRequest("/run/platform-zero/host-broker.sock", action, args, signal, 180000, 1)));
   pi.registerTool({ name: "p0_stack_read", label: "Read stack broker evidence", description: "Typed status/diagnostics/verify/logs/operation-status only. Broker peer authorization and scrubbing remain authoritative.", parameters: Type.Object({
     action: Type.Union(["status", "diagnostics", "verify", "logs", "operation-status"].map(action => Type.Literal(action))),
     release: Type.Optional(digest),

@@ -451,6 +451,41 @@ fn ensure_standard_containerfile() -> Result<PathBuf> {
             false,
         ),
         (
+            "assets/worklane-runtime/complain.ts",
+            include_str!("../../assets/worklane-runtime/complain.ts"),
+            false,
+        ),
+        (
+            "assets/worklane-runtime/plans.ts",
+            include_str!("../../assets/worklane-runtime/plans.ts"),
+            false,
+        ),
+        (
+            "assets/worklane-runtime/questionnaire.ts",
+            include_str!("../../assets/worklane-runtime/questionnaire.ts"),
+            false,
+        ),
+        (
+            "assets/worklane-runtime/subscription.ts",
+            include_str!("../../assets/worklane-runtime/subscription.ts"),
+            false,
+        ),
+        (
+            "assets/worklane-runtime/notifications.ts",
+            include_str!("../../assets/worklane-runtime/notifications.ts"),
+            false,
+        ),
+        (
+            "assets/worklane-runtime/notify.py",
+            include_str!("../../assets/worklane-runtime/notify.py"),
+            false,
+        ),
+        (
+            "assets/worklane-runtime/plans.py",
+            include_str!("../../assets/worklane-runtime/plans.py"),
+            false,
+        ),
+        (
             "assets/worklane-runtime/runtime.py",
             include_str!("../../assets/worklane-runtime/runtime.py"),
             true,
@@ -4047,7 +4082,9 @@ esac
         assert!(LANE_AGENTS_MD.contains("worklane-show-image"));
         assert!(LANE_AGENTS_MD.contains("Ghostty"));
         assert!(LANE_AGENTS_MD.contains("Agents may delegate concrete, bounded subtasks"));
-        assert!(LANE_AGENTS_MD.contains("agent--root--api.md"));
+        assert!(LANE_AGENTS_MD.lines().count() <= 50);
+        assert!(LANE_AGENTS_MD.contains("No manual planning-mode entry/exit"));
+        assert!(!LANE_AGENTS_MD.contains("at the start of every turn"));
         assert!(!LANE_AGENTS_MD.contains("scripts/release-check"));
         assert!(!LANE_AGENTS_MD.contains("podman_lab@"));
         assert!(AGENT_MIGRATION_MD.contains("Back up and merge"));

@@ -5,6 +5,7 @@ No network listener or host relay. Same-UID processes are trusted; workflow
 approval is not a security boundary against arbitrary code running as dev.
 """
 import argparse
+import importlib.util
 import fcntl
 import hashlib
 import json
@@ -25,6 +26,11 @@ import uuid
 MAX_REQUEST = 128 * 1024
 TERMINAL = {'done', 'failed', 'blocked', 'cancelled', 'settled', 'awaiting_approval'}
 DEFAULT_BUDGET = {'helpers': 2, 'seconds': 1800, 'turns': 20}
+
+# Installed alongside the executable; local source tests use the same module.
+_plan_spec = importlib.util.spec_from_file_location('worklane_plans', Path(__file__).with_name('plans.py'))
+_plan_module = importlib.util.module_from_spec(_plan_spec)
+_plan_spec.loader.exec_module(_plan_module)
 
 
 class Refused(ValueError):
@@ -82,10 +88,12 @@ class Runtime:
         self.db.execute('CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, run TEXT, value TEXT)')
         self.db.commit()
         self.lock = threading.RLock()
+        self.delivery_lock = threading.Lock()
         self.launch = launch
         self.session = os.environ.get('WORKLANE_SESSION', '')
         self.launching = set()
         self.last_view_check = 0
+        self.plans = _plan_module.Plans(self)
 
     def get(self, kind, ident):
         row = self.db.execute('SELECT value FROM objects WHERE kind=? AND id=?', (kind, ident)).fetchone()
@@ -120,6 +128,8 @@ class Runtime:
         return self.get('run', ident)
 
     def new_run(self, kind, prompt, goal=None, parent=None):
+        if kind == 'plan':
+            prompt += '\nPropose the plan for human review using goal_plan with the complete Markdown and exact external operation/arguments descriptors. Questions are available through questionnaire. Plan review does not change tool access or grant execution authority.'
         if kind in ('goal', 'task'):
             prompt += '\nComplete only after verification. Call run_finish with explicit status, summary and evidence. If helpers are active, await their peer result messages and verify the combined result. Do not claim success from idle/settlement alone.'
         run = {'id': str(uuid.uuid4()), 'kind': kind, 'prompt': prompt, 'status': 'queued',
@@ -146,20 +156,18 @@ class Runtime:
         # Never replay in-flight model work after a daemon/container restart.
         with self.lock, self.db:
             for run in self.rows('run'):
-                if run['status'] in ('running', 'starting'):
-                    run.update(status='blocked', summary='Interrupted runtime; explicit human retry required')
-                    self.put('run', run)
-                    self.event('error', run['id'], error=run['summary'])
-                    if run.get('goal_id'):
-                        goal = self.get('goal', run['goal_id'])
-                        goal.update(status='blocked')
-                        self.put('goal', goal)
+                if run['status'] in ('queued', 'running', 'starting'):
+                    self.finish(run, 'blocked', 'Interrupted runtime; explicit human retry required')
 
     def finish(self, run, status, summary):
         if run['status'] in TERMINAL:
             return run
         run.update(status=status, summary=summary, ended=time.time())
         self.put('run', run)
+        if status in ('failed', 'blocked', 'cancelled'):
+            for child in self.rows('run'):
+                if child.get('parent_run_id') == run['id'] and child['status'] not in TERMINAL:
+                    self.finish(child, 'blocked' if status != 'cancelled' else 'cancelled', 'Parent task stopped')
         self.event('settled' if status in ('done', 'settled') else 'error', run['id'], summary=summary)
         if run.get('goal_id') and run['kind'] != 'task':
             goal = self.get('goal', run['goal_id'])
@@ -172,23 +180,82 @@ class Runtime:
                                     'reply_to': run.get('agent_id', run['id']), 'to': parent['agent_id'],
                                     'subject': 'Helper result: ' + run['id'], 'kind': 'notice',
                                     'body': json.dumps({'status': status, 'summary': summary, 'evidence': run.get('evidence', [])}),
-                                    'ts': time.time(), 'delivery': 'queued', 'correlation_id': run['id']})
+                                    'ts': time.time(), 'delivery': 'queued', 'correlation_id': run['id'], 'helper_result': True})
+        if status == 'done' and run['kind'] in ('goal', 'chat', 'interactive') and run.get('evidence'):
+            self.run_notification(run, 'task', 'verified-task:' + run['id'], 'Task complete', 'completed')
+        elif status in ('failed', 'blocked', 'cancelled'):
+            self.run_notification(run, 'response', 'run-stopped:' + run['id'], 'Agent response stopped', status)
         if run.get('unit') and self.launch:
             # Reap only the explicitly owned run scope, never main Herdr panes.
-            threading.Thread(target=self.stop_run, args=(run,), daemon=True).start()
+            # Successful clients may flush their final notification first;
+            # failed/expired scopes are stopped immediately.
+            threading.Thread(target=self.stop_run, args=(run, 10 if status == 'done' else 0), daemon=True).start()
         return run
 
-    def stop_run(self, run):
+    def stop_run(self, run, delay=0):
+        if delay:
+            time.sleep(delay)
         try:
             command(['systemctl', '--user', 'stop', run['unit']], timeout=10)
         except (Refused, subprocess.TimeoutExpired):
             pass
 
+    def enqueue_notification(self, agent, request):
+        kind = request.get('kind')
+        if kind not in ('plan_review', 'question', 'response', 'task'):
+            raise Refused('Invalid scoped notification event')
+        key = text(request.get('key'), 256)
+        title = text(request.get('title'), 200)
+        outcome = text(request.get('outcome', 'settled'), 40)
+        if any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in title):
+            raise Refused('Notification title contains terminal control characters')
+        rows = self.rows('notification')
+        prior = next((row for row in rows if row['agent_id'] == agent['id'] and row['key'] == key), None)
+        if prior:
+            if prior['kind'] != kind or prior['outcome'] != outcome:
+                raise Refused('Notification key reused with a different event')
+            return prior
+        if len(rows) >= 1000:
+            # Bounded generated delivery history; never discard pending remote work.
+            completed = sorted((row for row in rows if row['ntfy_status'] in ('delivered', 'disabled')), key=lambda row: row['created'])
+            if not completed:
+                raise Refused('Notification outbox is full')
+            for row in completed[:len(rows) - 999]:
+                self.db.execute('DELETE FROM objects WHERE kind=? AND id=?', ('notification', row['id']))
+        prefs = self.rows('notification_settings')
+        settings = prefs[0] if prefs else {'terminal': True, 'ntfy': True, 'categories': {kind: True}}
+        enabled = settings['categories'][kind]
+        row = {'id': str(uuid.uuid4()), 'agent_id': agent['id'], 'key': key, 'kind': kind, 'title': title,
+               'outcome': outcome, 'pane_id': agent['pane_id'], 'created': time.time(), 'attempts': 0,
+               'next_attempt': 0, 'terminal': enabled and settings['terminal'], 'terminal_delivered': False,
+               'ntfy_status': 'pending' if enabled and settings['ntfy'] else 'disabled'}
+        return self.put('notification', row)
+
+    def run_notification(self, run, kind, key, title, outcome):
+        if not run.get('agent_id'):
+            return
+        try:
+            agent = self.get('agent', run['agent_id'])
+            label = f"{title} — {agent['session']} / {agent['pane_id']} — {outcome}"
+            label = ' '.join(''.join(c if ord(c) >= 32 and not 127 <= ord(c) <= 159 else ' ' for c in label).split())[:200]
+            self.enqueue_notification(agent, {'kind': kind, 'key': key, 'title': label, 'outcome': outcome})
+        except (Refused, KeyError):
+            self.event('notification_unavailable', run['id'])
+
     def dispatch(self, request):
-        if not isinstance(request, dict) or request.get('version') != 1:
-            raise Refused('Request version must be 1')
+        if not isinstance(request, dict) or request.get('version') not in (1, 2):
+            raise Refused('Unsupported runtime protocol version')
         action = request.get('action')
         with self.lock, self.db:
+            if action == 'protocol.describe':
+                return {'version': 2, 'compatible_versions': [1, 2], 'capabilities': ['plans', 'interactive_helpers', 'notification_outbox']}
+            if isinstance(action, str) and (action.startswith('plan.') or action.startswith('notification.') or action in ('interactive.open', 'interactive.children', 'interactive.turn', 'interactive.finish')) and request['version'] != 2:
+                raise Refused('This capability requires runtime protocol v2')
+            if isinstance(action, str) and action.startswith('plan.'):
+                try:
+                    return self.plans.dispatch(request)
+                except _plan_module.PlanError as error:
+                    raise Refused(str(error)) from None
             if action == 'agent.register':
                 ident = identifier(request.get('agent_id'))
                 pane = text(request.get('pane_id'), 128)
@@ -202,6 +269,7 @@ class Runtime:
                     raise Refused('Invalid process identity')
                 row = {'id': ident, 'session': session, 'pane_id': pane, 'pid': pid,
                        'role': request.get('role', 'agent'), 'session_file': request.get('session_file'), 'status': 'idle',
+                       'workspace_id': request.get('workspace_id'), 'cwd': request.get('cwd', str(self.home)),
                        'last_seen': time.time(), 'lease': secrets.token_urlsafe(32)}
                 if request.get('run_id'):
                     run = self.get('run', identifier(request['run_id']))
@@ -219,6 +287,36 @@ class Runtime:
                 agent = self.agent(request)
                 agent.update(last_seen=time.time(), status=text(request.get('status', 'idle'), 40))
                 return self.put('agent', agent)
+            if action == 'notification.settings':
+                if request.get('agent_id') or request.get('source') != 'human':
+                    raise Refused('Notification preferences require owner interaction')
+                rows = self.rows('notification_settings')
+                settings = rows[0] if rows else {'id': 'settings', 'terminal': True, 'ntfy': True, 'categories': {key: True for key in ('plan_review', 'question', 'response', 'task')}}
+                changes = request.get('changes', {})
+                if not isinstance(changes, dict) or set(changes) - {'terminal', 'ntfy', 'categories'}:
+                    raise Refused('Invalid notification preferences')
+                for key in ('terminal', 'ntfy'):
+                    if key in changes:
+                        if type(changes[key]) is not bool:
+                            raise Refused('Channel preferences must be boolean')
+                        settings[key] = changes[key]
+                categories = changes.get('categories', {})
+                if not isinstance(categories, dict) or set(categories) - set(settings['categories']) or any(type(v) is not bool for v in categories.values()):
+                    raise Refused('Invalid notification categories')
+                settings['categories'].update(categories)
+                return self.put('notification_settings', settings)
+            if action == 'notification.enqueue':
+                agent = self.agent(request)
+                if set(request) - {'version', 'action', 'agent_id', 'lease', 'kind', 'key', 'title', 'outcome'}:
+                    raise Refused('Invalid scoped notification event')
+                return self.enqueue_notification(agent, request)
+            if action == 'notification.terminal':
+                agent = self.agent(request)
+                row = self.get('notification', identifier(request.get('id')))
+                if row['agent_id'] != agent['id']:
+                    raise Refused('Not your notification')
+                row['terminal_delivered'] = True
+                return self.put('notification', row)
             if action == 'agent.list':
                 return [{k: v for k, v in a.items() if k != 'lease'} for a in self.rows('agent') if time.time() - a['last_seen'] <= 90]
             if action in ('message.send', 'message.reply'):
@@ -282,6 +380,8 @@ class Runtime:
                 run = self.get('run', agent.get('run_id', ''))
                 if run.get('goal_id') != goal['id'] or run['kind'] != 'plan' or run['status'] != 'running' or goal['status'] != 'planning':
                     raise Refused('Not the active planner for this goal')
+                if any(child.get('parent_run_id') == run['id'] and child['status'] not in TERMINAL for child in self.rows('run')):
+                    raise Refused('Wait for active helpers before submitting the final goal proposal')
                 plan = text(request.get('plan'), 50000)
                 actions = request.get('actions', [])
                 if not isinstance(actions, list) or len(actions) > 50 or any(not isinstance(a, dict) or set(a) != {'operation', 'arguments'} or not isinstance(a['operation'], str) or not isinstance(a['arguments'], dict) for a in actions):
@@ -292,8 +392,11 @@ class Runtime:
                 run.update(status='awaiting_approval', ended=time.time())
                 self.put('run', run)
                 self.event('plan_ready', run['id'], goal_id=goal['id'], plan_sha256=digest)
+                self.run_notification(run, 'plan_review', f"goal-review:{goal['id']}:{digest}", 'Plan ready for review', 'review')
                 if run.get('unit') and self.launch:
-                    threading.Thread(target=self.stop_run, args=(run,), daemon=True).start()
+                    # Give the client a bounded opportunity to render/flush the
+                    # final response. The durable outbox is persisted with this pass.
+                    threading.Thread(target=self.stop_run, args=(run, 10), daemon=True).start()
                 return goal
             if action in ('goal.approve', 'goal.reject', 'goal.cancel'):
                 if request.get('agent_id'):
@@ -350,7 +453,7 @@ class Runtime:
             if action == 'run.children':
                 run = self.run_for_agent(request)
                 children = [r for r in self.rows('run') if r.get('parent_run_id') == run['id']]
-                return {'pending': [r['id'] for r in children if r['status'] not in TERMINAL], 'children': children}
+                return {'run': run, 'pending': [r['id'] for r in children if r['status'] not in TERMINAL], 'children': children}
             if action == 'run.finish':
                 run = self.run_for_agent(request)
                 status = request.get('status')
@@ -360,26 +463,80 @@ class Runtime:
                 if status == 'done' and children:
                     raise Refused('Helpers are still active')
                 evidence = request.get('evidence', [])
+                if not isinstance(evidence, list) or any(not isinstance(item, str) or not item.strip() for item in evidence):
+                    raise Refused('Invalid completion evidence')
                 if status == 'done' and run['kind'] in ('goal', 'task') and not evidence:
                     raise Refused('Successful completion requires verification evidence')
                 if len(json.dumps(evidence).encode()) > 16000:
                     raise Refused('Completion evidence is oversized')
                 run['evidence'] = evidence
                 return self.finish(run, status, text(request.get('summary'), 16000))
+            if action in ('interactive.open', 'interactive.children', 'interactive.turn', 'interactive.finish'):
+                agent = self.agent(request)
+                group = agent.get('interactive_run_id')
+                run = self.get('run', group) if group else None
+                if action == 'interactive.open':
+                    if run and run['status'] == 'running':
+                        return run
+                    run = self.new_run('interactive', 'Human-requested interactive development')
+                    cwd = agent['cwd']
+                    if not isinstance(cwd, str) or not Path(cwd).is_absolute() or not Path(cwd).is_dir():
+                        raise Refused('Interactive workspace path is unavailable')
+                    run.update(status='running', started=time.time(), agent_id=agent['id'],
+                               pane_id=agent['pane_id'], cwd=cwd, human_workspace=agent.get('workspace_id'))
+                    agent['interactive_run_id'] = run['id']
+                    self.put('agent', agent)
+                    return self.put('run', run)
+                if not run:
+                    raise Refused('No interactive task group')
+                children = [r for r in self.rows('run') if r.get('parent_run_id') == run['id']]
+                if action == 'interactive.children':
+                    return {'run': run, 'children': children, 'pending': [r['id'] for r in children if r['status'] not in TERMINAL]}
+                if action == 'interactive.turn':
+                    run['turns'] += 1
+                    allowed = run['status'] == 'running' and run['turns'] <= run['budget']['turns'] and time.time() - run['started'] < run['budget']['seconds']
+                    self.put('run', run)
+                    if not allowed:
+                        self.finish(run, 'blocked', 'Interactive reply-continuation budget exhausted')
+                    return {'allowed': allowed}
+                status = request.get('status', 'settled')
+                if status not in ('done', 'failed', 'blocked', 'settled'):
+                    raise Refused('Invalid interactive completion status')
+                if status in ('done', 'settled') and any(r['status'] not in TERMINAL for r in children):
+                    raise Refused('Helpers are still active')
+                evidence = request.get('evidence', [])
+                if not isinstance(evidence, list) or any(not isinstance(item, str) or not item.strip() for item in evidence) or len(json.dumps(evidence).encode()) > 16000:
+                    raise Refused('Invalid completion evidence')
+                if status == 'done' and not evidence:
+                    raise Refused('Successful completion requires verification evidence')
+                run['evidence'] = evidence
+                return self.finish(run, status, text(request.get('summary', 'Interactive task verified complete' if status == 'done' else 'Interactive helper group settled; not a verification claim'), 16000))
             if action == 'task.create':
-                run = self.run_for_agent(request)
-                if run['kind'] != 'goal' or run['status'] != 'running':
-                    raise Refused('Only approved running goals can delegate')
+                if request.get('run_id'):
+                    run = self.run_for_agent(request)
+                    if run['kind'] not in ('goal', 'plan', 'chat'):
+                        raise Refused('Only root goal/planning/chat runs or interactive groups can delegate')
+                else:
+                    if request['version'] != 2:
+                        raise Refused('Interactive delegation requires protocol v2')
+                    agent = self.agent(request)
+                    run = self.get('run', agent.get('interactive_run_id', ''))
+                if run['status'] != 'running' or time.time() - run.get('started', time.time()) >= run['budget']['seconds']:
+                    raise Refused('Parent task is not running or its budget expired')
                 tasks = [r for r in self.rows('run') if r.get('parent_run_id') == run['id']]
-                if len(tasks) >= run['budget']['helpers']:
+                if sum(t['status'] not in TERMINAL for t in tasks) >= run['budget']['helpers']:
                     raise Refused('Helper budget exhausted')
                 paths = request.get('paths', [])
-                if not isinstance(paths, list) or not paths or any(not isinstance(p, str) or p.startswith('/') or '..' in Path(p).parts or not p for p in paths):
+                if not isinstance(paths, list) or not paths or len(paths) > 32 or any(not isinstance(p, str) or p.startswith('/') or '\\' in p or any(part in ('', '.', '..') for part in p.split('/')) for p in paths):
                     raise Refused('Helper requires relative ownership paths')
                 if any(p == q or p.startswith(q.rstrip('/') + '/') or q.startswith(p.rstrip('/') + '/') for p in paths for t in tasks if t['status'] not in TERMINAL for q in t.get('paths', [])):
                     raise Refused('Helper ownership overlaps active work')
                 task = self.new_run('task', text(request.get('statement')), parent=run)
-                task['paths'] = paths
+                if run['kind'] != 'goal':
+                    # Planning/chat/interactive helpers can reason and work
+                    # locally, never inherit unapproved external descriptors.
+                    task.update(goal_id=None, actions=[])
+                task.update(paths=list(dict.fromkeys(paths)), cwd=run.get('cwd', str(self.home)), human_workspace=run.get('human_workspace'))
                 return self.put('run', task)
             if action == 'chat.submit':
                 if any(r['kind'] == 'chat' and r['status'] not in TERMINAL for r in self.rows('run')):
@@ -450,6 +607,24 @@ class Runtime:
         except (ValueError, KeyError, TypeError) as error:
             raise Refused('Herdr returned no structured result') from error
 
+    def agent_workspace(self, run):
+        # Serialize workspace allocation across simultaneous helpers.
+        with self.lock, self.db:
+            owner = self.get('run', run.get('parent_run_id', run['id']))
+            snapshot = self.herdr('api', 'snapshot')['snapshot']
+            cwd = owner.get('cwd', str(self.home))
+            workspace = owner.get('agent_workspace_id')
+            if workspace and not any(w['workspace_id'] == workspace for w in snapshot['workspaces']):
+                raise Refused('Agent workspace disappeared; explicit retry required')
+            if not workspace:
+                created = self.herdr('workspace', 'create', '--cwd', cwd, '--label', 'agents:' + owner['id'][:8], '--no-focus')
+                workspace = created['workspace']['workspace_id']
+                if workspace == owner.get('human_workspace'):
+                    raise Refused('Agent workspace must differ from the human launch workspace')
+                owner['agent_workspace_id'] = workspace
+                self.put('run', owner)
+            return workspace, cwd
+
     def start_run(self, ident):
         try:
             with self.lock, self.db:
@@ -458,11 +633,8 @@ class Runtime:
                     return
                 run.update(status='starting', started=time.time(), unit='worklane-run-' + ident + '.scope')
                 self.put('run', run)
-            snapshot = self.herdr('api', 'snapshot')['snapshot']
-            workspace = next((w['workspace_id'] for w in snapshot['workspaces'] if w.get('label') == self.session), None)
-            if not workspace:
-                raise Refused('Managed Herdr workspace is unavailable')
-            tab = self.herdr('tab', 'create', '--workspace', workspace, '--cwd', str(self.home), '--label', run['kind'] + ':' + ident[:8],
+            workspace, cwd = self.agent_workspace(run)
+            tab = self.herdr('tab', 'create', '--workspace', workspace, '--cwd', cwd, '--label', run['kind'] + ':' + ident[:8],
                              '--env', 'WORKLANE_RUN_ID=' + ident, '--env', 'WORKLANE_RUN_KIND=' + run['kind'], '--no-focus')
             pane = tab['root_pane']['pane_id']
             with self.lock, self.db:
@@ -474,16 +646,8 @@ class Runtime:
                     '--property=RuntimeMaxSec=' + str(run['budget']['seconds']) + 's',
                     'worklane-pi-agent', '--session', str(session_dir / (ident + '.jsonl'))]
             self.herdr('pane', 'run', pane, shlex.join(argv))
-            if run['kind'] == 'plan':
-                for _ in range(60):
-                    agents = self.herdr('agent', 'list')['agents']
-                    if any(a.get('pane_id') == pane and a.get('agent_status') in ('idle', 'done') for a in agents):
-                        prompt = '/plan ' + run['prompt'] + '\nGoal ID: ' + run['goal_id'] + '\nResolve scope and tests. If external mutations are needed, call goal_plan with exact operation/arguments descriptors before plan_mode_complete. Complete with plan_mode_complete. Do not implement or approve your own plan.'
-                        self.herdr('agent', 'prompt', pane, prompt)
-                        break
-                    time.sleep(1)
-                else:
-                    raise Refused('Planner did not become ready')
+            # All kickoff, including goal proposals, uses the registered run
+            # input once. No slash-command parser or third-party Plan dependency.
         except (Refused, OSError, KeyError, ValueError, subprocess.TimeoutExpired) as error:
             with self.lock, self.db:
                 self.finish(self.get('run', ident), 'failed', 'Run startup failed: ' + str(error))
@@ -502,10 +666,42 @@ class Runtime:
         except (Refused, KeyError, OSError, subprocess.TimeoutExpired):
             pass  # Herdr may not yet be up; retry without affecting the durable queue.
 
+    def deliver_notifications(self):
+        if not self.delivery_lock.acquire(blocking=False):
+            return
+        try:
+            self._deliver_notifications()
+        finally:
+            self.delivery_lock.release()
+
+    def _deliver_notifications(self):
+        # Owner-scoped helper must be provisioned by the VM. It owns routing;
+        # this runtime never sees a publish credential, topic or remote host.
+        helper = self.home / '.p0/notify.py'
+        if not helper.is_file() or helper.is_symlink():
+            return
+        with self.lock:
+            rows = [row for row in self.rows('notification') if row['ntfy_status'] in ('pending', 'failed') and row['next_attempt'] <= time.time()][:10]
+        for row in rows:
+            try:
+                result = subprocess.run(['python3', str(helper), 'event'], input=json.dumps({key: row[key] for key in ('id', 'kind', 'title', 'outcome', 'pane_id')}) + '\n',
+                                        capture_output=True, text=True, timeout=15)
+                success = result.returncode == 0 and len(result.stdout) <= 16384 and json.loads(result.stdout).get('accepted') is True
+            except (OSError, ValueError, subprocess.TimeoutExpired):
+                success = False
+            with self.lock, self.db:
+                current = self.get('notification', row['id'])
+                current['attempts'] += 1
+                current['ntfy_status'] = 'delivered' if success else 'failed'
+                current['next_attempt'] = time.time() + min(3600, 30 * 2 ** min(current['attempts'], 7))
+                self.put('notification', current)
+
     def tick(self):
+        # No unsolicited viewer tab in the human workspace; explicit watch is
+        # available for diagnostics. Workspaces are created only for real runs.
         if self.launch and time.time() - self.last_view_check > 10:
             self.last_view_check = time.time()
-            threading.Thread(target=self.ensure_view, daemon=True).start()
+            threading.Thread(target=self.deliver_notifications, daemon=True).start()
         with self.lock, self.db:
             for run in self.rows('run'):
                 if run['status'] in ('starting', 'running') and time.time() - run['started'] >= run['budget']['seconds']:

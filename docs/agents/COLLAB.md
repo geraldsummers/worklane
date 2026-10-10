@@ -1,102 +1,64 @@
-# Bounded Pi collaboration extension
+# Lane-local Pi collaboration
 
-`collab.ts` registers `agent_send`, `agent_receive`, `agent_reply`,
-`agent_list_peers`, `agent_ack`, `task_delegate`, `run_finish`, and `goal_plan`.
-It implements protocol v1 in `PROTOCOL.md` over the lane-local Unix socket;
-it does not start a daemon, invoke hidden agents, or expose owner goal controls.
+`collab.ts` uses protocol v2 over the lane-local Unix socket. It registers
+`agent_send`, `agent_receive`, `agent_reply`, `agent_list_peers`, `agent_ack`,
+`task_delegate`, `run_finish`, and `goal_plan`. It neither starts the daemon nor
+exposes owner-wide service controls. See [PROTOCOL.md](../../assets/worklane-runtime/PROTOCOL.md).
 
-## Lifecycle and identity
+## Identity and messages
 
-No resources start during extension discovery. `session_start` requires a real
-Herdr pane, `HERDR_SESSION` (or `WORKLANE_SESSION`), and a durable Pi session file.
-Registration sends the Pi session UUID, exact Herdr session/pane, PID, session
-file, role, and optional `WORKLANE_RUN_ID`. The returned lease stays in memory,
-never tool output or persisted entries. Heartbeat and unread-message polling run
-at five-second intervals without overlapping polls. Shutdown reports completion,
-clears the timer, cancels session-owned socket operations, and discards the lease.
-A stopped/unavailable daemon causes tools to fail closed; it is not restarted.
+Registration starts at `session_start`, not discovery. It binds the durable Pi
+session UUID, exact Herdr session/workspace/pane, PID, project directory, and
+optional managed run. The session lease stays in memory; shutdown clears timers,
+owned socket operations, and the lease. An unavailable daemon fails explicitly.
 
-Peer envelopes use **custom messages with `display: true`**, explicitly marked as
-peer coordination rather than human authorization. They never use
-`sendUserMessage`. Only an already human-approved, budgeted goal/task run may
-continue on a custom peer result message; interactive/planning peers never
-trigger a model turn. Their IDs are deduplicated against the
-active session branch, including reloads. `agent_ack` marks an envelope consumed
-only when explicitly called; polling does not acknowledge unread work.
+Peer messages are displayed as custom coordination messages, never human
+consent. Only runtime-tagged helper results correlated to the current parent
+run/group may automatically continue its model work. Ordinary peer messages
+cannot wake interactive sessions. Result IDs are deduplicated against the active
+session branch. Reading does not acknowledge messages; use `agent_ack`.
 
-## Managed runs and planning
+## Delegation without a separate planning permission
 
-The daemon owns visible Herdr tabs and durable sessions. On registration,
-`run.input` supplies work for the exact current `WORKLANE_RUN_ID`.
-Non-plan kickoff uses the human-authorized run prompt, with a persisted branch
-marker preventing repeat delivery on `/reload`. Interrupted work is not resumed
-automatically. The daemon dispatches planning runs through the real interactive
-`/plan` command from the pinned Plan plugin; this extension never fakes Plan
-activation or injects a second planning kickoff.
+`task_delegate` can open a bounded interactive parent group when no managed run
+exists. No approved plan or autonomous goal is needed. Default limits are two
+concurrent helpers, 30 minutes and 20 logical requests per helper, and bounded
+parent automatic continuation. Relative claims reject escapes and overlap;
+claims coordinate work, not filesystem permissions. Helpers share project files.
 
-Humans create goals through the owner-checked P0/Worklane CLI, not Pi tools.
-Within that managed planning run, `goal_plan` stages at most 50 exact
-`{operation, arguments}` descriptors. It does **not** create a goal, grant
-approval, or delegate execution. The installer must include `goal_plan` in the
-Plan plugin's read-only allowlist. A successful version-1 `plan_mode_complete`
-result is reflected into `goal.plan`, with staged descriptors restored across
-reloads. Without staging, actions default to the daemon-provided list (normally
-empty). Approval remains an external human action over the plan hash.
+The runtime allocates a separate agent workspace without focusing it. Each
+helper gets one tab and a durable session; the human workspace stays intact.
+Queued/running work is blocked after a daemon restart, never silently replayed.
+Cancelling or failing a parent stops its unfinished children, not unrelated tabs.
 
-`task_delegate` requires a current execution run and validates relative path
-claims; the daemon enforces approval, ownership overlap, and its two-helper cap.
-`run_finish` records explicit status/summary/evidence and avoids duplicate
-settlement. Successful execution requires explicit verification evidence;
-ordinary settlement is not success. Parents with pending helpers wait for
-custom result messages before verifying and completing. Successful chat deltas stream through `chat.event`; terminal
-`settled`/`error` is sent at `agent_settled`, not the earlier `agent_end` boundary.
-Budget exhaustion settles as blocked through `run.finish` instead.
+## Managed goals remain independently authorized
 
-## Execution budget contract
+A managed run receives its direct prompt once; no third-party Plan plugin or
+read-only planning mode is involved. `goal_plan` submits full Markdown plus at
+most 50 exact `{operation, arguments}` descriptors to an existing planning run.
+It does not create or approve goals. Human approval binds the full goal hash.
 
-The installed SDK's `before_provider_request` hook counts each **logical model
-request**, including new-turn and Pi recovery retries. `before_agent_start` and
-`turn_start` reject already exhausted runs; charging them as well would double
-count requests. A denied or unavailable `run.turn` aborts the request and blocks
-subsequent tools.
+`run_finish` records status, summary and evidence. Successful goal/task execution
+requires explicit verification; response settlement alone is not success.
+Parents wait for pending helper results and verify the combined work. Chat
+`settled`/`error` is emitted at `agent_settled`, not the earlier `agent_end`.
 
-Provider-internal HTTP retries are **not individually observable** through this
-SDK hook. Managed runs therefore fail closed unless the effective settings are:
+## Accounting and resources
 
-```json
-{
-  "retry": { "provider": { "maxRetries": 0 } },
-  "cacheWarming": "off",
-  "compaction": { "enabled": false }
-}
-```
+Managed requests and automatic interactive continuations use the SDK's
+`before_provider_request` hook to count logical requests and require provider
+HTTP retries=0. Scoped hooks suppress cache warming and compaction for that
+automatic work without changing normal interactive compaction settings. Ordinary
+human-driven interactive sessions may use normal compaction. Custom nested model calls are not covered by
+this accounting; the managed extension set is explicit and bounded.
 
-This check happens before each request, so project overrides cannot silently
-re-enable invisible HTTP retries, cache warming, or automatic compaction calls.
-Arbitrary third-party extensions making nested model calls are outside this
-hook; the managed installed extension/loadout policy must remain bounded.
-No extension-only claim of transport-level accounting is made.
+Plan artifacts (`plan_*`), questions (`questionnaire`), and local feedback
+(`lane_complain`) are independent of these budgets and external-service grants.
+Plan approval is not blanket mail/Matrix/stack authority. See [AUTONOMY.md](AUTONOMY.md).
 
-## Focused validation
+## Validation
 
-`collab.test.ts` and `p0.test.ts` run with Node's built-in test runner through the
-installed Pi `jiti` loader. No SDK was installed or upgraded. Typecheck against
-the installed `pi-coding-agent`, `pi-ai`, Node declarations, and TypeScript with
-`strict`, `moduleResolution: bundler`, `allowImportingTsExtensions`, `noEmit`.
-Module aliases/TypeScript paths may be needed when these assets live outside
-Pi's package tree; point them at the installed packages, not mocked SDK types.
-
-The delegated implementation's actual run used:
-
-```sh
-TMPDIR=/home/dev/.tmp node /home/gerald/.tmp/pi-extension-test-runner.mjs
-TMPDIR=/home/dev/.tmp node "$TSC" -p /home/gerald/.tmp/pi-extension-tsconfig.json
-```
-
-The runner imports both adjacent test files via the installed Pi `createJiti`
-with `fsCache: false` and an alias for the installed `@earendil-works/pi-ai`.
-The generated runner/config are local validation artifacts, not runtime assets.
-`/home/dev/.tmp` exists but is not writable by this host's `gerald` user; test
-socket fixtures and generated configuration use `/home/gerald/.tmp` explicitly.
-Full release/coverage/isolated acceptance validation belongs to the parent
-integration checkpoint; these focused tests do not substitute for that gate.
+Run `node tests/run-pi-extensions.mjs --typecheck`, then the same command without
+`--typecheck`, against the locked SDK. Python runtime tests cover group limits,
+protocol compatibility and durable artifacts. These are source/contract tests,
+not subscription, live-service, terminal or phone acceptance.

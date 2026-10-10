@@ -1,17 +1,67 @@
-# Worklane runtime protocol v1
+# Worklane runtime protocol v2
 
-Local-only NDJSON requests/responses over `$HOME/.local/share/worklane/collab.sock`.
-Request `{version:1, action:NAME, ...fields}`; response `{ok:true,result:DATA}` or `{ok:false,error:TEXT}`.
-CLI: `worklane-collab request` reads one JSON request from stdin and prints one JSON response. Daemon: `worklane-collab serve`. Viewer: `worklane-collab watch`.
+Local NDJSON over `$HOME/.local/share/worklane/collab.sock`:
+`{version:2,action:NAME,...}` → `{ok:true,result:DATA}` or
+`{ok:false,error:TEXT}`. CLI: `worklane-collab request`; daemon: `serve`; viewer:
+`watch`. `protocol.describe` reports version/capabilities. Version 1 remains
+accepted for legacy actions; plans, interactive groups and notifications need v2.
 
-Actions:
-- `agent.register`: `agent_id` (UUID Pi session id), `session`, `pane_id`, `pid`, `role`, `run_id?`; result agent record plus session-scoped `lease` token. Mutating agent operations require agent_id + lease. `agent.heartbeat`: `agent_id,lease,status`. `agent.list`: list active peers.
-- `message.send`: `agent_id,lease,to,subject,body,kind?,correlation_id?,idempotency_key?`; result envelope. `message.read`: agent_id,lease,limit<=50; result unread envelopes. `message.ack`: agent_id,lease,id; marks consumed. `message.reply`: as send plus `reply_to` original message UUID; daemon resolves recipient.
-- `goal.create`: statement, schedule? (systemd OnCalendar), budget?; draft goal. `goal.list`; `goal.get`: id; `goal.plan`: id,agent_id,lease,plan (Markdown), actions (array of exact external action descriptors); awaiting_approval. `goal.approve`: id, plan_sha256; human CLI/GUI only, cannot be called via Pi tools. `goal.reject`: id. `goal.cancel`: id. `goal.schedule`: id, calendar. All schedule occurrences require new approval.
-- `run.finish`: agent_id,lease,run_id,status (done/failed/blocked),summary,evidence?; persists final state. `run.turn`: agent_id,lease,run_id; increments budget counter, returns run state. `run.authorize`: agent_id,lease,run_id,operation,arguments; true only for an approved current run whose actions include exact operation + argument object.
-- `task.create`: agent_id,lease,run_id,statement,paths (relative path claims); creates visible helper, max 2. `snapshot`: peers, messages, goals, runs, tasks, events; read-only.
-- `chat.submit`: prompt,source (gateway/matrix/device/librechat); starts a distinct durable visible Herdr agent run; result `{id}`. `chat.events`: id,after sequence; result `{events:[{seq,type,delta?}],status,error?}`. `chat.cancel`: id. Pi extension sends `chat.event`: agent_id,lease,run_id,event `{type: text_delta|settled|error,delta?}`. This API is lane-local; host gateway verifies human identity/ownership before entering lane.
+## Identity and coordination
 
-Per-run identity is injected by Herdr tab create --env WORKLANE_RUN_ID=... --env WORKLANE_RUN_KIND=chat|plan|goal|task. The daemon starts `worklane-pi-agent` with a durable Pi session file. Extensions claim the matching run on session_start, obtain work via `run.input` (agent_id,lease,run_id), and inject peer messages as custom messages, never human prompts. plan run input instructs `/plan` activation; approval is always external to the model. `run.input` returns `{prompt,kind,plan?,actions?}` once per run and is idempotent across reload. Resume interrupted runs only explicitly; never automatic.
+- `agent.register`: session UUID `agent_id`, `session`, `pane_id`, `workspace_id`,
+  `cwd`, `pid`, `role`, optional `run_id`; returns the session lease. Mutating
+  agent operations require `agent_id,lease`. Heartbeat and list are lane-local;
+  shutdown reports `agent.heartbeat` with `status=stopped`. Registration is bound to the durable Pi session and exact pane.
+- `message.send/read/ack/reply`: bounded envelopes with correlation/reply IDs.
+  Messages are custom coordination, not human instructions or authorization.
+- `interactive.open/children/turn/finish`: agent-owned bounded helper group,
+  child result/pending records, continuation request charging, explicit finish.
+- `task.create`: agent lease, optional current managed `run_id`, statement and
+  bounded relative `paths`; max two concurrent helpers. Without a managed run it
+  uses an interactive parent group. Each helper gets a no-focus agent tab.
 
-Same-UID is a trust boundary, not adversarial isolation. No cross-lane relay. All P0 external authority checks remain in existing brokers. Plan-mode helpers may register goal plans but never approve or delegate implementation before approval. Native P0 wrappers are separate from this transport.
+## Goals and runs
+
+- `goal.create/list/get/plan/approve/reject/cancel/schedule`: owner workflows.
+  `goal.plan` submits full Markdown and exact external `{operation,arguments}`
+  descriptors from a matching planning run. `goal.approve` binds the returned
+  hash and is human CLI/GUI only. Scheduled occurrences need fresh approval.
+- `run.input/turn/authorize/finish`: current run plus agent lease. Prompt delivery
+  is session-deduplicated; request counters and exact external approvals are
+  independently enforced. Verified `done` needs evidence; settlement is not it.
+- `chat.submit/events/cancel/event`: legacy host-gateway chat, owner checked
+  before entering the lane. `settled/error` uses Pi's final `agent_settled`
+  boundary, not internal model/tool turn completion.
+- `snapshot`: read-only peers/messages/goals/runs/tasks/events.
+
+Managed identity is injected as `WORKLANE_RUN_ID`/`WORKLANE_RUN_KIND`. The daemon
+uses durable sessions and scopes. No `/plan` activation, shell allowlist or
+model-changing planning hook exists. Interrupted queued/running work is blocked,
+not replayed. Failed/cancelled parents stop unfinished owned children.
+
+## Plans
+
+`plan.propose/list/get/update/history/approve/implement/revise/step/finish/archive`
+store revisioned project Markdown/steps. Proposals include source/project/session;
+step and finish requests carry verification evidence. Export is a private Pi
+`/plan export PATH` command, not a runtime action. Updates use revision CAS. Human approval
+binds ID/revision/content hash; implementation is separate. Content changes
+invalidate approval; status/evidence changes do not. Completed steps/finish need
+verification evidence. Pi only exposes artifact/status tools; trusted human
+input or CLI handles approval/implementation. Same-UID remains trusted, not an
+adversarial security boundary.
+
+## Notifications
+
+`notification.settings`: human channel/category preferences (no agent lease).
+`notification.enqueue`: agent lease, `kind,key,title,outcome`; no topic, URL,
+recipient or credential fields. Keys deduplicate durable events. `notification.terminal`
+records local presentation. Remote delivery retries through the scoped
+`~/.p0/notify.py` helper to VM-owned routing; missing provisioning stays pending.
+Kinds distinguish review/question/response/task. `response` is not verified root
+completion. OSC 9 terminal titles are sanitized and content-minimized.
+No cross-channel dismissal, approval coupling, companion or phone listener exists.
+
+No TCP listener or cross-lane relay. Existing P0 brokers remain authoritative
+for external mail/Matrix/memory/stack grants. Local feedback is approval-free;
+external forwarding is not. Wrappers/contracts do not prove live service delivery.

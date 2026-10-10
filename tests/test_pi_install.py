@@ -19,7 +19,7 @@ class PiInstallTest(unittest.TestCase):
         self.seed = root / 'seed'
         self.assets = root / 'assets'
         self.assets.mkdir()
-        for name in ('collab.ts', 'p0.ts', 'complain.ts'):
+        for name in ('collab.ts', 'p0.ts', 'complain.ts', 'plans.ts', 'questionnaire.ts', 'subscription.ts', 'notifications.ts'):
             (self.assets / name).write_text('export default function() {}\n')
         for package in ('@earendil-works/pi-coding-agent', 'pi-web-access', '@narumitw/pi-plan-mode', 'pi-lightpanda-extension'):
             folder = self.seed / package
@@ -91,21 +91,41 @@ class PiInstallTest(unittest.TestCase):
         settings = json.loads((agent / 'settings.json').read_text())
         self.assertEqual((settings['defaultProvider'], settings['defaultModel'], settings['defaultThinkingLevel']), ('openai-codex', 'gpt-6-sol', 'medium'))
         launcher = (ROOT / 'assets/worklane-pi-agent').read_text()
-        self.assertIn('--provider openai-codex --model "$model" --thinking medium', launcher)
+        self.assertIn('exec "$HOME/.local/bin/pi" "$@"', launcher)
+        self.assertNotIn('model_file=', launcher)
+        self.assertIn('extensions/worklane/complain.ts', launcher)
+        self.assertIn('extensions/worklane/plans.ts', launcher)
+        self.assertNotIn('pi-plan-mode', launcher)
+        self.assertNotIn('--no-skills', launcher)
         self.assertNotIn('--provider openrouter', launcher)
         self.assertNotIn('OPENROUTER_API_KEY', launcher)
-        self.assertEqual(len(settings['packages']), 3)
-        self.assertTrue(any('pi-lightpanda-extension' in p for p in settings['packages']))
-        self.assertEqual(len(settings['extensions']), 3)
+        self.assertEqual(len(settings['packages']), 1)
+        self.assertFalse(any('pi-plan-mode' in p or 'pi-lightpanda-extension' in p for p in settings['packages']))
+        self.assertEqual(len(settings['extensions']), 7)
+        self.assertEqual(settings['enabledModels'], ['openai-codex/*'])
         self.assertFalse(any('npm:' in item for item in settings['packages']))
-        plan = json.loads((agent / 'pi-plan-mode.json').read_text())
-        self.assertIn('goal_plan', plan['defaultPlanTools'])
-        self.assertNotIn('safeSubcommands', plan)
-        self.assertFalse(settings['compaction']['enabled'])
+        self.assertFalse((agent / 'pi-plan-mode.json').exists())
+        self.assertTrue(settings['compaction']['enabled'])
         web = json.loads((agent / 'web-search.json').read_text())
         self.assertEqual(web['toolActivation'], 'eager')
+        self.assertEqual(web['provider'], 'searxng')
+        self.assertEqual(web['webSearch']['allowedProviders'], ['searxng'])
+        self.assertNotIn('searchRouting', web)
         self.assertFalse(web['fetchRouting']['allowRemoteHostedProviders'])
         self.assertEqual((agent / 'settings.json').stat().st_mode & 0o777, 0o600)
+
+    def test_repairs_only_obsolete_worklane_strict_search_route(self):
+        self.install()
+        path = self.home / '.pi/agent/web-search.json'
+        web = json.loads(path.read_text())
+        web['searchRouting'] = {'providers': ['searxng'], 'fallbackOn': []}
+        path.write_text(json.dumps(web))
+        self.install()
+        self.assertNotIn('searchRouting', json.loads(path.read_text()))
+        web['searchRouting'] = {'providers': ['searxng'], 'fallbackOn': ['network']}
+        path.write_text(json.dumps(web))
+        self.install()
+        self.assertEqual(json.loads(path.read_text())['searchRouting'], web['searchRouting'])
 
     def test_invalid_settings_fail_without_overwriting(self):
         agent = self.home / '.pi/agent'

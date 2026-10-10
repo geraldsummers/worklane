@@ -35,4 +35,5 @@ if (process.argv.includes('--typecheck')) {
 } else {
   await jiti.import(join(root, 'assets/worklane-runtime/collab.test.ts'));
   await jiti.import(join(root, 'assets/worklane-runtime/p0.test.ts'));
+  await jiti.import(join(root, 'assets/worklane-runtime/features.test.ts'));
 }

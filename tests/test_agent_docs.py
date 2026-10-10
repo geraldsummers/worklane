@@ -47,10 +47,12 @@ class AgentDocsTest(unittest.TestCase):
         self.assertEqual(list(self.root.glob(".stage-*")), [])
 
         lane_guide = (current / "lane.md").read_text()
-        self.assertIn("nvidia-smi", lane_guide)
-        self.assertIn("framework's own availability check", lane_guide)
-        self.assertIn("retain a CPU fallback", lane_guide)
-        self.assertIn("Do not install or change host GPU drivers", lane_guide)
+        self.assertLessEqual(len(lane_guide.splitlines()), 50)
+        self.assertIn("CPU-only", lane_guide)
+        self.assertIn("No manual planning-mode entry/exit", lane_guide)
+        self.assertIn("questionnaire", lane_guide)
+        self.assertNotIn("nvidia-smi", lane_guide)
+        self.assertNotIn("at the start of every turn", lane_guide)
 
     def test_new_bundle_preserves_active_rules_and_previous_version(self):
         previous = self.install()

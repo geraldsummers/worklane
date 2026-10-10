@@ -181,8 +181,12 @@ class RuntimeTest(unittest.TestCase):
             invocations.append(args)
             if args[:2] == ('api', 'snapshot'):
                 return {'snapshot': {'workspaces': [{'workspace_id': 'w1', 'label': 'test'}]}}
+            if args[:2] == ('workspace', 'create'):
+                self.assertIn('--no-focus', args)
+                return {'workspace': {'workspace_id': 'w2'}, 'root_pane': {'pane_id': 'w2:p1'}}
             if args[:2] == ('tab', 'create'):
-                return {'root_pane': {'pane_id': 'w1:p2'}}
+                self.assertEqual(args[args.index('--workspace') + 1], 'w2')
+                return {'root_pane': {'pane_id': 'w2:p2'}}
             if args[:2] == ('pane', 'run'):
                 return {}  # Real Herdr pane run success has empty stdout.
             raise AssertionError(args)
@@ -191,7 +195,7 @@ class RuntimeTest(unittest.TestCase):
         self.runtime.start_run(run['id'])
         started = self.runtime.get('run', run['id'])
         self.assertEqual(started['status'], 'starting')
-        self.assertEqual(started['pane_id'], 'w1:p2')
+        self.assertEqual(started['pane_id'], 'w2:p2')
         tab = next(args for args in invocations if args[:2] == ('tab', 'create'))
         self.assertIn('--no-focus', tab)
         self.assertIn('WORKLANE_RUN_ID=' + run['id'], tab)
@@ -204,7 +208,7 @@ class RuntimeTest(unittest.TestCase):
             with self.assertRaises(mod.Refused):
                 self.call('goal.schedule', id=goal['id'], calendar=calendar)
         with self.assertRaises(mod.Refused):
-            self.runtime.dispatch({'version': 2, 'action': 'snapshot'})
+            self.runtime.dispatch({'version': 3, 'action': 'snapshot'})
 
 
 if __name__ == '__main__':

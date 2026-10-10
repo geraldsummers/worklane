@@ -9,7 +9,7 @@ export type Request = (action: string, fields?: Fields, signal?: AbortSignal) =>
 const MAX_RESPONSE = 2 * 1024 * 1024;
 
 /** One bounded exchange, no spawned daemon, credentials, or global owner endpoint. */
-export function socketRequest(path: string, action: string, fields: Fields = {}, signal?: AbortSignal, timeoutMs = 5000): Promise<any> {
+export function socketRequest(path: string, action: string, fields: Fields = {}, signal?: AbortSignal, timeoutMs = 5000, version = 2): Promise<any> {
   return new Promise((resolve, reject) => {
     let socket: Socket;
     let buffer = "";
@@ -28,7 +28,7 @@ export function socketRequest(path: string, action: string, fields: Fields = {},
     signal?.addEventListener("abort", abort, { once: true });
     socket = connect(path);
     socket.setEncoding("utf8");
-    socket.on("connect", () => socket.write(JSON.stringify({ ...fields, version: 1, action }) + "\n"));
+    socket.on("connect", () => socket.write(JSON.stringify({ ...fields, version, action }) + "\n"));
     socket.on("error", () => finish(new Error("Worklane daemon unavailable")));
     socket.on("end", () => { if (!done) finish(new Error("Incomplete Worklane daemon response")); });
     socket.on("data", (chunk: string) => {
@@ -52,12 +52,6 @@ export function claimPaths(paths: string[]): string[] {
   return [...new Set(paths)];
 }
 
-export function completedPlan(details: unknown): string | undefined {
-  if (!details || typeof details !== "object") return;
-  const d = details as Fields;
-  if (d.version === 1 && d.source === "plan_mode_complete" && typeof d.plan === "string" && d.plan.trim() && d.plan.length <= 50000) return d.plan.trim();
-}
-
 export function peerMessage(message: Fields) {
   return {
     customType: "worklane-peer", display: true,
@@ -72,6 +66,10 @@ export function toolData(data: unknown) {
 
 // Shared only within this Pi process; lease never becomes tool output or session data.
 let current: { request: Request; runId?: string; kind?: string } | undefined;
+export async function agentRequest(action: string, fields: Fields = {}, signal?: AbortSignal) {
+  if (!current) throw new Error("Worklane agent registration is unavailable");
+  return current.request(action, fields, signal);
+}
 export async function authorizeRun(operation: string, args: Fields, signal?: AbortSignal): Promise<boolean> {
   if (!current?.runId || current.kind === "plan") return false;
   const result = await current.request("run.authorize", { run_id: current.runId, operation, arguments: args }, signal);
@@ -93,6 +91,8 @@ export default function collab(pi: ExtensionAPI, transport: Request = (action, f
   let actions: Fields[] = [];
   let runId: string | undefined;
   let kind: string | undefined;
+  let interactiveGroup: string | undefined;
+  let replyContinuation = false;
   const seen = new Set<string>();
   const call = (action: string, fields: Fields = {}, signal?: AbortSignal) => {
     if (!request || stopped) throw new Error("Worklane lease is unavailable; open a registered visible session");
@@ -121,6 +121,8 @@ export default function collab(pi: ExtensionAPI, transport: Request = (action, f
     goalId = undefined;
     actions = [];
     busy = false;
+    interactiveGroup = undefined;
+    replyContinuation = false;
     const epoch = generation;
     runId = process.env.WORKLANE_RUN_ID || undefined;
     kind = process.env.WORKLANE_RUN_KIND || undefined;
@@ -130,7 +132,7 @@ export default function collab(pi: ExtensionAPI, transport: Request = (action, f
     const pane = process.env.HERDR_PANE_ID;
     if (!sessionFile || !session || !pane) { note(ctx, "Worklane collaboration requires a durable visible Herdr session and exact session identity"); return; }
     try {
-      const registration = await transport("agent.register", { agent_id: agentId, session, session_file: sessionFile, pane_id: pane, pid: process.pid, role: kind ?? "interactive", ...(runId ? { run_id: runId } : {}) }, lifecycle.signal);
+      const registration = await transport("agent.register", { agent_id: agentId, session, session_file: sessionFile, pane_id: pane, workspace_id: process.env.HERDR_WORKSPACE_ID, cwd: ctx.cwd, pid: process.pid, role: kind ?? "interactive", ...(runId ? { run_id: runId } : {}) }, lifecycle.signal);
       if (epoch !== generation) return;
       if (typeof registration?.lease !== "string" || !registration.lease) throw new Error("Daemon did not issue a session lease");
       const resourceSignal = lifecycle.signal;
@@ -157,10 +159,18 @@ export default function collab(pi: ExtensionAPI, transport: Request = (action, f
           for (const message of Array.isArray(messages) ? messages : messages?.messages ?? []) {
             if (typeof message.id !== "string" || seen.has(message.id)) continue;
             seen.add(message.id);
-            // Only an already human-approved, budgeted execution run may continue
-            // automatically on peer results. Interactive/planning peers cannot
-            // authorize new work or impersonate a user.
-            const continuation = !!runId && ["goal", "task"].includes(kind ?? "");
+            // Only runtime-generated results from this parent's active helper
+            // group can wake an interactive session. Arbitrary peers cannot.
+            let continuation = false;
+            if (runId && ["goal", "plan", "chat", "task"].includes(kind ?? "") && message.helper_result === true) {
+              const group = await call("run.children", { run_id: runId });
+              continuation = group.run?.id === runId && group.run?.status === "running" && group.children?.some((child: Fields) => child.id === message.correlation_id && child.parent_run_id === runId);
+            }
+            if (!runId && interactiveGroup && message.helper_result === true) {
+              const group = await call("interactive.children");
+              continuation = group.run?.id === interactiveGroup && group.run?.status === "running" && group.children?.some((child: Fields) => child.id === message.correlation_id && child.parent_run_id === interactiveGroup);
+              if (continuation) replyContinuation = true;
+            }
             pi.sendMessage(peerMessage(message), { deliverAs: continuation ? "followUp" : "nextTurn", triggerTurn: continuation });
           }
         } catch { note(ctx, "Worklane heartbeat/poll unavailable; requests remain fail-closed"); }
@@ -178,9 +188,9 @@ export default function collab(pi: ExtensionAPI, transport: Request = (action, f
         kind = input.kind ?? kind;
         current = { request: request!, runId, kind };
         const delivered = ctx.sessionManager.getBranch().some(entry => entry.type === "custom" && entry.customType === "worklane-run-input" && (entry.data as Fields)?.run_id === runId);
-        // The daemon dispatches plan runs through the real interactive /plan parser.
-        // It owns the one-time kickoff; this extension must not start a second plan.
-        if (kind !== "plan" && !delivered && ["queued", "running"].includes(input.status) && typeof input.prompt === "string" && input.prompt) {
+        // All registered runs consume the same durable one-time kickoff. Plans
+        // need no slash-command parser, permission mode, or third-party plugin.
+        if (!delivered && ["queued", "running"].includes(input.status) && typeof input.prompt === "string" && input.prompt) {
           pi.appendEntry("worklane-run-input", { run_id: runId });
           pi.sendUserMessage(input.prompt);
         }
@@ -198,21 +208,27 @@ export default function collab(pi: ExtensionAPI, transport: Request = (action, f
     finally { cleanup(); }
   });
 
+  pi.on("input", async event => {
+    if (["interactive", "rpc"].includes(event.source)) replyContinuation = false;
+  });
   pi.on("before_agent_start", async (_event, ctx) => {
     if (runId && (!request || exhausted)) { ctx.abort(); throw new Error("Managed run has no active execution allowance"); }
   });
   pi.on("turn_start", async (_event, ctx) => { if (runId && exhausted) ctx.abort(); });
-  // The SDK hook covers logical requests and recovery retries, not internal HTTP
-  // attempts. Managed sessions must disable invisible provider retries, warming,
-  // and automatic compaction. Counting turn_start too would double-charge.
+  // Disable secondary request paths only for automatic managed runs. Normal
+  // interactive Pi keeps compaction; this is unrelated to plan management.
+  pi.on("cache_warming_decision", async () => runId || replyContinuation ? { action: "stop" as const } : undefined);
+  pi.on("session_before_compact", async () => runId || replyContinuation ? { cancel: true } : undefined);
+  // The SDK hook counts logical requests including recovery retries. Internal
+  // HTTP retries must remain disabled; counting turn_start would double-charge.
   pi.on("before_provider_request", async (_event, ctx) => {
-    if (!runId) return;
+    if (!runId && !replyContinuation) return;
     try {
       const settings = pi.getSettings();
-      if (settings.retry?.provider?.maxRetries !== 0 || settings.cacheWarming !== "off" || settings.compaction?.enabled !== false) {
-        throw new Error("Managed budgets require provider retries=0, cache warming=off, compaction disabled");
+      if (settings.retry?.provider?.maxRetries !== 0) {
+        throw new Error("Managed budgets require provider retries=0");
       }
-      const budget = await call("run.turn", { run_id: runId });
+      const budget = runId ? await call("run.turn", { run_id: runId }) : await call("interactive.turn");
       if (budget?.allowed !== true) throw new Error(budget?.reason ?? "Managed run budget exhausted");
     } catch (error) {
       exhausted = true;
@@ -224,7 +240,6 @@ export default function collab(pi: ExtensionAPI, transport: Request = (action, f
   });
   pi.on("tool_call", async (event) => {
     if (runId && exhausted) return { block: true, reason: "Managed execution allowance unavailable" };
-    if (kind === "plan" && event.toolName === "task_delegate") return { block: true, reason: "Planning cannot launch execution" };
     if (runId) {
       const input = event.input as Fields;
       if (event.toolName === "web_search" && input.workflow && input.workflow !== "none")
@@ -244,22 +259,28 @@ export default function collab(pi: ExtensionAPI, transport: Request = (action, f
       summary = "Pi assistant request failed or was aborted";
     }
   });
-  pi.on("tool_result", async event => {
-    if (event.toolName !== "plan_mode_complete" || event.isError) return;
-    const plan = completedPlan(event.details);
-    if (!plan || !goalId) return;
-    await call("goal.plan", { id: goalId, plan, actions });
-    pi.sendMessage({ customType: "worklane-plan", display: true, content: `Goal ${goalId}: proposed plan recorded; human approval is still required.`, details: { goal_id: goalId } });
-  });
   pi.on("agent_settled", async () => {
-    if (!runId || !request || stopped) return;
+    if (!request || stopped) return;
+    if (!runId) {
+      replyContinuation = false;
+      if (interactiveGroup) {
+        const children = await call("interactive.children");
+        if (!children.pending?.length) {
+          await call("interactive.finish");
+          interactiveGroup = undefined;
+        }
+      }
+      return;
+    }
     if (explicitlyFinished) return;
+    if (outcome === "done") {
+      const children = await call("run.children", { run_id: runId });
+      if (children?.pending?.length) return;
+    }
     if (kind === "chat" && !exhausted) {
       // settled/error is itself terminal in the daemon; do not finish twice.
       await call("chat.event", { run_id: runId, event: { type: outcome === "done" ? "settled" : "error" } });
     } else if (kind !== "plan") {
-      const children = await call("run.children", { run_id: runId });
-      if (outcome === "done" && children?.pending?.length) return;
       // Settlement alone is not evidence of successful implementation.
       await call("run.finish", { run_id: runId, status: outcome === "done" ? "blocked" : outcome,
         summary: outcome === "done" ? "Run settled without explicit run_finish evidence" : summary });
@@ -274,24 +295,36 @@ export default function collab(pi: ExtensionAPI, transport: Request = (action, f
   pi.registerTool({ name: "agent_reply", label: "Reply to peer", description: "Reply to a daemon envelope; daemon resolves recipient.", parameters: Type.Object({ reply_to: str, ...messageFields }), async execute(id, params, signal) { return toolData(await call("message.reply", { ...params, idempotency_key: params.idempotency_key ?? id }, signal)); } });
   pi.registerTool({ name: "agent_list_peers", label: "List lane peers", description: "List active peers in this lane only.", parameters: Type.Object({}), async execute(_id, _params, signal) { return toolData(await call("agent.list", {}, signal)); } });
   pi.registerTool({ name: "agent_ack", label: "Acknowledge peer message", description: "Mark an envelope consumed after processing.", parameters: Type.Object({ id: str }), async execute(_id, params, signal) { return toolData(await call("message.ack", params, signal)); } });
-  pi.registerTool({ name: "task_delegate", label: "Delegate visible task", description: "Create a bounded visible helper for a current approved run. Maximum two; no hidden subprocess agents.", parameters: Type.Object({ statement: str, paths: Type.Array(str, { minItems: 1, maxItems: 32 }) }), async execute(_id, params, signal) {
-    if (!runId || kind === "plan") throw new Error("Delegation requires an approved execution run");
-    return toolData(await call("task.create", { run_id: runId, statement: params.statement, paths: claimPaths(params.paths) }, signal));
+  pi.registerTool({ name: "task_delegate", label: "Delegate visible task", description: "Delegate a relevant bounded subtask in its own Herdr tab/workspace. Interactive delegation needs no extra approval. Maximum two concurrent helpers; coordinate paths.", parameters: Type.Object({ statement: str, paths: Type.Array(str, { minItems: 1, maxItems: 32 }) }), async execute(_id, params, signal) {
+    const paths = claimPaths(params.paths);
+    if (!runId && !interactiveGroup) interactiveGroup = (await call("interactive.open", {}, signal)).id;
+    return toolData(await call("task.create", { ...(runId ? { run_id: runId } : {}), statement: params.statement, paths }, signal));
   } });
-  pi.registerTool({ name: "run_finish", label: "Finish managed run", description: "Persist final run state and evidence. Never grants approval.", parameters: Type.Object({ status: Type.Union([Type.Literal("done"), Type.Literal("failed"), Type.Literal("blocked")]), summary: str, evidence: Type.Optional(Type.Array(str, { maxItems: 32 })) }), async execute(_id, params, signal) {
-    if (!runId) throw new Error("No managed run is active");
+  pi.registerTool({ name: "run_finish", label: "Finish verified task", description: "Persist explicit root-task or managed-run status and evidence. Settlement alone is not verified completion; this never grants external approval.", parameters: Type.Object({ status: Type.Union([Type.Literal("done"), Type.Literal("failed"), Type.Literal("blocked")]), summary: str, evidence: Type.Optional(Type.Array(str, { maxItems: 32 })) }), async execute(_id, params, signal) {
     if (params.status === "done" && !params.evidence?.length) throw new Error("Successful completion requires verification evidence");
+    if (!runId) {
+      if (!interactiveGroup) interactiveGroup = (await call("interactive.open", {}, signal)).id;
+      const result = await call("interactive.finish", params, signal);
+      if (result.status === "done") pi.events?.emit("worklane:notification", { kind: "task", key: `verified-task:${result.id}`, outcome: "completed" });
+      interactiveGroup = undefined;
+      return toolData(result);
+    }
     const result = await call("run.finish", { run_id: runId, ...params }, signal);
     explicitlyFinished = true;
     outcome = params.status;
     summary = params.summary;
+    if (["goal", "chat"].includes(kind ?? "") && result.status === "done") {
+      pi.events?.emit("worklane:notification", { kind: "task", key: `verified-task:${runId}`, outcome: "completed" });
+    }
     return { ...toolData(result), terminate: true };
   } });
-  pi.registerTool({ name: "goal_plan", executionMode: "sequential", label: "Stage goal action proposal", description: "For the current human-created managed planning run only: stage exact external action descriptors to accompany plan_mode_complete. Does not create goals, activate Plan mode, approve, or launch execution. Human goal creation uses p0 CLI and the daemon's pinned /plan kickoff.", parameters: Type.Object({ actions: Type.Array(Type.Object({ operation: str, arguments: Type.Record(Type.String(), Type.Unknown()) }), { maxItems: 50 }) }), async execute(_id, params) {
-    if (!runId || kind !== "plan" || !goalId) throw new Error("Goal actions require the current human-created managed planning run");
-    if (!pi.getAllTools().some(t => t.name === "plan_mode_complete")) throw new Error("Pinned Plan plugin is unavailable");
+  pi.registerTool({ name: "goal_plan", executionMode: "sequential", label: "Submit goal proposal", description: "Submit complete Markdown and exact external action descriptors for the current human-created goal. Does not approve, create goals or change tool access.", parameters: Type.Object({ plan: Type.String({ minLength: 1, maxLength: 50000 }), actions: Type.Array(Type.Object({ operation: str, arguments: Type.Record(Type.String(), Type.Unknown()) }), { maxItems: 50 }) }), async execute(_id, params, signal) {
+    if (!runId || kind !== "plan" || !goalId) throw new Error("Goal proposals require the current human-created planning run");
+    const result = await call("goal.plan", { id: goalId, plan: params.plan, actions: params.actions }, signal);
     actions = params.actions;
     pi.appendEntry("worklane-goal-plan", { goal_id: goalId, actions });
-    return toolData({ id: goalId, status: "proposal", approval: "required", next: "Finish with plan_mode_complete" });
+    pi.events?.emit("worklane:notification", { kind: "plan_review", key: `goal-review:${goalId}:${result.plan_sha256}`, outcome: "review" });
+    explicitlyFinished = true;
+    return { ...toolData(result), terminate: true };
   } });
 }

@@ -5,7 +5,6 @@ ARG NODE_VERSION=24.21.0
 ARG NODE_SHA256=fd8e59d5a511510f6a298afb548f18c7d2b1be404d8b4a27d94fbe49f56cb2d6
 ARG PI_VERSION=1.0.2
 ARG PI_WEB_VERSION=0.35.0
-ARG PI_PLAN_VERSION=0.58.4
 COPY assets/pi-bundle/package.json assets/pi-bundle/package-lock.json /opt/worklane/pi-seed/
 ARG TYPESCRIPT_VERSION=7.0.2
 ARG PRETTIER_VERSION=3.9.5
@@ -53,11 +52,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && printf '%s\n' "$codex_version" > /etc/worklane/codex-version \
  && printf '%s\n' "$PI_VERSION" > /etc/worklane/pi-version \
  && printf '%s\n' "$PI_WEB_VERSION" > /etc/worklane/pi-web-version \
- && printf '%s\n' "$PI_PLAN_VERSION" > /etc/worklane/pi-plan-version \
  && ln -s /opt/worklane/pi-seed/node_modules/pi-web-access /opt/worklane/pi-web-access \
  && test "$(pi --version)" = "$PI_VERSION" \
  && test "$(node -p 'require("/opt/worklane/pi-seed/node_modules/pi-web-access/package.json").version')" = "$PI_WEB_VERSION" \
- && test "$(node -p 'require("/opt/worklane/pi-seed/node_modules/@narumitw/pi-plan-mode/package.json").version')" = "$PI_PLAN_VERSION" \
  && test "$(node -p 'require("/opt/worklane/pi-seed/node_modules/pi-lightpanda-extension/package.json").version')" = "$PI_LIGHTPANDA_VERSION" \
  && curl -fsSL "https://github.com/lightpanda-io/browser/releases/download/${LIGHTPANDA_VERSION}/lightpanda-x86_64-linux" -o /tmp/lightpanda \
  && echo "${LIGHTPANDA_SHA256}  /tmp/lightpanda" | sha256sum -c - \
@@ -183,7 +180,8 @@ RUN groupadd --gid "${USER_GID}" "${USERNAME}" && useradd --uid "${USER_UID}" --
     > /usr/lib/systemd/user/worklane-git-diff-pane-manager.service
 COPY --chmod=755 assets/worklane-pi-agent /usr/local/bin/worklane-pi-agent
 COPY --chmod=755 assets/worklane-pi-install /usr/local/lib/worklane/worklane-pi-install
-COPY assets/worklane-runtime/collab.ts assets/worklane-runtime/p0.ts assets/worklane-runtime/complain.ts /usr/local/lib/worklane/runtime/
+COPY assets/worklane-runtime/collab.ts assets/worklane-runtime/p0.ts assets/worklane-runtime/complain.ts assets/worklane-runtime/plans.ts assets/worklane-runtime/questionnaire.ts assets/worklane-runtime/subscription.ts assets/worklane-runtime/notifications.ts assets/worklane-runtime/notify.py /usr/local/lib/worklane/runtime/
+COPY assets/worklane-runtime/plans.py /usr/local/bin/plans.py
 COPY --chmod=755 assets/worklane-runtime/runtime.py /usr/local/bin/worklane-collab
 COPY assets/worklane-runtime/worklane-collab.service assets/worklane-runtime/worklane-goal-runner.service assets/worklane-runtime/worklane-goal-runner.timer /usr/lib/systemd/user/
 RUN ln -sfn ../worklane-collab.service /usr/lib/systemd/user/default.target.wants/worklane-collab.service \

@@ -95,11 +95,13 @@ focuses the selected agent and leaves previous agent panes and sessions intact.
 Use `worklane lane agent NAME pi` or `worklane lane agent NAME codex` from a shell.
 The standard image contains both agents, so switching does not require a rebuild.
 The standard bundle pins Pi **1.0.2**, pi-web-access **0.35.0**,
-@narumitw/pi-plan-mode **0.58.4**, and pi-lightpanda-extension **0.1.0**, including
+and optional pi-lightpanda-extension **0.1.0**, including
 transitive dependencies through
 `assets/pi-bundle/package-lock.json`. Image builds use `npm ci --ignore-scripts`;
-seed versions are recorded in `/etc/worklane/pi-version`, `pi-web-version`, and
-`pi-plan-version`. On first Pi use, Worklane copies the complete locked tree into
+seed versions are recorded in `/etc/worklane/pi-version` and `pi-web-version`.
+Worklane's local plan, questionnaire, notification, subscription, complaint,
+collaboration and P0 extensions are seeded with the image; no third-party
+read-only Plan mode is part of the standard loadout. On first Pi use, Worklane copies the complete locked tree into
 `~/.local/share/worklane/pi-bundle/node_modules`, links its packages through
 `~/.local/lib/node_modules`, and creates `~/.local/bin/pi`. The lane runs only
 this writable installation; no network package install happens at startup. Later image upgrades never replace it: use
@@ -111,7 +113,10 @@ an image containing the installer. A custom build context using the repository's
 `Containerfile` must also contain its `assets/` files; embedded standard builds
 seed those files automatically.
 
-The pinned `pi-lightpanda-extension` gives Pi agent-friendly web tools backed by
+Web access defaults to the configured SearXNG service with direct fetching and
+no silent search-provider, summary-model or hosted-fetch fallback. Lightpanda
+is installed but not enabled automatically. When explicitly enabled, the pinned
+`pi-lightpanda-extension` gives Pi agent-friendly web tools backed by
 the image's **Lightpanda** headless browser: `lightpanda_search`, `lightpanda_fetch`
 (markdown/html/semantic tree), and CDP navigate/eval/command/events for stateful
 browsing. The `lightpanda` binary is on `PATH` (version recorded in
@@ -127,7 +132,9 @@ private `~/.config/worklane/pi-codex` directory (mode 0700, files 0600),
 mounted writable only into that account's lanes so Pi can refresh OAuth. `M`
 selects a model from the installed openai-codex catalog;
 `worklane credentials models`, `set-model MODEL` and `status` are the shell
-commands. A running Pi process retains its selected model until restarted.
+commands. Deliberate subscription-model/thinking selections persist with the Pi session;
+explicit standard Pi CLI model choices are respected. Request-time checks reject
+non-subscription/provider fallback instead of inspecting OAuth JSON shapes.
 Legacy `set-openrouter` remains an explicit compatibility command, but writes
 only to `~/.config/worklane/pi` and is never mounted or automatically selected
 by managed Pi. No OpenRouter or metered OpenAI API-key fallback is installed.

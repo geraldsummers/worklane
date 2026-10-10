@@ -29,7 +29,9 @@ test("recursive redaction removes credential fields and common credential text",
 test("no broad owner API, break-glass, identity file, or untyped stack action registered", async () => {
   const tools = new Map<string, any>();
   p0({ registerTool: (tool: any) => tools.set(tool.name, tool) } as any);
-  assert.equal(tools.size, 17);
+  assert.equal(tools.size, 18);
+  assert.equal(tools.has("p0_notify"), true);
+  assert.equal(helperCommand("notify.send", {title: "Done"}).input, '{"title":"Done"}');
   assert.equal([...tools.keys()].some(name => /owner|goal|approve|token|identity|break.glass/.test(name)), false);
   const reads = tools.get("p0_stack_read").parameters.properties;
   assert.deepEqual(reads.action.anyOf.map((branch: any) => branch.const), ["status", "diagnostics", "verify", "logs", "operation-status"]);

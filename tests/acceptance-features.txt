@@ -50,7 +50,14 @@ runtime.git_shared_scans
 runtime.immutable_root
 runtime.mounts
 runtime.network
+runtime.notification_outbox
+runtime.plans
+runtime.protocol_v2
 runtime.pi_lane_local
+runtime.pi_rpc_registration
+runtime.pi_questionnaire
+runtime.pi_complaints
+runtime.pi_plan_review
 runtime.pi_versions
 runtime.process_reaping
 runtime.system_scope_denied

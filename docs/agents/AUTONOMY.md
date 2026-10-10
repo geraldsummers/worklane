@@ -1,16 +1,28 @@
-# Human-approved, visible autonomous Worklane goals
+# Conversational plans and managed goals
 
-Worklane's lane-local `worklane-collab.service` durably stores messages, goals and
-runs. `worklane-goal-runner.timer` supervises queue health; per-goal user-systemd
-timers schedule new occurrences. The lane must be running; stopped lanes do not
-wake themselves. These services never approve plans or replay interrupted work.
+## Plans are artifacts, not a permission mode
 
-## Submit, review, approve
+Ask normally to make or revise a plan. `plan_propose`, `plan_read`, `plan_update`,
+`plan_step_update` and `plan_finish` keep versioned Markdown, steps and evidence
+in private runtime storage. `/plan` is optional; `/plan export PATH` writes a
+private, exclusive Markdown export.
+Questions remain available through `questionnaire`; no mode entry is required.
+These tools do not restrict shell/edit/delegation tools or change models.
 
-In Platform Zero, select an owned agent lane and use the Goals page, or:
+A human's interactive/RPC “approve the plan” or “implement the plan” input binds
+the displayed ID/revision/hash. Peer/extension messages never count as approval.
+A stale revision must be displayed again. Approval alone does not start work;
+implementation is a separate human instruction. Content revisions invalidate
+approval; progress/evidence updates do not. Verified completion needs evidence.
+When multiple project plans match, select the intended ID rather than guessing.
+
+## Managed P0 goals
+
+Managed goals are separate owner-authorized jobs. Their external actions still
+need the existing exact-descriptor approvals and broker grants:
 
 ```sh
-p0 --json goal create 'Review and fix the failing project tests' --lane LANE
+p0 --json goal create 'Review and fix failing tests' --lane LANE
 p0 --json goal list --lane LANE
 p0 --json goal get GOAL_UUID --lane LANE
 p0 --json goal approve GOAL_UUID --lane LANE --plan-sha256 EXACT_HASH
@@ -19,73 +31,49 @@ p0 --json goal cancel GOAL_UUID --lane LANE
 p0 --json goal schedule GOAL_UUID --lane LANE --calendar daily
 ```
 
-The UUID and hash come from the returned record, not a guessed name. Approval
-binds both the full Markdown plan and exact external action descriptors. A stale
-hash is rejected. Every scheduled occurrence plans afresh and needs new human
-approval. Overlap (including a pending unapproved occurrence) is skipped and
-logged. Cancelling a schedule's goal prevents future occurrences. There are no
-preapproved recurring templates.
-
-From a lane's shell the same local API is available via stdin NDJSON:
+Each scheduled occurrence plans afresh and needs fresh approval. Pending
+occurrences do not overlap. Planning runs submit Markdown/actions directly with
+`goal_plan`; no read-only Plan plugin is used. Goals do not approve themselves.
+A local shell can use NDJSON, for example:
 
 ```sh
-printf '%s\n' '{"version":1,"action":"goal.list"}' | worklane-collab request
+printf '%s\n' '{"version":2,"action":"goal.list"}' | worklane-collab request
 ```
 
-For submission send `goal.create` with `statement`; to approve send
-`goal.approve` with `id` and `plan_sha256`. Approval is a human CLI/GUI action,
-not a Pi model tool. This is a workflow boundary inside a trusted same-UID lane,
-not a security sandbox against malicious code already running as `dev`.
+## Helpers and settlement
 
-## Herdr visibility and execution
+Relevant `task_delegate` work is allowed by default, including ordinary
+interactive sessions. Defaults are two concurrent helpers, 30 minutes/20 logical
+requests per helper and bounded parent automatic continuation. One helper runs
+per tab in a separate agent workspace, without focusing it. Claims are advisory;
+shared project permissions are unchanged. Verify combined results before finish.
 
-A planning run appears in its own `plan:UUID` tab and invokes the real pinned
-`/plan` plugin. Questions can be answered in that visible pane. Completing the
-plan records it as `awaiting_approval`; it cannot approve itself. After approval,
-a new durable Pi session appears in a `goal:UUID` tab. Helpers appear in
-`task:UUID` tabs, with relative path claims and parent/run identity. The
-`collaboration` tab shows peers, messages, goal/run states and failures without
-stealing focus. Use stable IDs, never the currently focused pane as identity.
+`agent_settled` means the visible response has ended, not verified root-task
+completion. Plan review, waiting questions, response settlement and verified
+completion are distinct notification events. Terminal and private owner ntfy
+channels have independent dismissal; there is no companion or dismissal relay.
+The runtime outbox retries unavailable remote delivery rather than claiming it
+succeeded. Provisioned VM-owned routing chooses recipients; agents cannot.
 
-Only an approved execution goal may call `task_delegate`. Defaults are two
-helpers, 30 minutes per run and 20 logical provider requests per agent. Relative
-claims reject traversal and overlaps between active helpers. Claims are advisory,
-not filesystem isolation: helpers share the lane's workspace and permissions.
-
-Wait for helper result messages, inspect their evidence, and verify the combined
-work. Finish through `run_finish` with explicit status, summary and verification
-evidence. Idle/settlement alone is not success. Helper result custom messages can
-continue only already authorized, budgeted execution runs; ordinary interactive
-or planning peers do not automatically launch new work.
-
-Timeout, exhausted budget, lost daemon authorization, restart or failure produces
-a blocked/failed run. The queue does not silently resume model work. Inspect the
-state, then submit a fresh goal explicitly if retry is intended. User-systemd
-scopes own managed run processes so cancellation does not kill unrelated panes.
-
-## External Platform Zero actions
-
-During planning, call `goal_plan` to stage exact `{operation,arguments}` actions
-before `plan_mode_complete`. For example `p0.mail.send` with the exact recipient,
-subject and body. P0 tools cannot infer broad permission from a goal statement.
-Different arguments require a new approval. Existing broker grants, suspension,
-revocation and Gerald's mandatory approvals remain authoritative. Do not expose
-new host broker sockets or mount owner-wide control APIs to ordinary lanes.
-
-## Runtime and recovery
+## Recovery and boundaries
 
 ```sh
 systemctl --user status worklane-collab.service worklane-goal-runner.timer
 journalctl --user-unit worklane-collab.service
 ```
 
-Durable state is private SQLite under
-`~/.local/share/worklane/collab/messages.sqlite3`; the private lane-local socket is
-`~/.local/share/worklane/collab.sock`. No TCP listener or cross-lane relay exists.
-Run transcripts persist under `~/.pi/agent/sessions/worklane-runs`.
+State: `~/.local/share/worklane/collab/messages.sqlite3`; socket:
+`~/.local/share/worklane/collab.sock`; managed sessions:
+`~/.pi/agent/sessions/worklane-runs`. Stopped lanes do not wake themselves.
+Interrupted queued/running work becomes blocked and requires explicit retry.
+Cancellation stops owned scopes/children, never unrelated panes.
 
-The bounded extension requires provider retries disabled, cache warming off and
-automatic compaction disabled. Those features can issue invisible extra model
-requests; managed runs fail closed if settings re-enable them. Arbitrary custom
-extensions making their own nested model calls are not covered by this budget.
-Review custom loadouts before delegating work.
+Managed requests and automatic continuations require provider retries=0 and use
+scoped hooks to suppress cache warming and compaction for bounded accounting.
+Ordinary human-driven Pi uses normal resources/settings and may compact. Every account uses its own subscription
+OAuth; no silent API-key or OpenRouter fallback is permitted. Local complaints
+need no approval; forwarding externally is a separate authorized action.
+
+Same-UID is a workflow trust boundary, not a sandbox against malicious `dev`
+code. No owner-wide APIs, credential files or new host sockets belong in ordinary
+lanes. Live SSO/service/device proof is separate from source/contract tests.
