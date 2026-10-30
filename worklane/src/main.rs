@@ -513,8 +513,11 @@ fn host_timezone() -> Option<String> {
         .ok()
         .and_then(|link| timezone_from_localtime_link(&link))
 }
-fn absolute_environment_dir(name: &str) -> Result<Option<PathBuf>> {
-    let Some(value) = std::env::var_os(name) else {
+fn absolute_environment_value(
+    name: &str,
+    value: Option<&std::ffi::OsStr>,
+) -> Result<Option<PathBuf>> {
+    let Some(value) = value else {
         return Ok(None);
     };
     let path = PathBuf::from(value);
@@ -523,24 +526,26 @@ fn absolute_environment_dir(name: &str) -> Result<Option<PathBuf>> {
     }
     Ok(Some(path))
 }
-fn host_home() -> Result<PathBuf> {
-    absolute_environment_dir("HOME")?.context("HOME is not set; cannot locate host credentials")
+fn absolute_environment_dir(name: &str) -> Result<Option<PathBuf>> {
+    absolute_environment_value(name, std::env::var_os(name).as_deref())
 }
-fn credential_mounts(spec: &LaneSpec) -> Result<Vec<(&'static str, PathBuf, PathBuf)>> {
+fn credential_mounts_with(
+    spec: &LaneSpec,
+    env_dir: &impl Fn(&str) -> Result<Option<PathBuf>>,
+) -> Result<Vec<(&'static str, PathBuf, PathBuf)>> {
     if !spec.profile.mount_codex_credentials && !spec.profile.mount_gh_credentials {
         return Ok(Vec::new());
     }
-    let home = host_home()?;
+    let home = env_dir("HOME")?.context("HOME is not set; cannot locate host credentials")?;
     let mut mounts = Vec::new();
     if spec.profile.mount_codex_credentials {
-        let codex_home =
-            absolute_environment_dir("CODEX_HOME")?.unwrap_or_else(|| home.join(".codex"));
+        let codex_home = env_dir("CODEX_HOME")?.unwrap_or_else(|| home.join(".codex"));
         mounts.push(("Codex", codex_home, PathBuf::from(HOST_CODEX_MOUNT)));
     }
     if spec.profile.mount_gh_credentials {
-        let gh_config = if let Some(path) = absolute_environment_dir("GH_CONFIG_DIR")? {
+        let gh_config = if let Some(path) = env_dir("GH_CONFIG_DIR")? {
             path
-        } else if let Some(path) = absolute_environment_dir("XDG_CONFIG_HOME")? {
+        } else if let Some(path) = env_dir("XDG_CONFIG_HOME")? {
             path.join("gh")
         } else {
             home.join(".config/gh")
@@ -552,6 +557,9 @@ fn credential_mounts(spec: &LaneSpec) -> Result<Vec<(&'static str, PathBuf, Path
         ));
     }
     Ok(mounts)
+}
+fn credential_mounts(spec: &LaneSpec) -> Result<Vec<(&'static str, PathBuf, PathBuf)>> {
+    credential_mounts_with(spec, &absolute_environment_dir)
 }
 fn prepare_codex_auth_link(spec: &LaneSpec) -> Result<()> {
     use std::os::unix::fs::{symlink, PermissionsExt};
@@ -667,7 +675,12 @@ fn prepare_credential_mountpoint(
         Err(error) => Err(error.into()),
     }
 }
-fn export_gh_credentials(spec: &LaneSpec, source: &Path) -> Result<PathBuf> {
+fn export_gh_credentials_with(
+    spec: &LaneSpec,
+    source: &Path,
+    data_root: &Path,
+    token_for: &impl Fn(&str) -> Result<String>,
+) -> Result<PathBuf> {
     let status: serde_json::Value = serde_yaml::from_str(&fs::read_to_string(source)?)
         .with_context(|| format!("parse GitHub CLI credentials {}", source.display()))?;
     let hosts = status
@@ -687,21 +700,7 @@ fn export_gh_credentials(spec: &LaneSpec, source: &Path) -> Result<PathBuf> {
         let token = if let Some(token) = embedded_token {
             token
         } else {
-            let output = Command::new("gh")
-                .args(["auth", "token", "--hostname", hostname])
-                .output()
-                .with_context(|| {
-                    format!("read GitHub CLI credentials for {hostname} from the host keyring")
-                })?;
-            if !output.status.success() {
-                bail!(
-                    "GitHub CLI could not export credentials for {hostname} from {}: {}",
-                    source.display(),
-                    String::from_utf8_lossy(&output.stderr).trim()
-                )
-            }
-            resolved_token = String::from_utf8(output.stdout)
-                .context("GitHub CLI returned a non-UTF-8 authentication token")?;
+            resolved_token = token_for(hostname)?;
             resolved_token.trim()
         };
         if token.is_empty() {
@@ -727,7 +726,7 @@ fn export_gh_credentials(spec: &LaneSpec, source: &Path) -> Result<PathBuf> {
         )
     }
 
-    let directory = data_dir().join("credentials/gh");
+    let directory = data_root.join("credentials/gh");
     fs::create_dir_all(&directory)?;
     #[cfg(unix)]
     {
@@ -755,8 +754,31 @@ fn export_gh_credentials(spec: &LaneSpec, source: &Path) -> Result<PathBuf> {
     file.write_all(b"\n")?;
     Ok(destination)
 }
-fn append_credential_mounts(args: &mut Vec<String>, spec: &LaneSpec) -> Result<()> {
-    let mounts = credential_mounts(spec)?;
+fn export_gh_credentials(spec: &LaneSpec, source: &Path) -> Result<PathBuf> {
+    export_gh_credentials_with(spec, source, &data_dir(), &|hostname| {
+        let output = Command::new("gh")
+            .args(["auth", "token", "--hostname", hostname])
+            .output()
+            .with_context(|| {
+                format!("read GitHub CLI credentials for {hostname} from the host keyring")
+            })?;
+        if !output.status.success() {
+            bail!(
+                "GitHub CLI could not export credentials for {hostname} from {}: {}",
+                source.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )
+        }
+        String::from_utf8(output.stdout)
+            .context("GitHub CLI returned a non-UTF-8 authentication token")
+    })
+}
+fn append_credential_mounts_with(
+    args: &mut Vec<String>,
+    spec: &LaneSpec,
+    mounts: Vec<(&'static str, PathBuf, PathBuf)>,
+    export_gh: &impl Fn(&LaneSpec, &Path) -> Result<PathBuf>,
+) -> Result<()> {
     if !mounts.is_empty() {
         report_phase(
             Some((&spec.id, &spec.name)),
@@ -807,7 +829,7 @@ fn append_credential_mounts(args: &mut Vec<String>, spec: &LaneSpec) -> Result<(
             )
         }
         if tool == "GitHub CLI" {
-            source = export_gh_credentials(spec, &source)?;
+            source = export_gh(spec, &source)?;
         }
         if tool != "Codex" && !prepare_credential_mountpoint(spec, tool, &source, &target)? {
             continue;
@@ -822,6 +844,9 @@ fn append_credential_mounts(args: &mut Vec<String>, spec: &LaneSpec) -> Result<(
         ]);
     }
     Ok(())
+}
+fn append_credential_mounts(args: &mut Vec<String>, spec: &LaneSpec) -> Result<()> {
+    append_credential_mounts_with(args, spec, credential_mounts(spec)?, &export_gh_credentials)
 }
 fn create_local_container<R: Runner>(r: &R, spec: &LaneSpec, name: &str) -> Result<()> {
     let mut credential_args = Vec::new();
@@ -1107,12 +1132,19 @@ fn apply_local_upgrade<R: Runner>(
         podman(r, ["rename", &canonical, &previous])?;
     }
     if let Err(error) = podman(r, ["rename", &staging, &canonical]) {
+        // A failed promotion leaves the already-started replacement at .next.
+        // Never restart the previous lane beside that candidate. If quiescing
+        // or restoring fails, retain the helpers and fail closed for reconcile.
+        stop_owned_container(r, &staging, spec)
+            .context("stop staged upgrade candidate after promotion failure")?;
         if container_runtime_state(r, &previous)? != "absent"
             && container_runtime_state(r, &canonical)? == "absent"
         {
-            let _ = podman(r, ["rename", &previous, &canonical]);
+            podman(r, ["rename", &previous, &canonical])
+                .context("restore previous container after promotion failure")?;
             if runtime_was_running {
-                let _ = podman(r, ["start", &canonical]);
+                podman(r, ["start", &canonical])
+                    .context("restart previous container after promotion failure")?;
             }
         }
         return Err(error);
@@ -3635,6 +3667,227 @@ mod tests {
     }
 
     #[test]
+    fn credential_selection_is_absolute_scoped_and_disabled_without_mounts() {
+        use std::ffi::OsStr;
+        assert!(absolute_environment_value("CODEX_HOME", None)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            absolute_environment_value("HOME", Some(OsStr::new("/private/host"))).unwrap(),
+            Some(PathBuf::from("/private/host"))
+        );
+        assert!(
+            absolute_environment_value("GH_CONFIG_DIR", Some(OsStr::new("relative/config")))
+                .unwrap_err()
+                .to_string()
+                .contains("absolute path")
+        );
+        let mut lane = spec("local");
+        let fail_env =
+            |_name: &str| -> Result<Option<PathBuf>> { bail!("must not read host environment") };
+        assert!(credential_mounts_with(&lane, &fail_env).unwrap().is_empty());
+        lane.profile.terminal_backend = TerminalBackend::TuiosV3;
+        lane.profile.agent = AgentKind::Pi;
+        lane.profile.mount_codex_credentials = true;
+        lane.profile.mount_gh_credentials = true;
+        let env = |name: &str| -> Result<Option<PathBuf>> {
+            Ok(match name {
+                "HOME" => Some(PathBuf::from("/private/host")),
+                "CODEX_HOME" => Some(PathBuf::from("/private/auth/codex")),
+                "GH_CONFIG_DIR" => Some(PathBuf::from("/private/auth/gh")),
+                "XDG_CONFIG_HOME" => panic!("GH_CONFIG_DIR takes precedence"),
+                _ => panic!("unexpected environment lookup"),
+            })
+        };
+        let mounts = credential_mounts_with(&lane, &env).unwrap();
+        assert_eq!(mounts.len(), 2);
+        assert_eq!(mounts[0].1, PathBuf::from("/private/auth/codex"));
+        assert_eq!(mounts[0].2, PathBuf::from(HOST_CODEX_MOUNT));
+        assert_eq!(mounts[1].1, PathBuf::from("/private/auth/gh/hosts.yml"));
+        assert_eq!(mounts[1].2, PathBuf::from("/home/dev/.config/gh/hosts.yml"));
+        lane.profile.mount_codex_credentials = false;
+        let xdg = |name: &str| -> Result<Option<PathBuf>> {
+            Ok(match name {
+                "HOME" => Some(PathBuf::from("/private/host")),
+                "XDG_CONFIG_HOME" => Some(PathBuf::from("/private/xdg")),
+                _ => None,
+            })
+        };
+        assert_eq!(
+            credential_mounts_with(&lane, &xdg).unwrap()[0].1,
+            PathBuf::from("/private/xdg/gh/hosts.yml")
+        );
+        let home_only = |name: &str| Ok((name == "HOME").then(|| PathBuf::from("/private/host")));
+        assert_eq!(
+            credential_mounts_with(&lane, &home_only).unwrap()[0].1,
+            PathBuf::from("/private/host/.config/gh/hosts.yml")
+        );
+        assert!(credential_mounts_with(&lane, &fail_env).is_err());
+    }
+
+    #[test]
+    fn gh_credential_export_uses_private_source_and_never_reads_host_keyring_unless_needed() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("../target/tmp/gh-fixture-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.yml");
+        let lane = spec("local");
+        std::fs::write(&source, "github.com:\n  user: fixture\n  git_protocol: ssh\n  users:\n    fixture:\n      oauth_token: fixture-only-token\n").unwrap();
+        let output = export_gh_credentials_with(&lane, &source, &root, &|_| {
+            panic!("embedded token must not query any keyring")
+        })
+        .unwrap();
+        assert_eq!(
+            output,
+            root.join(format!("credentials/gh/{}.hosts.yml", lane.id))
+        );
+        assert_eq!(
+            std::fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(output.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        let exported: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
+        assert_eq!(exported["github.com"]["user"], "fixture");
+        assert_eq!(exported["github.com"]["git_protocol"], "ssh");
+        assert_eq!(
+            exported["github.com"]["users"]["fixture"]["oauth_token"],
+            "fixture-only-token"
+        );
+
+        std::fs::write(&source, "github.com:\n  user: fixture\n").unwrap();
+        let keyring = |hostname: &str| {
+            assert_eq!(hostname, "github.com");
+            Ok("fixture-keyring-token\n".to_owned())
+        };
+        export_gh_credentials_with(&lane, &source, &root, &keyring).unwrap();
+        let exported: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
+        assert_eq!(
+            exported["github.com"]["oauth_token"],
+            "fixture-keyring-token"
+        );
+        assert_eq!(exported["github.com"]["git_protocol"], "https");
+        assert!(
+            export_gh_credentials_with(&lane, &source, &root, &|_| Ok("  \n".into()))
+                .unwrap_err()
+                .to_string()
+                .contains("empty authentication token")
+        );
+        assert!(
+            export_gh_credentials_with(&lane, &source, &root, &|_| bail!(
+                "fixture keyring refused"
+            ))
+            .unwrap_err()
+            .to_string()
+            .contains("fixture keyring refused")
+        );
+        for (document, error) in [
+            ("github.com:\n  users: {}\n", "no login"),
+            ("{}", "no active authenticated account"),
+            ("not: [valid: yaml", "parse GitHub CLI credentials"),
+        ] {
+            std::fs::write(&source, document).unwrap();
+            assert!(export_gh_credentials_with(&lane, &source, &root, &keyring)
+                .unwrap_err()
+                .to_string()
+                .contains(error));
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn credential_mounts_preserve_private_data_and_explicit_read_write_boundaries() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../target/tmp/credential-mount-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut lane = spec("local");
+        lane.project_path = root.join("lane");
+        std::fs::create_dir_all(&lane.project_path).unwrap();
+        let codex = root.join("host-codex");
+        std::fs::create_dir_all(&codex).unwrap();
+        std::fs::write(codex.join("auth.json"), "{\"fixture\":true}\n").unwrap();
+        let gh = root.join("host-gh/hosts.yml");
+        std::fs::create_dir_all(gh.parent().unwrap()).unwrap();
+        std::fs::write(
+            &gh,
+            "github.com:\n  user: fixture\n  oauth_token: fixture-token\n",
+        )
+        .unwrap();
+        let mounts = || {
+            vec![
+                ("Codex", codex.clone(), PathBuf::from(HOST_CODEX_MOUNT)),
+                (
+                    "GitHub CLI",
+                    gh.clone(),
+                    lane.container_home().join(".config/gh/hosts.yml"),
+                ),
+            ]
+        };
+        let export = |spec: &LaneSpec, source: &Path| {
+            export_gh_credentials_with(spec, source, &root.join("data"), &|_| {
+                panic!("fixture has embedded token")
+            })
+        };
+        let mut args = vec![];
+        append_credential_mounts_with(&mut args, &lane, mounts(), &export).unwrap();
+        assert_eq!(args.len(), 4);
+        assert!(args[1].contains("dst=/run/worklane-host-codex,ro=true"));
+        assert!(args[3].contains("dst=/home/dev/.config/gh/hosts.yml,rw=true"));
+        let link = lane.project_path.join(".codex/auth.json");
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            PathBuf::from("/run/worklane-host-codex/auth.json")
+        );
+        let mountpoint = lane.project_path.join(".config/gh/hosts.yml");
+        assert_eq!(std::fs::metadata(&mountpoint).unwrap().len(), 0);
+        assert_eq!(
+            std::fs::metadata(&mountpoint).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::write(&mountpoint, b"private existing user config").unwrap();
+        let mut rejected_args = vec![];
+        assert!(
+            append_credential_mounts_with(&mut rejected_args, &lane, mounts(), &export)
+                .unwrap_err()
+                .to_string()
+                .contains("refusing to hide existing GitHub CLI credential data")
+        );
+        assert_eq!(
+            std::fs::read(&mountpoint).unwrap(),
+            b"private existing user config"
+        );
+        assert!(rejected_args.iter().any(|arg| arg.contains("ro=true"))); // Codex was prepared first.
+        assert!(!rejected_args.iter().any(|arg| arg.contains("rw=true")));
+        let mut missing_args = vec![];
+        assert!(append_credential_mounts_with(
+            &mut missing_args,
+            &lane,
+            vec![(
+                "Codex",
+                root.join("missing-codex"),
+                PathBuf::from(HOST_CODEX_MOUNT)
+            )],
+            &export,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("credentials were not found"));
+        assert!(missing_args.is_empty());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn attached_local_pty_command_keeps_selected_session_and_never_crosses_backends() {
         let mut legacy = spec("local");
         legacy.name = "new-display-name".into();
@@ -4163,6 +4416,66 @@ esac
         );
         assert!(store.index(&delete.id).is_err());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn private_v3_journal_blocks_lifecycle_and_replays_only_verified_manifest() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../target/tmp/v3-journal-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(root.join("registry.db")).unwrap();
+        let mut lane = spec("local");
+        lane.project_path = root.join("lane");
+        lane.profile.terminal_backend = TerminalBackend::TuiosV3;
+        lane.profile.agent = AgentKind::Pi;
+        lane.profile.embedded_containerfile = false;
+        std::fs::create_dir_all(&lane.project_path).unwrap();
+        store.save_lane(&lane, "stopped", true).unwrap();
+        let mut journal = OperationJournal::new(&lane, "create", "prepared").unwrap();
+        write_operation_journal(&lane, &journal).unwrap();
+        for verb in ["start", "stop", "open", "attach"] {
+            let err = ensure_no_pending_operation(&lane, verb)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(verb) && err.contains("create") && err.contains("prepared"),
+                "{err}"
+            );
+        }
+        let status = refresh_state_only(&RuntimeStateRunner("exited"), &store, &lane).unwrap();
+        assert_eq!(status.state, "exited");
+        assert!(status.drift); // A fast refresh must not silently clear cached drift.
+        assert_eq!(store.index(&lane.id).unwrap().state, "exited");
+        let dry = reconcile_local(
+            &RuntimeStateRunner("exited"),
+            &store,
+            &store.index(&lane.id).unwrap(),
+            false,
+        )
+        .unwrap();
+        assert!(dry.changes.is_empty());
+        assert!(!lane.manifest_path().exists());
+        journal.phase = "runtime-applied".into();
+        write_operation_journal(&lane, &journal).unwrap();
+        let applied = reconcile_local(
+            &RuntimeStateRunner("exited"),
+            &store,
+            &store.index(&lane.id).unwrap(),
+            true,
+        )
+        .unwrap();
+        assert!(applied.changes.contains(&"completed create commit".into()));
+        assert_eq!(
+            store.lane(&lane.id).unwrap().profile.terminal_backend,
+            TerminalBackend::TuiosV3
+        );
+        assert!(read_operation_journal(&lane).unwrap().is_none());
+        ensure_no_pending_operation(&lane, "start").unwrap();
+        assert_eq!(store.index(&lane.id).unwrap().state, "exited");
+        assert!(store.index(&lane.id).unwrap().drift);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -5026,6 +5339,106 @@ CMD ["sleep", "infinity"]
             .unwrap_err()
             .to_string();
         assert!(error.contains("no canonical or staged replacement"));
+    }
+
+    #[test]
+    fn failed_upgrade_quiesces_candidate_before_restarting_original_lane() {
+        let mut lane = spec("local");
+        let canonical = lane.container_name();
+        let staging = format!("{canonical}.next");
+        let previous = format!("{canonical}.previous");
+        lane.profile.runtime = RuntimeMode::Systemd;
+        let failed_candidate = UpgradeStateRunner::new(
+            &lane,
+            [
+                (canonical.clone(), "running".into()),
+                (staging.clone(), "exited".into()),
+            ],
+        );
+        let error = apply_local_upgrade(&failed_candidate, &lane, true).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("staged upgrade container did not reach running state"));
+        assert_eq!(
+            failed_candidate.state(&canonical).as_deref(),
+            Some("running")
+        );
+        assert_eq!(failed_candidate.state(&staging), None);
+        assert_eq!(failed_candidate.state(&previous), None);
+
+        struct PromotionFailure {
+            inner: UpgradeStateRunner,
+            events: Mutex<Vec<String>>,
+            staging: String,
+            canonical: String,
+            reject_staging_stop: bool,
+        }
+        impl Runner for PromotionFailure {
+            fn run(&self, program: &str, args: &[String]) -> Result<String> {
+                if program == "podman" {
+                    self.events.lock().unwrap().push(args.join(" "));
+                    if args.first().is_some_and(|a| a == "rename")
+                        && args.get(1) == Some(&self.staging)
+                        && args.get(2) == Some(&self.canonical)
+                    {
+                        bail!("fixture promotion failed");
+                    }
+                    if self.reject_staging_stop
+                        && args.first().is_some_and(|a| a == "stop")
+                        && args.get(1) == Some(&self.staging)
+                    {
+                        bail!("fixture cannot quiesce staged container");
+                    }
+                }
+                self.inner.run(program, args)
+            }
+            fn run_output(&self, program: &str, args: &[String]) -> Result<ProcessOutput> {
+                self.inner.run_output(program, args)
+            }
+        }
+        lane.profile.runtime = RuntimeMode::PodmanInit;
+        let make_runner = |reject_staging_stop| PromotionFailure {
+            inner: UpgradeStateRunner::new(
+                &lane,
+                [
+                    (canonical.clone(), "running".into()),
+                    (staging.clone(), "running".into()),
+                ],
+            ),
+            events: Mutex::new(vec![]),
+            staging: staging.clone(),
+            canonical: canonical.clone(),
+            reject_staging_stop,
+        };
+        let failed = make_runner(false);
+        assert!(apply_local_upgrade(&failed, &lane, true).is_err());
+        assert_eq!(failed.inner.state(&canonical).as_deref(), Some("running"));
+        assert_ne!(
+            failed.inner.state(&staging).as_deref(),
+            Some("running"),
+            "a failed candidate must not run beside the restored lane"
+        );
+        assert_eq!(failed.inner.state(&previous), None);
+        let events = failed.events.lock().unwrap();
+        let stop_candidate = events.iter().position(|e| e == &format!("stop {staging}"));
+        let restart_original = events
+            .iter()
+            .position(|e| e == &format!("start {canonical}"));
+        assert!(
+            stop_candidate.is_some()
+                && restart_original.is_some()
+                && stop_candidate < restart_original
+        );
+        drop(events);
+
+        let unquiesced = make_runner(true);
+        assert!(apply_local_upgrade(&unquiesced, &lane, true).is_err());
+        assert_ne!(
+            unquiesced.inner.state(&canonical).as_deref(),
+            Some("running"),
+            "do not restart the original while the staged candidate still runs"
+        );
+        assert_eq!(unquiesced.inner.state(&staging).as_deref(), Some("running"));
     }
 
     #[test]
