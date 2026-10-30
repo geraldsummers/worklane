@@ -178,8 +178,15 @@ esac
     assert!(opened.contains("\"name\":\"tuios-test\""), "{opened}");
     let log = fs::read_to_string(podman.with_extension("log")).unwrap();
     assert!(log.contains("tuios new"));
+    assert!(log.contains("tuios integration install pi --no-skill"));
+    assert!(log.contains(" install -d -m 0700 -o "));
     assert!(log.contains("tuios session-info -s tuios-test --json"));
     assert!(!log.to_lowercase().contains("herdr"));
+    let upgrade_error = run_failure(binary, &data, &bin, &["lane", "upgrade", "tuios-test"]);
+    assert!(upgrade_error.contains("refusing the legacy image rebuild path"));
+    assert!(!fs::read_to_string(podman.with_extension("log"))
+        .unwrap()
+        .contains("build"));
 
     fs::write(podman.with_extension("log"), "").unwrap();
     assert!(run(binary, &data, &bin, &["lane", "attach", "tuios-test"]).is_empty());

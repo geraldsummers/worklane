@@ -426,6 +426,9 @@ fn effective_build_context(spec: &LaneSpec) -> &Path {
         .unwrap_or(&spec.project_path)
 }
 fn build_local_image<R: Runner>(r: &R, spec: &LaneSpec, no_cache: bool) -> Result<()> {
+    if spec.profile.terminal_backend == TerminalBackend::TuiosV3 {
+        bail!("tuios-v3 requires a prebuilt verified TUIOS image; refusing to build a legacy image")
+    }
     let (file, context) = if spec.profile.embedded_containerfile {
         (None, standard_build_context()?)
     } else {
@@ -824,6 +827,9 @@ fn create_local_container<R: Runner>(r: &R, spec: &LaneSpec, name: &str) -> Resu
     let mut credential_args = Vec::new();
     append_credential_mounts(&mut credential_args, spec)?;
     if !image_exists(r, &spec.profile.image)? {
+        if spec.profile.terminal_backend == TerminalBackend::TuiosV3 {
+            bail!("tuios-v3 requires a prebuilt verified TUIOS image in the selected Podman store")
+        }
         build_local_image(r, spec, false)?;
     }
     fs::create_dir_all(&spec.project_path)?;
@@ -1474,6 +1480,13 @@ fn validate_tuios_image(spec: &LaneSpec) -> Result<()> {
 fn bootstrap_tuios_script() -> &'static str {
     r#"set -eu
 command -v tuios >/dev/null || { echo 'tuios-v3 image is missing tuios' >&2; exit 1; }
+command -v pi >/dev/null || { echo 'tuios-v3 image is missing pi' >&2; exit 1; }
+# /home/dev is a bind mount: image-time Pi hooks are hidden by the lane home.
+# Install the native hook in this lane's private Pi directory, not on the host.
+mkdir -p "$HOME/.pi/agent"
+chmod 0700 "$HOME/.pi/agent"
+tuios integration install pi --no-skill --command "$(command -v tuios)"
+test -f "$HOME/.pi/agent/extensions/tuios-agent-state.ts"
 session="${WORKLANE_SESSION:?missing session}"
 workspace="${WORKLANE_WORKSPACE:?missing workspace}"
 if ! tuios session-info -s "$session" --json >/dev/null 2>&1; then
@@ -1487,7 +1500,35 @@ tuios list-windows -s "$session" --json >/dev/null
 
 fn bootstrap_tuios(spec: &LaneSpec) -> Result<()> {
     validate_tuios_image(spec)?;
-    let (_, uid, _) = current_identity(&SystemRunner)?;
+    let (_, uid, gid) = current_identity(&SystemRunner)?;
+    if spec.profile.effective_runtime() == RuntimeMode::PodmanInit {
+        // Podman-init has no user-runtime-dir service. /run is already a
+        // container-private tmpfs; provision the daemon socket directory there.
+        let output = Command::new("podman")
+            .args([
+                "exec",
+                "--user",
+                "0",
+                &spec.container_name(),
+                "install",
+                "-d",
+                "-m",
+                "0700",
+                "-o",
+                &uid,
+                "-g",
+                &gid,
+                &format!("/run/user/{uid}"),
+            ])
+            .output()
+            .context("prepare private TUIOS runtime directory")?;
+        if !output.status.success() {
+            bail!(
+                "TUIOS runtime directory bootstrap failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )
+        }
+    }
     let mut args = vec![
         "exec".into(),
         "--user".into(),
@@ -2719,6 +2760,12 @@ fn main() -> Result<()> {
                     } else {
                         vec![store.lane(&lane.context("provide a lane or --all")?)?]
                     };
+                    if specs
+                        .iter()
+                        .any(|spec| spec.profile.terminal_backend == TerminalBackend::TuiosV3)
+                    {
+                        bail!("tuios-v3 lane upgrade requires a separately verified pinned image; refusing the legacy image rebuild path")
+                    }
                     report_phase(
                         None,
                         "running",
@@ -3248,6 +3295,21 @@ mod tests {
 
     #[test]
     fn v3_image_pins_verified_tuios_and_pi_without_herdr() {
+        let fixture: worklane_core::ProfilesFile = toml::from_str(include_str!(
+            "../../tests/fixtures/tuios-v3-private-profiles.toml"
+        ))
+        .unwrap();
+        let profile = &fixture.profiles["v3-private"];
+        assert_eq!(
+            profile.image,
+            "localhost/worklane-v3@sha256:f57a3f3e6d3aa9141751754e91d3dd4ac1dc896958b1e873dd41c0eb9d6de1fa"
+        );
+        assert_eq!(profile.agent, AgentKind::Pi);
+        assert_eq!(profile.terminal_backend, TerminalBackend::TuiosV3);
+        assert_eq!(profile.effective_runtime(), RuntimeMode::PodmanInit);
+        assert_eq!(profile.network, "none");
+        assert!(!profile.mount_codex_credentials && !profile.mount_gh_credentials);
+        worklane_core::validate_profile(profile, Path::new("/home/dev"), false).unwrap();
         let image = include_str!("../../Containerfile.v3");
         for expected in [
             "FROM --platform=linux/amd64 docker.io/library/debian@sha256:1e1a22175fbf1b32157ddaf0219e1db4e5401fab2b94ed285add64d18587cd2d",
@@ -3305,6 +3367,7 @@ mod tests {
         validate_tuios_image(&selected).unwrap();
         let script = bootstrap_tuios_script();
         assert!(script.contains("tuios new \"$session\" --detach --cwd \"$workspace\""));
+        assert!(script.contains("tuios integration install pi --no-skill"));
         assert!(script.contains("tuios session-info -s \"$session\" --json"));
         assert!(script.contains("tuios list-windows -s \"$session\" --json"));
         assert!(!script.contains("herdr"));
@@ -3325,6 +3388,7 @@ mod tests {
             r#"#!/bin/sh
 printf '%s\n' "$*" >> "$HOME/tuios.log"
 case "$1" in
+  integration) mkdir -p "$HOME/.pi/agent/extensions"; : > "$HOME/.pi/agent/extensions/tuios-agent-state.ts" ;;
   session-info) test -e "$HOME/created" ;;
   new) test ! -e "$HOME/fail-new" || exit 2; : > "$HOME/created" ;;
   list-windows) test -e "$HOME/created" ;;
@@ -3334,11 +3398,14 @@ esac
         )
         .unwrap();
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        let pi = bin.join("pi");
+        fs::write(&pi, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&pi, fs::Permissions::from_mode(0o755)).unwrap();
         let run = || {
             Command::new("/bin/sh")
                 .args(["-c", bootstrap_tuios_script()])
                 .env("HOME", &root)
-                .env("PATH", &bin)
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
                 .env("WORKLANE_SESSION", "test-v3")
                 .env("WORKLANE_WORKSPACE", &root)
                 .output()
@@ -3349,6 +3416,14 @@ esac
         let calls = fs::read_to_string(root.join("tuios.log")).unwrap();
         assert_eq!(calls.matches("new test-v3 --detach --cwd").count(), 1);
         assert_eq!(calls.matches("list-windows -s test-v3 --json").count(), 2);
+        assert_eq!(
+            calls.matches("integration install pi --no-skill").count(),
+            2
+        );
+        fs::remove_file(&pi).unwrap();
+        assert!(!run().status.success()); // Never launch a v3 session without Pi.
+        fs::write(&pi, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&pi, fs::Permissions::from_mode(0o755)).unwrap();
         fs::remove_file(root.join("created")).unwrap();
         fs::write(root.join("fail-new"), "").unwrap();
         assert!(!run().status.success());
@@ -4453,6 +4528,27 @@ CMD ["sleep", "infinity"]
             .unwrap()
             .iter()
             .any(|args| args.first() == Some(&"build".into())));
+    }
+
+    #[test]
+    fn v3_missing_image_and_build_fail_before_legacy_image_fallback() {
+        let runner = MissingImageRunner {
+            calls: Mutex::new(vec![]),
+        };
+        let mut lane = spec("local");
+        lane.profile.embedded_containerfile = false;
+        lane.profile.terminal_backend = TerminalBackend::TuiosV3;
+        lane.profile.agent = AgentKind::Pi;
+        lane.profile.mount_codex_credentials = false;
+        let err = ensure_local_started(&runner, &lane)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("prebuilt verified TUIOS image"), "{err}");
+        assert!(build_local_image(&runner, &lane, false).is_err());
+        let calls = runner.calls.lock().unwrap();
+        assert!(!calls
+            .iter()
+            .any(|args| args.first().is_some_and(|arg| arg == "build")));
     }
 
     #[test]

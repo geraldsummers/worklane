@@ -1,0 +1,11 @@
+# Test-only: make this visible ONLY under an isolated XDG_CONFIG_HOME.
+# The tag exists in the dedicated target/v3-build Podman store, not live Podman.
+[profiles.v3-private]
+image = "localhost/worklane-v3@sha256:f57a3f3e6d3aa9141751754e91d3dd4ac1dc896958b1e873dd41c0eb9d6de1fa"
+agent = "pi"
+terminal_backend = "tuios-v3"
+embedded_containerfile = false
+runtime = "podman-init"
+network = "none"
+mount_codex_credentials = false
+mount_gh_credentials = false
