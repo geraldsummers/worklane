@@ -1064,6 +1064,17 @@ fn stop_owned_container<R: Runner>(r: &R, name: &str, spec: &LaneSpec) -> Result
         ),
     }
 }
+fn stop_local_lane(r: &impl Runner, spec: &LaneSpec) -> Result<()> {
+    let canonical = spec.container_name();
+    for name in [
+        canonical.clone(),
+        format!("{canonical}.next"),
+        format!("{canonical}.previous"),
+    ] {
+        stop_owned_container(r, &name, spec)?;
+    }
+    Ok(())
+}
 fn apply_local_upgrade<R: Runner>(
     r: &R,
     spec: &LaneSpec,
@@ -1161,6 +1172,36 @@ fn apply_local_upgrade<R: Runner>(
         bail!("upgraded canonical container is '{actual}', expected {expected}; run lane reconcile")
     }
     Ok((container_runtime_state(r, &previous)? != "absent").then_some(previous))
+}
+fn advance_local_upgrade(
+    r: &impl Runner,
+    spec: &LaneSpec,
+    journal: &mut OperationJournal,
+) -> Result<()> {
+    if journal.kind != "upgrade"
+        || journal.lane_id != spec.id
+        || journal.desired_manifest_sha256 != manifest_sha256(spec)?
+    {
+        bail!("upgrade journal does not match the selected lane and desired manifest")
+    }
+    write_operation_journal(spec, journal)?;
+    report_phase(
+        Some((&spec.id, &spec.name)),
+        "running",
+        "switching-container",
+        "validating and swapping the staged container",
+    );
+    match journal.phase.as_str() {
+        "prepared" => {
+            apply_local_upgrade(r, spec, journal.runtime_was_running.unwrap_or(true))?;
+            journal.phase = "runtime-applied".into();
+            journal.updated_at = Utc::now();
+            write_operation_journal(spec, journal)?;
+        }
+        "runtime-applied" => {} // Replaying must not start a second candidate.
+        other => bail!("cannot commit upgrade journal at unexpected phase '{other}'"),
+    }
+    write_lane_spec(spec)
 }
 fn cleanup_local_upgrade_helpers<R: Runner>(r: &R, spec: &LaneSpec) -> Result<()> {
     let canonical = spec.container_name();
@@ -1300,6 +1341,45 @@ fn ensure_no_pending_operation(spec: &LaneSpec, verb: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+fn create_local_lane(
+    runner: &impl Runner,
+    store: &Store,
+    spec: &LaneSpec,
+    pending: Option<OperationJournal>,
+) -> Result<()> {
+    validate_tuios_image(spec)?;
+    let _lock = lock_lane_operation(spec)?;
+    let mut journal = match pending {
+        Some(journal) => journal,
+        None => OperationJournal::new(spec, "create", "prepared")?,
+    };
+    if journal.kind != "create"
+        || journal.lane_id != spec.id
+        || journal.desired_manifest_sha256 != manifest_sha256(spec)?
+    {
+        bail!("create journal does not match the selected lane and desired manifest")
+    }
+    write_operation_journal(spec, &journal)?;
+    report_phase(
+        Some((&spec.id, &spec.name)),
+        "running",
+        "preparing-container",
+        "ensuring the lane container is running",
+    );
+    ensure_local_started(runner, spec)?;
+    journal.phase = "runtime-applied".into();
+    journal.updated_at = Utc::now();
+    write_operation_journal(spec, &journal)?;
+    write_lane_spec(spec)?;
+    report_phase(
+        Some((&spec.id, &spec.name)),
+        "running",
+        "updating-index",
+        "committing the registry projection",
+    );
+    store.save_lane(spec, "created", false)?;
+    clear_operation_journal(spec)
 }
 fn refresh_all<R: Runner>(runner: &R, store: &Store) -> Result<Vec<LaneStatus>> {
     let specs = store
@@ -2514,29 +2594,7 @@ fn main() -> Result<()> {
                     validate_profile(&spec.profile, &spec.container_home(), spec.host == "local")?;
                     validate_lane_registration(&store, &spec)?;
                     if spec.host == "local" {
-                        let _lock = lock_lane_operation(&spec)?;
-                        let mut journal =
-                            pending.unwrap_or(OperationJournal::new(&spec, "create", "prepared")?);
-                        write_operation_journal(&spec, &journal)?;
-                        report_phase(
-                            Some((&spec.id, &spec.name)),
-                            "running",
-                            "preparing-container",
-                            "ensuring the lane container is running",
-                        );
-                        ensure_local_started(&runner, &spec)?;
-                        journal.phase = "runtime-applied".into();
-                        journal.updated_at = Utc::now();
-                        write_operation_journal(&spec, &journal)?;
-                        write_lane_spec(&spec)?;
-                        report_phase(
-                            Some((&spec.id, &spec.name)),
-                            "running",
-                            "updating-index",
-                            "committing the registry projection",
-                        );
-                        store.save_lane(&spec, "created", false)?;
-                        clear_operation_journal(&spec)?;
+                        create_local_lane(&runner, &store, &spec, pending)?;
                     } else {
                         report_phase(
                             Some((&spec.id, &spec.name)),
@@ -2792,10 +2850,7 @@ fn main() -> Result<()> {
                     )?
                     .is_none()
                     {
-                        let canonical = s.container_name();
-                        stop_owned_container(&runner, &canonical, &s)?;
-                        stop_owned_container(&runner, &format!("{canonical}.next"), &s)?;
-                        stop_owned_container(&runner, &format!("{canonical}.previous"), &s)?;
+                        stop_local_lane(&runner, &s)?;
                     };
                     emit(cli.json, &refresh(&runner, &store, &s)?)
                 }
@@ -2984,21 +3039,8 @@ fn main() -> Result<()> {
                                     journal
                                 }
                             };
-                            write_operation_journal(&s, &journal)?;
-                            report_phase(
-                                Some((&s.id, &s.name)),
-                                "running",
-                                "switching-container",
-                                "validating and swapping the staged container",
-                            );
+                            advance_local_upgrade(&runner, &s, &mut journal)?;
                             let runtime_was_running = journal.runtime_was_running.unwrap_or(true);
-                            if journal.phase == "prepared" {
-                                apply_local_upgrade(&runner, &s, runtime_was_running)?;
-                                journal.phase = "runtime-applied".into();
-                                journal.updated_at = Utc::now();
-                                write_operation_journal(&s, &journal)?;
-                            }
-                            write_lane_spec(&s)?;
                             out.push(serde_json::to_value(refresh(&runner, &store, &s)?)?);
                             finalize_local_upgrade_runtime(&runner, &s, runtime_was_running)?;
                             clear_operation_journal(&s)?;
@@ -4419,6 +4461,80 @@ esac
     }
 
     #[test]
+    fn v3_create_failure_persists_prepared_journal_and_retry_commits_once() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../target/tmp/v3-create-retry-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(root.join("registry.db")).unwrap();
+        let mut lane = spec("local");
+        lane.project_path = root.join("lane");
+        lane.profile.terminal_backend = TerminalBackend::TuiosV3;
+        lane.profile.agent = AgentKind::Pi;
+        lane.profile.embedded_containerfile = false;
+        std::fs::create_dir_all(&lane.project_path).unwrap();
+        struct RefuseStart;
+        impl Runner for RefuseStart {
+            fn run(&self, program: &str, args: &[String]) -> Result<String> {
+                assert_eq!(program, "podman");
+                match args.first().map(String::as_str) {
+                    Some("inspect") => Ok("exited".into()),
+                    Some("start") => bail!("private fixture refused container start"),
+                    command => panic!("unexpected container command: {command:?}"),
+                }
+            }
+            fn run_output(&self, program: &str, args: &[String]) -> Result<ProcessOutput> {
+                assert_eq!(
+                    (program, args.first().map(String::as_str)),
+                    ("podman", Some("container"))
+                );
+                Ok(ProcessOutput {
+                    code: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+        }
+        assert!(create_local_lane(&RefuseStart, &store, &lane, None)
+            .unwrap_err()
+            .to_string()
+            .contains("refused container start"));
+        assert!(!lane.manifest_path().exists());
+        assert!(store.index(&lane.id).is_err());
+        let journal = read_operation_journal(&lane).unwrap().unwrap();
+        assert_eq!(journal.phase, "prepared");
+        let mut foreign = journal.clone();
+        foreign.kind = "upgrade".into();
+        assert!(
+            create_local_lane(&MockRunner::new(), &store, &lane, Some(foreign))
+                .unwrap_err()
+                .to_string()
+                .contains("does not match")
+        );
+        assert_eq!(
+            read_operation_journal(&lane).unwrap().unwrap().operation_id,
+            journal.operation_id
+        );
+        let mut incompatible = lane.clone();
+        incompatible.profile.agent = AgentKind::Codex;
+        assert!(
+            create_local_lane(&MockRunner::new(), &store, &incompatible, None)
+                .unwrap_err()
+                .to_string()
+                .contains("requires Pi")
+        );
+        create_local_lane(&MockRunner::new(), &store, &lane, Some(journal)).unwrap();
+        assert!(read_operation_journal(&lane).unwrap().is_none());
+        assert_eq!(store.index(&lane.id).unwrap().state, "created");
+        assert_eq!(
+            store.lane(&lane.id).unwrap().profile.terminal_backend,
+            TerminalBackend::TuiosV3
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn private_v3_journal_blocks_lifecycle_and_replays_only_verified_manifest() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
             "../target/tmp/v3-journal-test-{}",
@@ -5339,6 +5455,117 @@ CMD ["sleep", "infinity"]
             .unwrap_err()
             .to_string();
         assert!(error.contains("no canonical or staged replacement"));
+    }
+
+    #[test]
+    fn stopping_local_lane_handles_all_owned_helpers_and_stops_on_failure() {
+        let lane = spec("local");
+        let canonical = lane.container_name();
+        let next = format!("{canonical}.next");
+        let previous = format!("{canonical}.previous");
+        let states = || {
+            [
+                (canonical.clone(), "running".into()),
+                (next.clone(), "running".into()),
+                (previous.clone(), "exited".into()),
+            ]
+        };
+        let runner = UpgradeStateRunner::new(&lane, states());
+        stop_local_lane(&runner, &lane).unwrap();
+        assert_eq!(runner.state(&canonical).as_deref(), Some("exited"));
+        assert_eq!(runner.state(&next).as_deref(), Some("exited"));
+        assert_eq!(runner.state(&previous).as_deref(), Some("exited"));
+
+        struct RejectStop {
+            runner: UpgradeStateRunner,
+            next: String,
+        }
+        impl Runner for RejectStop {
+            fn run(&self, program: &str, args: &[String]) -> Result<String> {
+                if program == "podman"
+                    && args.first().is_some_and(|arg| arg == "stop")
+                    && args.get(1) == Some(&self.next)
+                {
+                    bail!("fixture refused to stop the staged lane")
+                }
+                self.runner.run(program, args)
+            }
+            fn run_output(&self, program: &str, args: &[String]) -> Result<ProcessOutput> {
+                self.runner.run_output(program, args)
+            }
+        }
+        let failing = RejectStop {
+            runner: UpgradeStateRunner::new(&lane, states()),
+            next: next.clone(),
+        };
+        assert!(stop_local_lane(&failing, &lane)
+            .unwrap_err()
+            .to_string()
+            .contains("refused"));
+        assert_eq!(failing.runner.state(&canonical).as_deref(), Some("exited"));
+        assert_eq!(failing.runner.state(&next).as_deref(), Some("running"));
+        assert_eq!(failing.runner.state(&previous).as_deref(), Some("exited"));
+    }
+
+    #[test]
+    fn local_upgrade_journal_commits_once_and_rejects_foreign_replay() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../target/tmp/upgrade-replay-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut lane = spec("local");
+        lane.project_path = root.join("lane");
+        lane.profile.embedded_containerfile = false;
+        lane.profile.runtime = RuntimeMode::PodmanInit;
+        std::fs::create_dir_all(&lane.project_path).unwrap();
+        let canonical = lane.container_name();
+        let staging = format!("{canonical}.next");
+        let previous = format!("{canonical}.previous");
+        let runner = UpgradeStateRunner::new(
+            &lane,
+            [
+                (canonical.clone(), "running".into()),
+                (staging.clone(), "running".into()),
+            ],
+        );
+        let mut journal = OperationJournal::new(&lane, "upgrade", "prepared").unwrap();
+        journal.runtime_was_running = Some(true);
+        let mut foreign = journal.clone();
+        foreign.kind = "rename".into();
+        assert!(advance_local_upgrade(&runner, &lane, &mut foreign)
+            .unwrap_err()
+            .to_string()
+            .contains("does not match"));
+        assert!(read_operation_journal(&lane).unwrap().is_none());
+        foreign = journal.clone();
+        foreign.desired_manifest_sha256 = "a".repeat(64);
+        assert!(advance_local_upgrade(&runner, &lane, &mut foreign).is_err());
+        assert!(read_operation_journal(&lane).unwrap().is_none());
+
+        advance_local_upgrade(&runner, &lane, &mut journal).unwrap();
+        assert_eq!(journal.phase, "runtime-applied");
+        assert_eq!(
+            read_operation_journal(&lane).unwrap().unwrap().phase,
+            "runtime-applied"
+        );
+        assert_eq!(runner.state(&canonical).as_deref(), Some("running"));
+        assert_eq!(runner.state(&staging), None);
+        assert_eq!(runner.state(&previous).as_deref(), Some("exited"));
+        assert_eq!(
+            read_lane_spec(&lane.manifest_path(), "local".into(), None)
+                .unwrap()
+                .id,
+            lane.id
+        );
+        advance_local_upgrade(&runner, &lane, &mut journal).unwrap();
+        assert_eq!(runner.state(&canonical).as_deref(), Some("running"));
+        assert_eq!(runner.state(&previous).as_deref(), Some("exited"));
+        finalize_local_upgrade_runtime(&runner, &lane, true).unwrap();
+        clear_operation_journal(&lane).unwrap();
+        assert!(read_operation_journal(&lane).unwrap().is_none());
+        assert_eq!(runner.state(&previous), None);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
