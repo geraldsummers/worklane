@@ -1463,6 +1463,37 @@ fn lane_attach_args(
     }
 }
 
+// Build the attached PTY command without invoking Podman. The explicit lane
+// session and backend come from the selected persisted profile, never focus.
+fn local_attach_command(spec: &LaneSpec, shell: bool, uid: &str) -> Vec<String> {
+    let session = spec.session_name();
+    let mut args = vec![
+        "exec".into(),
+        "-it".into(),
+        "--user".into(),
+        CONTAINER_USER.into(),
+        "--workdir".into(),
+        spec.container_home().display().to_string(),
+    ];
+    args.extend(user_manager_environment(uid));
+    args.extend([
+        "--env".into(),
+        format!("WORKLANE_NAME={}", spec.name),
+        "--env".into(),
+        format!("WORKLANE_SESSION={session}"),
+        "--env".into(),
+        format!("WORKLANE_WORKSPACE={}", spec.container_home().display()),
+        spec.container_name(),
+    ]);
+    args.extend(lane_attach_args(
+        &session,
+        shell,
+        spec.profile.effective_runtime(),
+        spec.profile.terminal_backend,
+    ));
+    args
+}
+
 // Only a custom image explicitly selected by a lane may use this backend. Never
 // try Herdr if TUIOS is missing or its headless session cannot be inspected.
 fn validate_tuios_image(spec: &LaneSpec) -> Result<()> {
@@ -2794,34 +2825,10 @@ fn main() -> Result<()> {
                         &s,
                         LocalSessionActivity::Attach { shell },
                     )?;
-                    let session = s.session_name();
-                    let command = lane_attach_args(
-                        &session,
-                        shell,
-                        s.profile.effective_runtime(),
-                        s.profile.terminal_backend,
-                    );
                     let (_, uid, _) = current_identity(&runner)?;
-                    let mut args = vec![
-                        "exec".into(),
-                        "-it".into(),
-                        "--user".into(),
-                        CONTAINER_USER.into(),
-                        "--workdir".into(),
-                        s.container_home().display().to_string(),
-                    ];
-                    args.extend(user_manager_environment(&uid));
-                    args.extend([
-                        "--env".into(),
-                        format!("WORKLANE_NAME={}", s.name),
-                        "--env".into(),
-                        format!("WORKLANE_SESSION={session}"),
-                        "--env".into(),
-                        format!("WORKLANE_WORKSPACE={}", s.container_home().display()),
-                        s.container_name(),
-                    ]);
-                    args.extend(command);
-                    let status = Command::new("podman").args(args).status()?;
+                    let status = Command::new("podman")
+                        .args(local_attach_command(&s, shell, &uid))
+                        .status()?;
                     if !status.success() {
                         bail!("attach failed")
                     };
@@ -3625,6 +3632,47 @@ mod tests {
             vec!["tuios", "attach", "alpha"]
         );
         assert_eq!(spec("local").session_name(), "test");
+    }
+
+    #[test]
+    fn attached_local_pty_command_keeps_selected_session_and_never_crosses_backends() {
+        let mut legacy = spec("local");
+        legacy.name = "new-display-name".into();
+        legacy.session_name = "original-session".into();
+        let mut native = legacy.clone();
+        native.profile.terminal_backend = TerminalBackend::TuiosV3;
+        native.profile.agent = AgentKind::Pi;
+        native.profile.embedded_containerfile = false;
+        for (lane, command, forbidden) in [
+            (&legacy, ["herdr", "--session", "original-session"], "tuios"),
+            (&native, ["tuios", "attach", "original-session"], "herdr"),
+        ] {
+            let args = local_attach_command(lane, false, "1000");
+            assert_eq!(args[0..2], ["exec", "-it"]);
+            assert!(args.contains(&lane.container_name()));
+            assert!(args.contains(&"XDG_RUNTIME_DIR=/run/user/1000".into()));
+            assert!(args.contains(&"WORKLANE_NAME=new-display-name".into()));
+            assert!(args.contains(&"WORKLANE_SESSION=original-session".into()));
+            assert_eq!(&args[args.len() - 3..], command);
+            assert!(!args.iter().any(|arg| arg == forbidden));
+            let shell_args = local_attach_command(lane, true, "1000");
+            assert_eq!(&shell_args[shell_args.len() - 2..], ["zsh", "-l"]);
+            assert!(!shell_args.iter().any(|arg| arg == command[0]));
+        }
+        native.profile.runtime = RuntimeMode::Systemd;
+        let systemd = local_attach_command(&native, true, "1000");
+        assert_eq!(
+            &systemd[systemd.len() - 7..],
+            [
+                "systemd-run",
+                "--user",
+                "--scope",
+                "--quiet",
+                "--collect",
+                "zsh",
+                "-l"
+            ]
+        );
     }
 
     #[test]

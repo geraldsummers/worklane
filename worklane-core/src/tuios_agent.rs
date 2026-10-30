@@ -334,6 +334,27 @@ mod tests {
         assert_eq!(client.calls, ["list-all:v3-agent"]);
     }
     #[test]
+    fn restored_session_id_and_window_name_are_not_live_pi_identity() {
+        // From the private v0.11.1 restart: TUIOS retained a conversation ID,
+        // reserved name, stable window ID and Pi title, yet the restored window
+        // contained only /bin/bash and its hook state was none. A conversation
+        // ID is historical metadata, not permission to reuse or launch a pane.
+        let reply = serde_json::json!({
+            "type":"agent_list", "session":"v3-agent", "agents":[{
+                "name":"worklane-pi", "session":"v3-agent",
+                "window_id":"c071e83f-1428-45ee-a62a-f44b1adf9de4",
+                "agent_session_id":"01a18df0-84de-72af-b969-72e236e37112",
+                "title":"π - dev", "harness_id":"", "state":"none"
+            }]
+        });
+        let candidates = decode_candidates(&reply, "v3-agent").unwrap();
+        assert_eq!(candidates.len(), 1);
+        let mut client = MockNative::new(vec![candidates]);
+        assert!(ensure_agent(&lane(), &mut client).is_err());
+        assert_eq!(client.calls, ["list-all:v3-agent"]);
+    }
+
+    #[test]
     fn invalid_or_multiple_panes_and_legacy_profiles_fail_before_launch() {
         for activity in [
             AgentActivity::Done,
