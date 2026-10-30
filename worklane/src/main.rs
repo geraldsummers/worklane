@@ -3247,6 +3247,22 @@ mod tests {
     }
 
     #[test]
+    fn v3_image_pins_verified_tuios_and_pi_without_herdr() {
+        let image = include_str!("../../Containerfile.v3");
+        for expected in [
+            "TUIOS_VERSION=0.11.1",
+            "TUIOS_ARCHIVE_SHA256=1d7589420449c42f14a326c6351228741af0f09e0f6a517503c49bc1d418f983",
+            "TUIOS_BINARY_SHA256=384f153756a802b99bee5286c776093e949662c2b7a0f4f5e2bcb39eeb0ac2f7",
+            "PI_VERSION=1.4.0",
+            "tuios integration install pi --no-skill --command /usr/local/bin/tuios",
+            "sha256sum -c -",
+        ] {
+            assert!(image.contains(expected), "v3 image missing {expected}");
+        }
+        assert!(!image.to_ascii_lowercase().contains("herdr"));
+    }
+
+    #[test]
     fn tuios_opt_in_fails_closed_and_uses_native_session_commands() {
         let mut selected = spec("local");
         selected.profile.terminal_backend = TerminalBackend::TuiosV3;

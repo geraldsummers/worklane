@@ -1,0 +1,38 @@
+# Experimental, isolated v3-only image recipe. Not used by the legacy defaults.
+# Build only in an isolated test environment; do not overwrite an installed lane image.
+FROM debian:trixie-slim
+ARG NODE_VERSION=24.21.0
+ARG NODE_SHA256=fd8e59d5a511510f6a298afb548f18c7d2b1be404d8b4a27d94fbe49f56cb2d6
+ARG PI_VERSION=1.4.0
+ARG TUIOS_VERSION=0.11.1
+ARG TUIOS_ARCHIVE_SHA256=1d7589420449c42f14a326c6351228741af0f09e0f6a517503c49bc1d418f983
+ARG TUIOS_BINARY_SHA256=384f153756a802b99bee5286c776093e949662c2b7a0f4f5e2bcb39eeb0ac2f7
+ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8 LC_ALL=C.UTF-8
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl git openssh-client python3 python3-venv systemd systemd-sysv \
+    dbus-user-session zsh xz-utils tar procps tini \
+ && rm -rf /var/lib/apt/lists/*
+RUN curl --proto '=https' --tlsv1.2 -fsSL \
+    "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" -o /tmp/node.tar.xz \
+ && echo "${NODE_SHA256}  /tmp/node.tar.xz" | sha256sum -c - \
+ && tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 \
+ && rm /tmp/node.tar.xz \
+ && env NPM_CONFIG_PREFIX=/usr/local npm install -g --ignore-scripts --no-audit "@earendil-works/pi-coding-agent@${PI_VERSION}" \
+ && test "$(pi --version)" = "${PI_VERSION}"
+RUN curl --proto '=https' --tlsv1.2 -fsSL \
+    "https://github.com/Gaurav-Gosain/tuios/releases/download/v${TUIOS_VERSION}/tuios_${TUIOS_VERSION}_Linux_x86_64.tar.gz" -o /tmp/tuios.tar.gz \
+ && echo "${TUIOS_ARCHIVE_SHA256}  /tmp/tuios.tar.gz" | sha256sum -c - \
+ && tar -xzf /tmp/tuios.tar.gz -C /usr/local/bin tuios \
+ && echo "${TUIOS_BINARY_SHA256}  /usr/local/bin/tuios" | sha256sum -c - \
+ && chmod 755 /usr/local/bin/tuios \
+ && tuios --version | grep -F "${TUIOS_VERSION}" \
+ && rm /tmp/tuios.tar.gz
+RUN groupadd -g 1000 dev && useradd -u 1000 -g 1000 -m -s /usr/bin/zsh dev
+USER dev
+WORKDIR /home/dev
+RUN install -d -m 0700 /home/dev/.pi/agent \
+ && tuios integration install pi --no-skill --command /usr/local/bin/tuios \
+ && test -f /home/dev/.pi/agent/extensions/tuios-agent-state.ts
+ENV container=podman
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]
