@@ -28,9 +28,9 @@ intentionally permits arbitrary shell commands inside the selected lane.
 The bridge requires explicit stable IDs, limits calls to 60 seconds and 1 MiB, and rejects
 unbounded subscriptions, live handoff, focused-pane lookup, and graphics transfer.
 
-The source-only [TUIOS v3 transition](tuios-v3-transition.md) adds `tuios.schema` and
-read-only `tuios.read` to the **direct Worklane API** for lanes already running TUIOS. These
-methods are not MCP tools and do not replace the current Herdr-backed connector or lane runtime.
+The opt-in [TUIOS v3 transition](tuios-v3-transition.md) adds `tuios.schema` and
+read-only `tuios.read` to the **direct Worklane API** for lanes running TUIOS. These
+methods are not MCP tools and do not replace the current Herdr-backed connector or legacy-default lane runtime.
 
 ## Install the three binaries
 

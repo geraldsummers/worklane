@@ -150,6 +150,20 @@ case "$*" in
   "diff "*) : ;;
   *"tuios session-info -s tuios-test --json"*)
     if test -e "$0.bad-info"; then printf 'not-json\n'; else printf '{"name":"tuios-test"}\n'; fi ;;
+  *"tuios list-agents -s tuios-test --all --json"*)
+    if test -e "$0.pi-started"; then
+      printf '{"success":true,"session":"tuios-test","agents":[{"session":"tuios-test","window_id":"window-private","name":"worklane-pi","harness_id":"pi","identity":"report","state":"idle"}]}\n'
+    else printf '{"success":true,"session":"tuios-test","agents":[]}\n'; fi ;;
+  *"tuios start-agent pi -s tuios-test "*)
+    case "$*" in *" --provider openai --model gpt-6-sol"*) : ;; *) exit 24 ;; esac
+    : > "$0.pi-started"
+    printf '{"success":true,"session":"tuios-test","name":"worklane-pi","agent":"pi","outcome":"ready","ready":true,"state":"idle","window_id":"window-private","command":"/usr/local/bin/pi --provider openai --model gpt-6-sol"}\n' ;;
+  *"tuios get-agent-state -s tuios-test -w window-private --json"*)
+    printf '{"success":true,"window_id":"window-private","harness_id":"pi","identity":"report","state":"idle"}\n' ;;
+  *"tuios get-window window-private -s tuios-test --json"*)
+    printf '{"success":true,"window_id":"window-private","pid":52,"tty":"/dev/pts/1","agent_state":"idle"}\n' ;;
+  *"python3 -c "*)
+    printf '{"pid":52,"tty":"/dev/pts/1","fd0":"/dev/pts/1","argv0":"pi","exe":"node","parent":"tuios","boot_id":"private-boot","start_ticks":12345}\n' ;;
   "exec --user "*)
     case "$*" in
       *"tuios new"*)
@@ -184,6 +198,8 @@ esac
     assert!(opened.contains("\"name\":\"tuios-test\""), "{opened}");
     let log = fs::read_to_string(podman.with_extension("log")).unwrap();
     assert!(log.contains("tuios new"));
+    assert!(log.contains("tuios start-agent pi -s tuios-test"));
+    assert!(log.contains("--provider openai --model gpt-6-sol"));
     assert!(log.contains("tuios integration install pi --no-skill"));
     assert!(log.contains(" install -d -m 0700 -o "));
     assert!(log.contains("tuios session-info -s tuios-test --json"));

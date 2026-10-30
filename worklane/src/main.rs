@@ -14,6 +14,7 @@ use std::{
 use worklane_core::*;
 
 mod api;
+mod tuios_live;
 
 /// The standard lane image recipe travels with every `worklane` binary.
 const EMBEDDED_CONTAINERFILE: &str = include_str!("../../Containerfile");
@@ -2636,6 +2637,7 @@ enum LocalSessionStep {
     EnsureStarted,
     Shell,
     Tuios,
+    TuiosAgent,
     Herdr,
     TuiosSnapshot,
     HerdrSnapshot,
@@ -2652,9 +2654,12 @@ fn local_session_steps(
     use LocalSessionStep as Step;
     match (backend, activity) {
         (TerminalBackend::Herdr, Activity::Start) => &[Step::EnsureStarted],
-        (TerminalBackend::TuiosV3, Activity::Start) => {
-            &[Step::EnsureStarted, Step::Shell, Step::Tuios]
-        }
+        (TerminalBackend::TuiosV3, Activity::Start) => &[
+            Step::EnsureStarted,
+            Step::Shell,
+            Step::Tuios,
+            Step::TuiosAgent,
+        ],
         (TerminalBackend::Herdr, Activity::Open) => &[
             Step::EnsureStarted,
             Step::Shell,
@@ -2665,15 +2670,19 @@ fn local_session_steps(
             Step::EnsureStarted,
             Step::Shell,
             Step::Tuios,
+            Step::TuiosAgent,
             Step::TuiosSnapshot,
         ],
         (_, Activity::Attach { shell: true }) => &[Step::EnsureStarted, Step::Shell],
         (TerminalBackend::Herdr, Activity::Attach { shell: false }) => {
             &[Step::EnsureStarted, Step::Shell, Step::Herdr]
         }
-        (TerminalBackend::TuiosV3, Activity::Attach { shell: false }) => {
-            &[Step::EnsureStarted, Step::Shell, Step::Tuios]
-        }
+        (TerminalBackend::TuiosV3, Activity::Attach { shell: false }) => &[
+            Step::EnsureStarted,
+            Step::Shell,
+            Step::Tuios,
+            Step::TuiosAgent,
+        ],
     }
 }
 
@@ -2694,6 +2703,11 @@ impl<R: Runner> LocalSessionOps for LiveLocalSession<'_, R> {
             LocalSessionStep::EnsureStarted => ensure_local_started(self.0, spec)?,
             LocalSessionStep::Shell => bootstrap_shell_with_runner(self.0, spec)?,
             LocalSessionStep::Tuios => bootstrap_tuios_with_runner(self.0, spec)?,
+            LocalSessionStep::TuiosAgent => tuios_live::ensure_live_pi_with_runner(
+                self.0,
+                spec,
+                &data_dir().join("v3-pi-process"),
+            )?,
             LocalSessionStep::Herdr => bootstrap_herdr_with_runner(self.0, spec)?,
             LocalSessionStep::TuiosSnapshot => {
                 return session_snapshot_with_runner(self.0, spec, TerminalBackend::TuiosV3)
@@ -3715,6 +3729,7 @@ mod tests {
                     LocalSessionStep::EnsureStarted,
                     LocalSessionStep::Shell,
                     LocalSessionStep::Tuios,
+                    LocalSessionStep::TuiosAgent,
                 ],
             ),
             (
@@ -3734,6 +3749,7 @@ mod tests {
                     LocalSessionStep::EnsureStarted,
                     LocalSessionStep::Shell,
                     LocalSessionStep::Tuios,
+                    LocalSessionStep::TuiosAgent,
                     LocalSessionStep::TuiosSnapshot,
                 ],
             ),
@@ -3753,6 +3769,7 @@ mod tests {
                     LocalSessionStep::EnsureStarted,
                     LocalSessionStep::Shell,
                     LocalSessionStep::Tuios,
+                    LocalSessionStep::TuiosAgent,
                 ],
             ),
             (
@@ -3829,6 +3846,9 @@ mod tests {
             fn run(&self, program: &str, args: &[String]) -> Result<String> {
                 if program == "podman" {
                     self.calls.lock().unwrap().push(args.to_vec());
+                    if args.first().is_some_and(|arg| arg == "exec") {
+                        bail!("private native Pi identity is unavailable")
+                    }
                     assert_eq!(args[0], "inspect");
                     if args.iter().any(|arg| arg.contains("Labels")) {
                         return Ok(fixture_owner_label(args));
@@ -3872,6 +3892,11 @@ mod tests {
             reject,
         };
         let mut native = spec("local");
+        native.project_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../target/tmp/native-live-adapter-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&native.project_path).unwrap();
         native.profile.terminal_backend = TerminalBackend::TuiosV3;
         native.profile.agent = AgentKind::Pi;
         native.profile.embedded_containerfile = false;
@@ -3880,11 +3905,16 @@ mod tests {
             (&spec("local"), "herdr", "tuios"),
         ] {
             let runner = mock(None);
-            let value =
-                execute_local_session(&LiveLocalSession(&runner), lane, LocalSessionActivity::Open)
-                    .unwrap()
-                    .unwrap();
-            assert_eq!(value["window_count"], 1);
+            let result =
+                execute_local_session(&LiveLocalSession(&runner), lane, LocalSessionActivity::Open);
+            if lane.profile.terminal_backend == TerminalBackend::TuiosV3 {
+                assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("native TUIOS Pi control failed"));
+            } else {
+                assert_eq!(result.unwrap().unwrap()["window_count"], 1);
+            }
             let calls = runner.calls.lock().unwrap();
             assert!(
                 calls
@@ -3910,13 +3940,14 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(error.contains("TUIOS session inspection failed"), "{error}");
+        assert!(error.contains("native TUIOS Pi control failed"), "{error}");
         assert!(!runner
             .calls
             .lock()
             .unwrap()
             .iter()
             .any(|args| args.iter().any(|arg| arg == "herdr")));
+        std::fs::remove_dir_all(&native.project_path).unwrap();
     }
 
     #[test]

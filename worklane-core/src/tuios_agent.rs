@@ -43,6 +43,17 @@ pub enum AgentActivity {
     Unknown,
 }
 impl AgentActivity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Working => "working",
+            Self::NeedsInput => "needs_input",
+            Self::Idle => "idle",
+            Self::Done => "done",
+            Self::Errored => "errored",
+            Self::Unknown => "unknown",
+        }
+    }
     fn parse(value: &str) -> Result<Self> {
         match value {
             "none" => Ok(Self::None),
@@ -63,7 +74,73 @@ pub struct AgentObservation {
     pub window_id: String,
     pub name: String,
     pub harness_id: String,
+    pub identity: String,
     pub activity: AgentActivity,
+}
+
+/// A Linux process identity sampled inside the selected container, not a
+/// historical conversation ID or a TUIOS window title. Linux PID reuse is
+/// fenced by boot ID and the /proc start tick (and by the window's PTY).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PiProcessProof {
+    pub lane_id: String,
+    pub session: String,
+    pub window_id: String,
+    pub pid: u32,
+    pub tty: String,
+    pub boot_id: String,
+    pub start_ticks: u64,
+    pub command: String,
+}
+
+/// Validate independent native pane and in-container /proc evidence. The
+/// adapter must collect the two reads from the same selected lane; this is a
+/// point-in-time check, not proof that the process will survive the next read.
+pub fn verify_pi_process(
+    spec: &LaneSpec,
+    agent: &AgentObservation,
+    window: &Value,
+    process: &Value,
+) -> Result<PiProcessProof> {
+    validate_observation(spec, agent)?;
+    let pid = window["pid"]
+        .as_u64()
+        .filter(|p| *p > 1 && *p <= u32::MAX as u64)
+        .context("TUIOS Pi window has no valid process ID")? as u32;
+    let tty = window["tty"]
+        .as_str()
+        .filter(|v| v.starts_with("/dev/pts/"))
+        .context("TUIOS Pi window has no private PTY")?;
+    if window["window_id"] != agent.window_id || window["agent_state"] != agent.activity.as_str() {
+        bail!("TUIOS Pi window identity or activity changed")
+    }
+    let boot_id = process["boot_id"]
+        .as_str()
+        .filter(|v| !v.is_empty())
+        .context("Pi process boot identity is missing")?;
+    let start_ticks = process["start_ticks"]
+        .as_u64()
+        .filter(|v| *v > 0)
+        .context("Pi process start tick is missing")?;
+    if process["pid"] != pid
+        || process["tty"] != tty
+        || process["fd0"] != tty
+        || process["argv0"] != "pi"
+        || process["exe"] != "node"
+        || process["parent"] != "tuios"
+    {
+        bail!("TUIOS window PID does not identify a live Pi child on its private PTY")
+    }
+    Ok(PiProcessProof {
+        lane_id: spec.id.clone(),
+        session: spec.session_name(),
+        window_id: agent.window_id.clone(),
+        pid,
+        tty: tty.into(),
+        boot_id: boot_id.into(),
+        start_ticks,
+        command: "pi --provider openai --model gpt-6-sol".into(),
+    })
 }
 
 /// Decode a native v0.11.1 `list-agents` result produced with `all: true`.
@@ -91,6 +168,7 @@ pub fn decode_candidates(reply: &Value, session: &str) -> Result<Vec<AgentObserv
                 window_id: text("window_id")?,
                 name: text("name")?,
                 harness_id: text("harness_id")?,
+                identity: text("identity")?,
                 activity: AgentActivity::parse(&text("state")?)?,
             })
         })
@@ -144,6 +222,7 @@ pub fn decode_start_reply(reply: &Value, session: &str) -> Result<AgentObservati
         window_id: window_id.into(),
         name: PI_PANE_NAME.into(),
         harness_id: "pi".into(), // Must be independently verified by list-agents.
+        identity: String::new(), // Start replies do not prove hook identity.
         activity,
     })
 }
@@ -152,6 +231,7 @@ pub fn decode_start_reply(reply: &Value, session: &str) -> Result<AgentObservati
 /// with state `none`, and must never call the `.herdr` compatibility socket.
 pub trait NativePiControl {
     fn list_candidates(&mut self, session: &str) -> Result<Vec<AgentObservation>>;
+    fn verify_live_process(&mut self, agent: &AgentObservation, launched: bool) -> Result<()>;
     fn start_pi(
         &mut self,
         session: &str,
@@ -170,6 +250,7 @@ fn validate_observation(spec: &LaneSpec, observed: &AgentObservation) -> Result<
     if observed.session != spec.session_name()
         || observed.name != PI_PANE_NAME
         || observed.harness_id != "pi"
+        || observed.identity != "report"
     {
         bail!("TUIOS Pi pane has unexpected session, name, or harness")
     }
@@ -202,16 +283,25 @@ pub fn ensure_agent(spec: &LaneSpec, client: &mut impl NativePiControl) -> Resul
     match initial.as_slice() {
         [existing] => {
             validate_observation(spec, existing)?;
+            client.verify_live_process(existing, false)?;
             Ok(AgentOutcome::Existing(existing.clone()))
         }
         [] => {
             let started =
                 client.start_pi(&session, &PiLaunch::default(), &spec.container_home())?;
-            validate_observation(spec, &started)?;
+            if started.session != session
+                || started.name != PI_PANE_NAME
+                || started.harness_id != "pi"
+                || started.window_id.is_empty()
+                || started.activity != AgentActivity::Idle
+            {
+                bail!("TUIOS Pi launch did not return a stable ready window")
+            }
             let confirmed = client.list_candidates(&session)?;
             match confirmed.as_slice() {
                 [agent] if agent.window_id == started.window_id => {
                     validate_observation(spec, agent)?;
+                    client.verify_live_process(agent, true)?;
                     Ok(AgentOutcome::Launched(agent.clone()))
                 }
                 _ => bail!(
@@ -232,6 +322,8 @@ mod tests {
     struct MockNative {
         observations: VecDeque<Result<Vec<AgentObservation>>>,
         start_result: Option<Result<AgentObservation>>,
+        verify_result: Option<Result<()>>,
+        verified: usize,
         calls: Vec<String>,
     }
     impl MockNative {
@@ -239,11 +331,17 @@ mod tests {
             Self {
                 observations: observations.into_iter().map(Ok).collect(),
                 start_result: None,
+                verify_result: None,
+                verified: 0,
                 calls: Vec::new(),
             }
         }
     }
     impl NativePiControl for MockNative {
+        fn verify_live_process(&mut self, _: &AgentObservation, _: bool) -> Result<()> {
+            self.verified += 1;
+            self.verify_result.take().unwrap_or(Ok(()))
+        }
         fn list_candidates(&mut self, session: &str) -> Result<Vec<AgentObservation>> {
             self.calls.push(format!("list-all:{session}"));
             self.observations
@@ -288,8 +386,59 @@ mod tests {
             window_id: "window-123".into(),
             name: PI_PANE_NAME.into(),
             harness_id: "pi".into(),
+            identity: "report".into(),
             activity,
         }
+    }
+    #[test]
+    fn process_proof_requires_native_report_and_matching_live_pid_pty_and_parent() {
+        let selected = lane();
+        let agent = agent(AgentActivity::Idle);
+        let window = serde_json::json!({"window_id":agent.window_id,"pid":52,"tty":"/dev/pts/1","agent_state":"idle","title":"π - dev"});
+        let process = serde_json::json!({"pid":52,"tty":"/dev/pts/1","fd0":"/dev/pts/1","argv0":"pi","exe":"node","parent":"tuios","boot_id":"private-boot","start_ticks":12345});
+        let proof = verify_pi_process(&selected, &agent, &window, &process).unwrap();
+        assert_eq!(proof.pid, 52);
+        assert_eq!(proof.start_ticks, 12345);
+        assert_eq!(proof.command, "pi --provider openai --model gpt-6-sol");
+        for (field, replacement) in [
+            ("pid", serde_json::json!(53)),
+            ("fd0", serde_json::json!("/dev/pts/2")),
+            ("argv0", serde_json::json!("bash")),
+            ("exe", serde_json::json!("bash")),
+            ("parent", serde_json::json!("other")),
+            ("boot_id", serde_json::json!("")),
+            ("start_ticks", serde_json::json!(0)),
+        ] {
+            let mut tampered = process.clone();
+            tampered[field] = replacement;
+            assert!(
+                verify_pi_process(&selected, &agent, &window, &tampered).is_err(),
+                "{field}"
+            );
+        }
+        let mut restored_window = window;
+        restored_window["pid"] = serde_json::json!(52);
+        restored_window["agent_state"] = serde_json::json!("none");
+        assert!(verify_pi_process(&selected, &agent, &restored_window, &process).is_err());
+        let mut historical = agent;
+        historical.identity.clear();
+        assert!(verify_pi_process(&selected, &historical, &restored_window, &process).is_err());
+    }
+    #[test]
+    fn failed_process_confirmation_never_reports_success_or_launches_again() {
+        let mut existing = MockNative::new(vec![vec![agent(AgentActivity::Idle)]]);
+        existing.verify_result = Some(Err(anyhow::anyhow!("/proc reports a shell")));
+        assert!(ensure_agent(&lane(), &mut existing)
+            .unwrap_err()
+            .to_string()
+            .contains("shell"));
+        assert_eq!(existing.calls, ["list-all:v3-agent"]);
+        let mut launched = MockNative::new(vec![vec![], vec![agent(AgentActivity::Idle)]]);
+        launched.start_result = Some(Ok(agent(AgentActivity::Idle)));
+        launched.verify_result = Some(Err(anyhow::anyhow!("process exited")));
+        assert!(ensure_agent(&lane(), &mut launched).is_err());
+        assert_eq!(launched.calls.len(), 3);
+        assert_eq!(launched.verified, 1);
     }
     #[test]
     fn pi_existing_active_agent_is_preserved_without_prompt_or_spawn() {
@@ -304,6 +453,7 @@ mod tests {
                 AgentOutcome::Existing(agent(activity))
             );
             assert_eq!(client.calls, ["list-all:v3-agent"]);
+            assert_eq!(client.verified, 1);
         }
     }
     #[test]
@@ -322,6 +472,7 @@ mod tests {
                 "list-all:v3-agent"
             ]
         );
+        assert_eq!(client.verified, 1);
     }
     #[test]
     fn timeout_kept_unrecognised_pi_pane_never_gets_a_second_launch() {
@@ -344,7 +495,7 @@ mod tests {
                 "name":"worklane-pi", "session":"v3-agent",
                 "window_id":"c071e83f-1428-45ee-a62a-f44b1adf9de4",
                 "agent_session_id":"01a18df0-84de-72af-b969-72e236e37112",
-                "title":"π - dev", "harness_id":"", "state":"none"
+                "title":"π - dev", "harness_id":"", "identity":"", "state":"none"
             }]
         });
         let candidates = decode_candidates(&reply, "v3-agent").unwrap();
@@ -415,7 +566,7 @@ mod tests {
     fn v0111_native_reply_decoders_reject_unrecognised_and_timed_out_pi() {
         let list = serde_json::json!({"type":"agent_list","session":"v3-agent","agents":[
             {"name":"Terminal abc","session":"v3-agent","state":"none"},
-            {"name":"worklane-pi","session":"v3-agent","window_id":"w-pi","harness_id":"","state":"none"}
+            {"name":"worklane-pi","session":"v3-agent","window_id":"w-pi","harness_id":"","identity":"","state":"none"}
         ]});
         let candidates = decode_candidates(&list, "v3-agent").unwrap();
         assert_eq!(candidates.len(), 1);
