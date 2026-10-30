@@ -1556,10 +1556,6 @@ fn bootstrap_tuios_with_runner(r: &impl Runner, spec: &LaneSpec) -> Result<()> {
     Ok(())
 }
 
-fn bootstrap_tuios(spec: &LaneSpec) -> Result<()> {
-    bootstrap_tuios_with_runner(&SystemRunner, spec)
-}
-
 fn bootstrap_herdr_script() -> &'static str {
     r#"set -eu
 agent="$(cat "$HOME/.config/worklane/agent" 2>/dev/null || printf codex)"
@@ -1616,14 +1612,14 @@ if [ "$managed_user" = false ] && [ -x "$manager" ]; then
 fi"#
 }
 
-fn bootstrap_herdr(spec: &LaneSpec) -> Result<()> {
+fn bootstrap_herdr_with_runner(r: &impl Runner, spec: &LaneSpec) -> Result<()> {
     let session = spec.session_name();
     let script = bootstrap_herdr_script();
     let agent_name = match spec.profile.agent {
         AgentKind::Codex => "Codex",
         AgentKind::Pi => "Pi",
     };
-    let (_, uid, _) = current_identity(&SystemRunner)?;
+    let (_, uid, _) = current_identity(r)?;
     let mut args = vec![
         "exec".into(),
         "--user".into(),
@@ -1644,14 +1640,13 @@ fn bootstrap_herdr(spec: &LaneSpec) -> Result<()> {
         "-lc".into(),
         script.into(),
     ]);
-    let output = Command::new("podman")
-        .args(args)
-        .output()
+    let output = r
+        .run_output("podman", &args)
         .with_context(|| format!("bootstrap Herdr {agent_name} integration"))?;
-    if !output.status.success() {
+    if output.code != 0 {
         bail!(
             "Herdr {agent_name} integration bootstrap failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            output.stderr.trim()
         )
     }
     Ok(())
@@ -1883,13 +1878,13 @@ fi
 "#
 }
 
-fn bootstrap_shell(spec: &LaneSpec) -> Result<()> {
+fn bootstrap_shell_with_runner(r: &impl Runner, spec: &LaneSpec) -> Result<()> {
     let script = match spec.profile.terminal_backend {
         TerminalBackend::Herdr => bootstrap_shell_script(),
         TerminalBackend::TuiosV3 => bootstrap_tuios_shell_script().into(),
     };
     let session = spec.session_name();
-    let (_, uid, _) = current_identity(&SystemRunner)?;
+    let (_, uid, _) = current_identity(r)?;
     let mut args = vec![
         "exec".into(),
         "--user".into(),
@@ -1912,11 +1907,10 @@ fn bootstrap_shell(spec: &LaneSpec) -> Result<()> {
         "-lc".into(),
         script,
     ]);
-    let status = Command::new("podman")
-        .args(args)
-        .status()
+    let code = r
+        .run_status("podman", &args)
         .context("bootstrap lane zsh configuration")?;
-    if !status.success() {
+    if code != 0 {
         bail!("lane zsh bootstrap failed")
     }
     Ok(())
@@ -1973,13 +1967,113 @@ fn session_snapshot_with_runner(
     serde_json::from_str(&output.stdout).context(invalid)
 }
 
-fn tuios_session_info(spec: &LaneSpec) -> Result<serde_json::Value> {
-    session_snapshot_with_runner(&SystemRunner, spec, TerminalBackend::TuiosV3)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LocalSessionActivity {
+    Start,
+    Open,
+    Attach { shell: bool },
 }
 
-fn herdr_snapshot(spec: &LaneSpec) -> Result<serde_json::Value> {
-    session_snapshot_with_runner(&SystemRunner, spec, TerminalBackend::Herdr)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LocalSessionStep {
+    EnsureStarted,
+    Shell,
+    Tuios,
+    Herdr,
+    TuiosSnapshot,
+    HerdrSnapshot,
 }
+
+// The plan is independent of Podman and the daemon. Keep the legacy start
+// behavior (no eager shell/session bootstrap), while v3 start always seeds its
+// native session. A plain-shell attach must never start either manager.
+fn local_session_steps(
+    backend: TerminalBackend,
+    activity: LocalSessionActivity,
+) -> &'static [LocalSessionStep] {
+    use LocalSessionActivity as Activity;
+    use LocalSessionStep as Step;
+    match (backend, activity) {
+        (TerminalBackend::Herdr, Activity::Start) => &[Step::EnsureStarted],
+        (TerminalBackend::TuiosV3, Activity::Start) => {
+            &[Step::EnsureStarted, Step::Shell, Step::Tuios]
+        }
+        (TerminalBackend::Herdr, Activity::Open) => &[
+            Step::EnsureStarted,
+            Step::Shell,
+            Step::Herdr,
+            Step::HerdrSnapshot,
+        ],
+        (TerminalBackend::TuiosV3, Activity::Open) => &[
+            Step::EnsureStarted,
+            Step::Shell,
+            Step::Tuios,
+            Step::TuiosSnapshot,
+        ],
+        (_, Activity::Attach { shell: true }) => &[Step::EnsureStarted, Step::Shell],
+        (TerminalBackend::Herdr, Activity::Attach { shell: false }) => {
+            &[Step::EnsureStarted, Step::Shell, Step::Herdr]
+        }
+        (TerminalBackend::TuiosV3, Activity::Attach { shell: false }) => {
+            &[Step::EnsureStarted, Step::Shell, Step::Tuios]
+        }
+    }
+}
+
+trait LocalSessionOps {
+    fn perform(&self, spec: &LaneSpec, step: LocalSessionStep)
+        -> Result<Option<serde_json::Value>>;
+}
+
+struct LiveLocalSession<'a, R: Runner>(&'a R);
+
+impl<R: Runner> LocalSessionOps for LiveLocalSession<'_, R> {
+    fn perform(
+        &self,
+        spec: &LaneSpec,
+        step: LocalSessionStep,
+    ) -> Result<Option<serde_json::Value>> {
+        match step {
+            LocalSessionStep::EnsureStarted => ensure_local_started(self.0, spec)?,
+            LocalSessionStep::Shell => bootstrap_shell_with_runner(self.0, spec)?,
+            LocalSessionStep::Tuios => bootstrap_tuios_with_runner(self.0, spec)?,
+            LocalSessionStep::Herdr => bootstrap_herdr_with_runner(self.0, spec)?,
+            LocalSessionStep::TuiosSnapshot => {
+                return session_snapshot_with_runner(self.0, spec, TerminalBackend::TuiosV3)
+                    .map(Some);
+            }
+            LocalSessionStep::HerdrSnapshot => {
+                return session_snapshot_with_runner(self.0, spec, TerminalBackend::Herdr)
+                    .map(Some);
+            }
+        }
+        Ok(None)
+    }
+}
+
+fn execute_local_session(
+    ops: &impl LocalSessionOps,
+    spec: &LaneSpec,
+    activity: LocalSessionActivity,
+) -> Result<Option<serde_json::Value>> {
+    if spec.host != "local" {
+        bail!("local session operation requires a local lane")
+    }
+    validate_tuios_image(spec)?;
+    let mut snapshot = None;
+    for step in local_session_steps(spec.profile.terminal_backend, activity) {
+        let result = ops.perform(spec, *step)?;
+        match step {
+            LocalSessionStep::TuiosSnapshot | LocalSessionStep::HerdrSnapshot => {
+                snapshot = Some(result.context("session inspector did not return a snapshot")?);
+            }
+            _ if result.is_some() => bail!("session operation unexpectedly returned a snapshot"),
+            _ => {}
+        }
+    }
+    Ok(snapshot)
+}
+
 fn run_executor() -> Result<()> {
     let mut input = Vec::new();
     io::stdin().read_to_end(&mut input)?;
@@ -2605,11 +2699,11 @@ fn main() -> Result<()> {
                     )?
                     .is_none()
                     {
-                        ensure_local_started(&runner, &s)?;
-                        if s.profile.terminal_backend == TerminalBackend::TuiosV3 {
-                            bootstrap_shell(&s)?;
-                            bootstrap_tuios(&s)?;
-                        }
+                        execute_local_session(
+                            &LiveLocalSession(&runner),
+                            &s,
+                            LocalSessionActivity::Start,
+                        )?;
                     }
                     emit(cli.json, &refresh(&runner, &store, &s)?)
                 }
@@ -2648,19 +2742,12 @@ fn main() -> Result<()> {
                     if s.host != "local" {
                         bail!("lane open through API version 1 supports local lanes only")
                     }
-                    validate_tuios_image(&s)?;
-                    ensure_local_started(&runner, &s)?;
-                    bootstrap_shell(&s)?;
-                    let snapshot = match s.profile.terminal_backend {
-                        TerminalBackend::Herdr => {
-                            bootstrap_herdr(&s)?;
-                            herdr_snapshot(&s)?
-                        }
-                        TerminalBackend::TuiosV3 => {
-                            bootstrap_tuios(&s)?;
-                            tuios_session_info(&s)?
-                        }
-                    };
+                    let snapshot = execute_local_session(
+                        &LiveLocalSession(&runner),
+                        &s,
+                        LocalSessionActivity::Open,
+                    )?
+                    .context("lane open did not inspect a session")?;
                     s.last_attached = Some(Utc::now());
                     write_lane_spec(&s)?;
                     refresh(&runner, &store, &s)?;
@@ -2702,15 +2789,11 @@ fn main() -> Result<()> {
                         store.save_lane(&s, "unknown", false)?;
                         return Ok(());
                     };
-                    validate_tuios_image(&s)?;
-                    ensure_local_started(&runner, &s)?;
-                    bootstrap_shell(&s)?;
-                    if !shell {
-                        match s.profile.terminal_backend {
-                            TerminalBackend::Herdr => bootstrap_herdr(&s)?,
-                            TerminalBackend::TuiosV3 => bootstrap_tuios(&s)?,
-                        }
-                    }
+                    execute_local_session(
+                        &LiveLocalSession(&runner),
+                        &s,
+                        LocalSessionActivity::Attach { shell },
+                    )?;
                     let session = s.session_name();
                     let command = lane_attach_args(
                         &session,
@@ -3245,6 +3328,259 @@ mod tests {
         spec.profile.mount_codex_credentials = false;
         spec.profile.mount_gh_credentials = false;
         spec
+    }
+
+    #[test]
+    fn local_session_plan_preserves_legacy_and_runs_only_native_v3_steps() {
+        struct SessionFixture {
+            calls: Mutex<Vec<LocalSessionStep>>,
+            fail_at: Option<LocalSessionStep>,
+            extra_snapshot: bool,
+        }
+        impl LocalSessionOps for SessionFixture {
+            fn perform(
+                &self,
+                _spec: &LaneSpec,
+                step: LocalSessionStep,
+            ) -> Result<Option<serde_json::Value>> {
+                self.calls.lock().unwrap().push(step);
+                if self.fail_at == Some(step) {
+                    bail!("private fixture refused {step:?}")
+                }
+                if matches!(
+                    step,
+                    LocalSessionStep::TuiosSnapshot | LocalSessionStep::HerdrSnapshot
+                ) || self.extra_snapshot
+                {
+                    return Ok(Some(
+                        serde_json::json!({"session_name":"test","window_count":1}),
+                    ));
+                }
+                Ok(None)
+            }
+        }
+        let mock = || SessionFixture {
+            calls: Mutex::new(vec![]),
+            fail_at: None,
+            extra_snapshot: false,
+        };
+        let legacy = spec("local");
+        let mut native = legacy.clone();
+        native.profile.terminal_backend = TerminalBackend::TuiosV3;
+        native.profile.agent = AgentKind::Pi;
+        native.profile.embedded_containerfile = false;
+        let cases: [(&LaneSpec, LocalSessionActivity, &[LocalSessionStep]); 7] = [
+            (
+                &legacy,
+                LocalSessionActivity::Start,
+                &[LocalSessionStep::EnsureStarted],
+            ),
+            (
+                &native,
+                LocalSessionActivity::Start,
+                &[
+                    LocalSessionStep::EnsureStarted,
+                    LocalSessionStep::Shell,
+                    LocalSessionStep::Tuios,
+                ],
+            ),
+            (
+                &legacy,
+                LocalSessionActivity::Open,
+                &[
+                    LocalSessionStep::EnsureStarted,
+                    LocalSessionStep::Shell,
+                    LocalSessionStep::Herdr,
+                    LocalSessionStep::HerdrSnapshot,
+                ],
+            ),
+            (
+                &native,
+                LocalSessionActivity::Open,
+                &[
+                    LocalSessionStep::EnsureStarted,
+                    LocalSessionStep::Shell,
+                    LocalSessionStep::Tuios,
+                    LocalSessionStep::TuiosSnapshot,
+                ],
+            ),
+            (
+                &legacy,
+                LocalSessionActivity::Attach { shell: false },
+                &[
+                    LocalSessionStep::EnsureStarted,
+                    LocalSessionStep::Shell,
+                    LocalSessionStep::Herdr,
+                ],
+            ),
+            (
+                &native,
+                LocalSessionActivity::Attach { shell: false },
+                &[
+                    LocalSessionStep::EnsureStarted,
+                    LocalSessionStep::Shell,
+                    LocalSessionStep::Tuios,
+                ],
+            ),
+            (
+                &native,
+                LocalSessionActivity::Attach { shell: true },
+                &[LocalSessionStep::EnsureStarted, LocalSessionStep::Shell],
+            ),
+        ];
+        for (lane, activity, expected) in cases {
+            let fixture = mock();
+            let response = execute_local_session(&fixture, lane, activity).unwrap();
+            assert_eq!(*fixture.calls.lock().unwrap(), expected, "{activity:?}");
+            if activity == LocalSessionActivity::Open {
+                assert_eq!(response.unwrap()["session_name"], "test");
+            } else {
+                assert!(response.is_none());
+            }
+            if lane.profile.terminal_backend == TerminalBackend::TuiosV3 {
+                assert!(!expected.contains(&LocalSessionStep::Herdr));
+                assert!(!expected.contains(&LocalSessionStep::HerdrSnapshot));
+            }
+        }
+        let broken = SessionFixture {
+            fail_at: Some(LocalSessionStep::Tuios),
+            ..mock()
+        };
+        assert!(
+            execute_local_session(&broken, &native, LocalSessionActivity::Open)
+                .unwrap_err()
+                .to_string()
+                .contains("refused Tuios")
+        );
+        assert_eq!(
+            *broken.calls.lock().unwrap(),
+            [
+                LocalSessionStep::EnsureStarted,
+                LocalSessionStep::Shell,
+                LocalSessionStep::Tuios
+            ]
+        );
+        let unexpected = SessionFixture {
+            extra_snapshot: true,
+            ..mock()
+        };
+        assert!(
+            execute_local_session(&unexpected, &native, LocalSessionActivity::Start)
+                .unwrap_err()
+                .to_string()
+                .contains("unexpectedly returned a snapshot")
+        );
+        let mut bad = native.clone();
+        bad.profile.agent = AgentKind::Codex;
+        assert!(execute_local_session(&mock(), &bad, LocalSessionActivity::Start).is_err());
+        bad.profile.agent = AgentKind::Pi;
+        bad.profile.embedded_containerfile = true;
+        assert!(execute_local_session(&mock(), &bad, LocalSessionActivity::Start).is_err());
+        bad = native;
+        bad.host = "remote".into();
+        assert!(
+            execute_local_session(&mock(), &bad, LocalSessionActivity::Open)
+                .unwrap_err()
+                .to_string()
+                .contains("local lane")
+        );
+    }
+
+    #[test]
+    fn local_session_live_adapter_uses_only_selected_backend_and_propagates_failure() {
+        struct LocalRunner {
+            calls: Mutex<Vec<Vec<String>>>,
+            reject: Option<&'static str>,
+        }
+        impl Runner for LocalRunner {
+            fn run(&self, program: &str, args: &[String]) -> Result<String> {
+                if program == "podman" {
+                    self.calls.lock().unwrap().push(args.to_vec());
+                    assert_eq!(args[0], "inspect");
+                    return Ok("running".into());
+                }
+                assert_eq!(program, "id");
+                Ok(match args[0].as_str() {
+                    "-un" => "gerald",
+                    "-u" | "-g" => "1000",
+                    _ => panic!("unexpected id query"),
+                }
+                .into())
+            }
+            fn run_output(&self, program: &str, args: &[String]) -> Result<ProcessOutput> {
+                assert_eq!(program, "podman");
+                self.calls.lock().unwrap().push(args.to_vec());
+                let code = i32::from(
+                    self.reject
+                        .is_some_and(|marker| args.iter().any(|arg| arg == marker)),
+                );
+                let stdout = if args
+                    .iter()
+                    .any(|arg| arg == "session-info" || arg == "snapshot")
+                {
+                    r#"{"session_name":"test","window_count":1}"#
+                } else if args.first().is_some_and(|arg| arg == "inspect") {
+                    "running"
+                } else {
+                    ""
+                };
+                Ok(ProcessOutput {
+                    code,
+                    stdout: stdout.into(),
+                    stderr: "private fixture failure".into(),
+                })
+            }
+        }
+        let mock = |reject| LocalRunner {
+            calls: Mutex::new(vec![]),
+            reject,
+        };
+        let mut native = spec("local");
+        native.profile.terminal_backend = TerminalBackend::TuiosV3;
+        native.profile.agent = AgentKind::Pi;
+        native.profile.embedded_containerfile = false;
+        for (lane, backend_name, forbidden) in [
+            (&native, "tuios", "herdr"),
+            (&spec("local"), "herdr", "tuios"),
+        ] {
+            let runner = mock(None);
+            let value =
+                execute_local_session(&LiveLocalSession(&runner), lane, LocalSessionActivity::Open)
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(value["window_count"], 1);
+            let calls = runner.calls.lock().unwrap();
+            assert!(
+                calls
+                    .iter()
+                    .any(|args| args.iter().any(|arg| arg == backend_name)),
+                "{calls:?}"
+            );
+            assert!(
+                !calls
+                    .iter()
+                    .any(|args| args.iter().any(|arg| arg == forbidden)),
+                "{calls:?}"
+            );
+            assert!(calls
+                .iter()
+                .any(|args| args.iter().any(|arg| arg.starts_with("WORKLANE_SESSION="))));
+        }
+        let runner = mock(Some("session-info"));
+        let error = execute_local_session(
+            &LiveLocalSession(&runner),
+            &native,
+            LocalSessionActivity::Open,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("TUIOS session inspection failed"), "{error}");
+        assert!(!runner
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|args| args.iter().any(|arg| arg == "herdr")));
     }
 
     #[test]

@@ -865,6 +865,11 @@ pub trait Runner {
             stderr: String::new(),
         })
     }
+    // Unlike run_output, a real runner keeps the child's terminal streams
+    // connected to the caller. Test runners can use run_output to supply status.
+    fn run_status(&self, program: &str, args: &[String]) -> Result<i32> {
+        Ok(self.run_output(program, args)?.code)
+    }
 }
 #[derive(Debug, Clone)]
 pub struct ProcessOutput {
@@ -874,6 +879,14 @@ pub struct ProcessOutput {
 }
 pub struct SystemRunner;
 impl Runner for SystemRunner {
+    fn run_status(&self, program: &str, args: &[String]) -> Result<i32> {
+        Ok(Command::new(program)
+            .args(args)
+            .status()
+            .with_context(|| format!("run {program}"))?
+            .code()
+            .unwrap_or(125))
+    }
     fn run(&self, program: &str, args: &[String]) -> Result<String> {
         let mut command = Command::new(program);
         command.args(args);
@@ -2070,6 +2083,9 @@ mod tests {
             (output.code, output.stdout.as_str(), output.stderr.as_str()),
             (5, "result", "private-error")
         );
+        assert_eq!(runner.run_status("/bin/sh", &sh("true")).unwrap(), 0);
+        assert_eq!(runner.run_status("/bin/sh", &sh("exit 7")).unwrap(), 7);
+        assert!(runner.run_status("/no-such-worklane-fixture", &[]).is_err());
         assert!(runner.run("/no-such-worklane-fixture", &[]).is_err());
     }
 
