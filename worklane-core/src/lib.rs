@@ -1,4 +1,6 @@
 //! Shared durable model and process adapters for Worklane.
+
+pub mod tuios_agent;
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use fs2::FileExt;
