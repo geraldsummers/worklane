@@ -11,7 +11,7 @@ use std::{
     process::{Command, Stdio},
 };
 use uuid::Uuid;
-use worklane_core::{ErrorReport, Store};
+use worklane_core::{ErrorReport, Store, TerminalBackend};
 
 pub const API_VERSION: u32 = 1;
 const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
@@ -584,9 +584,17 @@ fn podman_json(
     serde_json::from_slice(&output.stdout).context("lane Herdr API returned invalid JSON")
 }
 
+fn require_herdr_backend(spec: &worklane_core::LaneSpec) -> Result<()> {
+    if spec.profile.terminal_backend != TerminalBackend::Herdr {
+        bail!("Herdr API is unavailable for a tuios-v3 lane")
+    }
+    Ok(())
+}
+
 fn herdr_schema(params: &Value) -> Result<Value> {
     let store = Store::open_default()?;
     let spec = store.lane(&required_string(params, "lane")?)?;
+    require_herdr_backend(&spec)?;
     podman_json(
         &spec,
         &[
@@ -663,6 +671,7 @@ fn validate_herdr_call(method: &str, params: &Value, schema: &Value) -> Result<(
 fn herdr_call(params: &Value) -> Result<Value> {
     let store = Store::open_default()?;
     let spec = store.lane(&required_string(params, "lane")?)?;
+    require_herdr_backend(&spec)?;
     let method = required_string(params, "method")?;
     let native_params = params.get("params").cloned().unwrap_or_else(|| json!({}));
     let schema = podman_json(
@@ -811,6 +820,9 @@ sys.stdout.buffer.write(result)
 fn tuios_read(params: &Value, schema: bool) -> Result<Value> {
     let store = Store::open_default()?;
     let spec = store.lane(&required_string(params, "lane")?)?;
+    if spec.profile.terminal_backend != TerminalBackend::TuiosV3 {
+        bail!("native TUIOS API requires a lane opted into terminal_backend = 'tuios-v3'")
+    }
     let verb = if schema {
         "list-verbs".to_owned()
     } else {

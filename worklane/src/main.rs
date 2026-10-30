@@ -1431,7 +1431,12 @@ fn reconcile_local(
     }
     Ok(report)
 }
-fn lane_attach_args(session: &str, shell: bool, runtime: RuntimeMode) -> Vec<String> {
+fn lane_attach_args(
+    session: &str,
+    shell: bool,
+    runtime: RuntimeMode,
+    backend: TerminalBackend,
+) -> Vec<String> {
     if shell {
         if runtime == RuntimeMode::Systemd {
             return vec![
@@ -1446,7 +1451,69 @@ fn lane_attach_args(session: &str, shell: bool, runtime: RuntimeMode) -> Vec<Str
         }
         return vec!["zsh".into(), "-l".into()];
     }
-    vec!["herdr".into(), "--session".into(), session.into()]
+    match backend {
+        TerminalBackend::Herdr => vec!["herdr".into(), "--session".into(), session.into()],
+        TerminalBackend::TuiosV3 => vec!["tuios".into(), "attach".into(), session.into()],
+    }
+}
+
+// Only a custom image explicitly selected by a lane may use this backend. Never
+// try Herdr if TUIOS is missing or its headless session cannot be inspected.
+fn validate_tuios_image(spec: &LaneSpec) -> Result<()> {
+    if spec.profile.terminal_backend == TerminalBackend::TuiosV3
+        && spec.profile.embedded_containerfile
+    {
+        bail!("tuios-v3 requires a custom image with TUIOS installed; the embedded image contains Herdr")
+    }
+    Ok(())
+}
+
+fn bootstrap_tuios_script() -> &'static str {
+    r#"set -eu
+command -v tuios >/dev/null || { echo 'tuios-v3 image is missing tuios' >&2; exit 1; }
+session="${WORKLANE_SESSION:?missing session}"
+workspace="${WORKLANE_WORKSPACE:?missing workspace}"
+if ! tuios session-info -s "$session" --json >/dev/null 2>&1; then
+  tuios new "$session" --detach --cwd "$workspace" ||
+    tuios session-info -s "$session" --json >/dev/null
+fi
+tuios session-info -s "$session" --json >/dev/null
+tuios list-windows -s "$session" --json >/dev/null
+"#
+}
+
+fn bootstrap_tuios(spec: &LaneSpec) -> Result<()> {
+    validate_tuios_image(spec)?;
+    let (_, uid, _) = current_identity(&SystemRunner)?;
+    let mut args = vec![
+        "exec".into(),
+        "--user".into(),
+        CONTAINER_USER.into(),
+        "--workdir".into(),
+        spec.container_home().display().to_string(),
+    ];
+    args.extend(user_manager_environment(&uid));
+    args.extend([
+        "--env".into(),
+        format!("WORKLANE_SESSION={}", spec.session_name()),
+        "--env".into(),
+        format!("WORKLANE_WORKSPACE={}", spec.container_home().display()),
+        spec.container_name(),
+        "sh".into(),
+        "-c".into(),
+        bootstrap_tuios_script().into(),
+    ]);
+    let output = Command::new("podman")
+        .args(args)
+        .output()
+        .context("bootstrap native TUIOS session")?;
+    if !output.status.success() {
+        bail!(
+            "TUIOS session bootstrap failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+    }
+    Ok(())
 }
 
 fn bootstrap_herdr_script() -> &'static str {
@@ -1762,8 +1829,21 @@ fi"#,
     );
     script
 }
+fn bootstrap_tuios_shell_script() -> &'static str {
+    r#"set -eu
+mkdir -p "$HOME/.config/worklane"
+printf '%s\n' "${WORKLANE_AGENT:-codex}" > "$HOME/.config/worklane/agent"
+if [ ! -e "$HOME/.zshrc" ]; then
+  printf '%s\n' 'cd "${WORKLANE_WORKSPACE:-$HOME}" 2>/dev/null || true' > "$HOME/.zshrc"
+fi
+"#
+}
+
 fn bootstrap_shell(spec: &LaneSpec) -> Result<()> {
-    let script = bootstrap_shell_script();
+    let script = match spec.profile.terminal_backend {
+        TerminalBackend::Herdr => bootstrap_shell_script(),
+        TerminalBackend::TuiosV3 => bootstrap_tuios_shell_script().into(),
+    };
     let session = spec.session_name();
     let (_, uid, _) = current_identity(&SystemRunner)?;
     let mut args = vec![
@@ -1797,6 +1877,37 @@ fn bootstrap_shell(spec: &LaneSpec) -> Result<()> {
     }
     Ok(())
 }
+fn tuios_session_info(spec: &LaneSpec) -> Result<serde_json::Value> {
+    let (_, uid, _) = current_identity(&SystemRunner)?;
+    let mut args = vec![
+        "exec".into(),
+        "--user".into(),
+        CONTAINER_USER.into(),
+        "--workdir".into(),
+        spec.container_home().display().to_string(),
+    ];
+    args.extend(user_manager_environment(&uid));
+    args.extend([
+        spec.container_name(),
+        "tuios".into(),
+        "session-info".into(),
+        "-s".into(),
+        spec.session_name(),
+        "--json".into(),
+    ]);
+    let output = Command::new("podman")
+        .args(args)
+        .output()
+        .context("read native TUIOS session")?;
+    if !output.status.success() {
+        bail!(
+            "TUIOS session inspection failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+    }
+    serde_json::from_slice(&output.stdout).context("TUIOS returned invalid session info")
+}
+
 fn herdr_snapshot(spec: &LaneSpec) -> Result<serde_json::Value> {
     let (_, uid, _) = current_identity(&SystemRunner)?;
     let mut args = vec![
@@ -2436,6 +2547,7 @@ fn main() -> Result<()> {
                 }
                 LaneAction::Start { lane } => {
                     let s = store.lane(&lane)?;
+                    validate_tuios_image(&s)?;
                     ensure_no_pending_operation(&s, "start")?;
                     report_phase(
                         Some((&s.id, &s.name)),
@@ -2451,8 +2563,12 @@ fn main() -> Result<()> {
                     )?
                     .is_none()
                     {
-                        ensure_local_started(&runner, &s)?
-                    };
+                        ensure_local_started(&runner, &s)?;
+                        if s.profile.terminal_backend == TerminalBackend::TuiosV3 {
+                            bootstrap_shell(&s)?;
+                            bootstrap_tuios(&s)?;
+                        }
+                    }
                     emit(cli.json, &refresh(&runner, &store, &s)?)
                 }
                 LaneAction::Stop { lane } => {
@@ -2490,10 +2606,19 @@ fn main() -> Result<()> {
                     if s.host != "local" {
                         bail!("lane open through API version 1 supports local lanes only")
                     }
+                    validate_tuios_image(&s)?;
                     ensure_local_started(&runner, &s)?;
                     bootstrap_shell(&s)?;
-                    bootstrap_herdr(&s)?;
-                    let snapshot = herdr_snapshot(&s)?;
+                    let snapshot = match s.profile.terminal_backend {
+                        TerminalBackend::Herdr => {
+                            bootstrap_herdr(&s)?;
+                            herdr_snapshot(&s)?
+                        }
+                        TerminalBackend::TuiosV3 => {
+                            bootstrap_tuios(&s)?;
+                            tuios_session_info(&s)?
+                        }
+                    };
                     s.last_attached = Some(Utc::now());
                     write_lane_spec(&s)?;
                     refresh(&runner, &store, &s)?;
@@ -2535,13 +2660,22 @@ fn main() -> Result<()> {
                         store.save_lane(&s, "unknown", false)?;
                         return Ok(());
                     };
+                    validate_tuios_image(&s)?;
                     ensure_local_started(&runner, &s)?;
                     bootstrap_shell(&s)?;
                     if !shell {
-                        bootstrap_herdr(&s)?;
+                        match s.profile.terminal_backend {
+                            TerminalBackend::Herdr => bootstrap_herdr(&s)?,
+                            TerminalBackend::TuiosV3 => bootstrap_tuios(&s)?,
+                        }
                     }
                     let session = s.session_name();
-                    let command = lane_attach_args(&session, shell, s.profile.effective_runtime());
+                    let command = lane_attach_args(
+                        &session,
+                        shell,
+                        s.profile.effective_runtime(),
+                        s.profile.terminal_backend,
+                    );
                     let (_, uid, _) = current_identity(&runner)?;
                     let mut args = vec![
                         "exec".into(),
@@ -3068,15 +3202,25 @@ mod tests {
     #[test]
     fn attach_defaults_to_herdr_or_explicit_shell() {
         assert_eq!(
-            lane_attach_args("alpha", false, RuntimeMode::PodmanInit),
+            lane_attach_args(
+                "alpha",
+                false,
+                RuntimeMode::PodmanInit,
+                TerminalBackend::Herdr
+            ),
             vec!["herdr", "--session", "alpha"]
         );
         assert_eq!(
-            lane_attach_args("alpha", true, RuntimeMode::PodmanInit),
+            lane_attach_args(
+                "alpha",
+                true,
+                RuntimeMode::PodmanInit,
+                TerminalBackend::Herdr
+            ),
             vec!["zsh", "-l"]
         );
         assert_eq!(
-            lane_attach_args("alpha", true, RuntimeMode::Systemd),
+            lane_attach_args("alpha", true, RuntimeMode::Systemd, TerminalBackend::Herdr),
             vec![
                 "systemd-run",
                 "--user",
@@ -3087,7 +3231,78 @@ mod tests {
                 "-l"
             ]
         );
+        assert_eq!(
+            lane_attach_args(
+                "alpha",
+                false,
+                RuntimeMode::Systemd,
+                TerminalBackend::TuiosV3
+            ),
+            vec!["tuios", "attach", "alpha"]
+        );
         assert_eq!(spec("local").session_name(), "test");
+    }
+
+    #[test]
+    fn tuios_opt_in_fails_closed_and_uses_native_session_commands() {
+        let mut selected = spec("local");
+        selected.profile.terminal_backend = TerminalBackend::TuiosV3;
+        assert!(validate_tuios_image(&selected).is_err());
+        selected.profile.embedded_containerfile = false;
+        validate_tuios_image(&selected).unwrap();
+        let script = bootstrap_tuios_script();
+        assert!(script.contains("tuios new \"$session\" --detach --cwd \"$workspace\""));
+        assert!(script.contains("tuios session-info -s \"$session\" --json"));
+        assert!(script.contains("tuios list-windows -s \"$session\" --json"));
+        assert!(!script.contains("herdr"));
+        assert!(!bootstrap_tuios_shell_script().contains("herdr"));
+        assert!(!bootstrap_tuios_shell_script().contains("git-diff-pane"));
+    }
+
+    #[test]
+    fn tuios_headless_bootstrap_creates_once_and_rejects_missing_binary() {
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::env::temp_dir().join(format!("worklane-tuios-test-{}", uuid::Uuid::new_v4()));
+        let bin = root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let binary = bin.join("tuios");
+        fs::write(
+            &binary,
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> "$HOME/tuios.log"
+case "$1" in
+  session-info) test -e "$HOME/created" ;;
+  new) test ! -e "$HOME/fail-new" || exit 2; : > "$HOME/created" ;;
+  list-windows) test -e "$HOME/created" ;;
+  *) exit 1 ;;
+esac
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        let run = || {
+            Command::new("/bin/sh")
+                .args(["-c", bootstrap_tuios_script()])
+                .env("HOME", &root)
+                .env("PATH", &bin)
+                .env("WORKLANE_SESSION", "test-v3")
+                .env("WORKLANE_WORKSPACE", &root)
+                .output()
+                .unwrap()
+        };
+        assert!(run().status.success());
+        assert!(run().status.success());
+        let calls = fs::read_to_string(root.join("tuios.log")).unwrap();
+        assert_eq!(calls.matches("new test-v3 --detach --cwd").count(), 1);
+        assert_eq!(calls.matches("list-windows -s test-v3 --json").count(), 2);
+        fs::remove_file(root.join("created")).unwrap();
+        fs::write(root.join("fail-new"), "").unwrap();
+        assert!(!run().status.success());
+        fs::remove_file(binary).unwrap();
+        assert!(!run().status.success());
+        assert!(!root.join("herdr.log").exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

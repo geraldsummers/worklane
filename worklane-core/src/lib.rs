@@ -33,6 +33,20 @@ pub enum RuntimeMode {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
+pub enum TerminalBackend {
+    /// Absent in legacy manifests and omitted on serialization to keep their hashes stable.
+    #[default]
+    Herdr,
+    TuiosV3,
+}
+impl TerminalBackend {
+    fn is_herdr(&self) -> bool {
+        *self == Self::Herdr
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
 pub enum AgentKind {
     #[default]
     Codex,
@@ -60,9 +74,12 @@ pub struct Host {
 #[serde(deny_unknown_fields)]
 pub struct Profile {
     pub image: String,
-    /// Agent started in the lane's primary Herdr pane.
+    /// Agent chosen for this lane (TUIOS agent launch is a later v3 slice).
     #[serde(default)]
     pub agent: AgentKind,
+    /// Explicit per-lane opt-in; missing/default fields preserve legacy manifest hashes.
+    #[serde(default, skip_serializing_if = "TerminalBackend::is_herdr")]
+    pub terminal_backend: TerminalBackend,
     /// Host-native context used to rebuild this host-local image during upgrade.
     #[serde(default, with = "build_context_serde")]
     pub build_context: Option<PathBuf>,
@@ -141,6 +158,7 @@ impl Default for Profile {
         Self {
             image: DEFAULT_IMAGE.into(),
             agent: AgentKind::Codex,
+            terminal_backend: TerminalBackend::Herdr,
             build_context: None,
             containerfile: default_containerfile(),
             embedded_containerfile: default_embedded_containerfile(),
@@ -203,6 +221,9 @@ pub fn load_profiles() -> Result<BTreeMap<String, Profile>> {
     Ok(profiles)
 }
 pub fn validate_profile(profile: &Profile, home: &Path, require_sources: bool) -> Result<()> {
+    if profile.terminal_backend == TerminalBackend::TuiosV3 && profile.embedded_containerfile {
+        bail!("tuios-v3 requires a custom image with TUIOS installed; the embedded image contains Herdr")
+    }
     if profile.agent == AgentKind::Pi && profile.embedded_containerfile {
         bail!("Pi lanes require a custom Pi image; the embedded image contains Codex")
     }
@@ -1618,6 +1639,28 @@ mod tests {
         assert!(profile.mount_codex_credentials);
         assert!(profile.mount_gh_credentials);
         assert!(profile.devices.is_empty());
+    }
+
+    #[test]
+    fn tuios_requires_explicit_custom_image_and_legacy_profile_json_is_unchanged() {
+        let mut legacy = Profile::default();
+        assert_eq!(legacy.terminal_backend, TerminalBackend::Herdr);
+        let original = serde_json::to_value(&legacy).unwrap();
+        assert!(original.get("terminal_backend").is_none());
+        let decoded: Profile = serde_json::from_value(original.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), original);
+        assert!(validate_profile(&legacy, Path::new("/home/dev"), false).is_ok());
+
+        legacy.terminal_backend = TerminalBackend::TuiosV3;
+        assert!(validate_profile(&legacy, Path::new("/home/dev"), false)
+            .unwrap_err()
+            .to_string()
+            .contains("custom image"));
+        legacy.embedded_containerfile = false;
+        assert!(validate_profile(&legacy, Path::new("/home/dev"), false).is_ok());
+        let encoded = toml::to_string(&legacy).unwrap();
+        assert!(encoded.contains("terminal_backend = \"tuios-v3\""));
+        assert_eq!(toml::from_str::<Profile>(&encoded).unwrap(), legacy);
     }
 
     #[test]

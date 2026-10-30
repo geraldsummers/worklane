@@ -1,6 +1,6 @@
-# TUIOS v3 transition: first connector slice (not a reinstall)
+# TUIOS v3 transition: opt-in native lifecycle slice (not a reinstall)
 
-Status: **source-only prototype** in this personal clone. No image, runtime, launcher, MCP tool, guidance bundle, or production lane has been migrated. Do not use this as evidence of a 2/2 reinstall or deployment. The existing v1 `herdr.schema`/`herdr.call` behavior remains unchanged for current lanes. `tuios.schema` and `tuios.read` require a **separately provisioned TUIOS daemon inside the selected local lane**; on existing Herdr-only lanes they fail instead of falling back to Herdr. There is no new TUIOS installation in this slice.
+Status: **source-only prototype** in this personal clone. The opt-in lane startup/attach path has been added, but no image, MCP tool, guidance bundle, or production lane has been migrated. Do not use this as evidence of a 2/2 reinstall or deployment. The existing v1 `herdr.schema`/`herdr.call` behavior remains unchanged for current lanes. `tuios.schema` and `tuios.read` require both an opted-in lane and a **separately provisioned TUIOS daemon inside it**; on existing Herdr-only lanes they fail instead of falling back to Herdr. There is no new TUIOS installation in this slice.
 
 ## Verified source contracts (upstream docs consulted 2026-10-30)
 
@@ -12,14 +12,35 @@ Status: **source-only prototype** in this personal clone. No image, runtime, lau
 
 - `Containerfile` and `Containerfile.pi` pin Herdr 0.8.2, create `worklane-herdr.service`, and embed Herdr-specific bootstrap. `worklane/src/main.rs` installs Herdr integration/config, reconciles workspace, agent and diff pane using Herdr IDs/CLI, attaches via Herdr, and snapshots via its API. `assets/worklane-show-image` uses the experimental Herdr pane graphics API.
 - `worklane/src/api.rs` bridges a local container's **session-specific** Herdr socket and checks the installed Herdr schema before calls. `worklane-mcp/src/main.rs`, `docs/connector.md`, `tests/connector_acceptance.py`, `scripts/lab-acceptance`, and CLI/runtime tests expose and assert this contract. `docs/agents/lane.md` documents Herdr as the lane control plane. These are migration work, not addressed by this patch.
-- New `tuios.schema` asks the **native daemon socket** for `list-verbs`, and `tuios.read` allows only `hello`, `list-sessions`, `list-workspaces`, `list-windows`, `session-info`, `get-window`, `list-agents`, `get-agent-state`, `capture-pane`. Both use the existing local-only, timeout-bound, size-bound Podman bridge; `tuios.read` enforces exact lane session for scoped reads and a nonempty explicit window for pane reads. Responses retain the native `result`/`error` envelope (inside Worklane's outer API envelope). No mutation verbs or streaming are exposed. Schema discovery is not a license to invoke other verbs.
+- New `tuios.schema` asks the **native daemon socket** for `list-verbs`, and `tuios.read` allows only `hello`, `list-sessions`, `list-workspaces`, `list-windows`, `session-info`, `get-window`, `list-agents`, `get-agent-state`, `capture-pane`. Both reject lanes without `terminal_backend = "tuios-v3"`; conversely `herdr.schema` and `herdr.call` reject opted-in lanes. Native reads use the existing local-only, timeout-bound, size-bound Podman bridge; `tuios.read` enforces exact lane session for scoped reads and a nonempty explicit window for pane reads. Responses retain the native `result`/`error` envelope (inside Worklane's outer API envelope). No mutation verbs or streaming are exposed. Schema discovery is not a license to invoke other verbs.
 - `list-sessions` reports *all* sessions in the selected lane's daemon, not just the lane session. It must not be confused with Herdr's per-session snapshot. TUIOS grants are an additional in-daemon authorization boundary, not a substitute for the Worklane bridge's allowlist.
+
+## Opt-in native lifecycle slice
+
+`Profile.terminal_backend` defaults to `herdr` and is **omitted from serialization** when defaulted, preserving existing profile/manifests and config hashes. Only an explicitly selected `terminal_backend = "tuios-v3"` on a **custom image** (`embedded_containerfile = false`) selects the new path. No global environment switch can accidentally select it. The custom image must already contain `tuios`; otherwise startup fails closed. This clone does not build or install such an image.
+
+For opted-in lanes, `lane start` bootstraps a named detached TUIOS session after starting the container; `lane open` does so and reads native `tuios session-info -s NAME --json`; `lane attach` uses `tuios attach NAME` with an explicit session. All invoke TUIOS **inside the selected lane**. The separate minimal shell bootstrap avoids the Herdr config, Herdr reconciler, Herdr-native graphics helper and Herdr git-diff manager. A plain `--shell` remains a plain shell. There is **no fallback to Herdr** on missing TUIOS, failed session creation, or invalid session info. The first TUIOS window is a shell; automatic agent launch, persistent supervision, guidance, diff view and image presentation remain unimplemented. Opted-in custom images must not start a separate Herdr service themselves; Worklane does not control custom image contents.
+
+Test-only example profile (not a production image recipe):
+
+```toml
+[profiles.tuios-experiment]
+image = "localhost/worklane-tuios-test:local"
+embedded_containerfile = false
+terminal_backend = "tuios-v3"
+runtime = "systemd"
+```
+
+### Removal and coverage acceptance criteria
+
+- For **full replacement**, audit with `rg -n -i 'herdr' Containerfile Containerfile.pi assets worklane worklane-core worklane-mcp docs/agents scripts tests docs/connector.md README.md` after migration. Resolve every *active* runtime, embedded image, unit, connector, MCP, script, acceptance, agent-guidance and user-facing reference; isolate historical transition notes only. Confirm both images contain no Herdr binary/service or `.herdr` shim requirement, the v3 API cannot call the Herdr bridge, and attach/start/open/image/diff/agent behavior is natively tested. Search alone is not proof: enforce negative tests with Herdr absent from PATH and image, and fresh lane/PTY acceptance. Do not claim replacement while legacy Herdr remains an active default.
+- The repository's actual coverage gate is `cargo llvm-cov --workspace --fail-under-lines 90` (see `.github/workflows/ci.yml`); `scripts/release-check` also runs `cargo llvm-cov --workspace --fail-under-lines 90 -- --test-threads=1`. Measure **unit-only** coverage separately with `cargo llvm-cov --workspace --lib --bins --fail-under-lines 90` (and record line percentage and uncovered files), plus the full workspace gate. Target **at least 90% lines** on both, with regression tests for fallback denial, idempotency, errors, selection, and old-manifest hashes. At this slice, measured unit-only workspace line coverage is **69.65%** (`cargo llvm-cov --offline --workspace --lib --bins --summary-only -- --test-threads=1`), below the target; no full workspace coverage result is claimed.
 
 ## Next checkpoints before any runtime cutover
 
 1. Pin and checksum a TUIOS release; inspect its actual `list-verbs` and `hello` in an **isolated test container**, confirm session/window ID formats, daemon socket permissions, environment/systemd supervision, config, terminal attach behavior, and safe shutdown/rollback. Reject incompatible daemon protocol versions rather than guessing.
-2. Migrate image(s), session reconcile/attach/agent detection, service unit, diff pane, helper/graphics behavior (TUIOS images are not Herdr native pane graphics), guidance and all references; decide whether to keep an explicit Herdr compatibility shim for external consumers. Do not silently repoint the old Herdr socket bridge.
+2. Migrate image(s), agent launch/detection, supervision unit, diff pane, helper/graphics behavior (TUIOS images are not Herdr native pane graphics), guidance and all references; remove Herdr rather than relying on an indefinite compatibility shim. Do not silently repoint the old Herdr socket bridge.
 3. Add MCP read tools and reviewed write operations with explicit targets, typed/native schema validation and grant checks; run negative tests for cross-session and focus defaults, socket failures, oversized and malformed responses.
 4. Update acceptance fixtures and perform **whole-stack isolated acceptance**, including fresh lane create/attach/restart/agent/diff/TUI captures and a documented 2/2 reinstall only when actually executed. No rollout to running software_lab lanes or production accounts in this effort.
 
-Local Rust tests cover API validation and execute the real Python bridge against a fixture-owned Unix socket while mocking only `podman exec`/`timeout`; they do not test a running TUIOS daemon or a production migration.
+Local Rust tests cover API validation and execute the real Python bridge against a fixture-owned Unix socket while mocking only `podman exec`/`timeout`; shell tests mock `tuios` to check idempotent session creation and fail-closed errors. They do not test a running TUIOS daemon or a production migration. An exploratory `cargo test --offline --workspace` was **not green**: the unchanged `lane/tests/tui_smoke.rs::attach_cannot_poison_the_calling_shell_terminal` fixture uses host `lab` without registering it and its PTY transcript reports `Error: unknown host`. A single-test retry reproduced the failure; this slice does not repair the unrelated TUI fixture.

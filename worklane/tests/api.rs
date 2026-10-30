@@ -7,7 +7,7 @@ use std::{
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
-use worklane_core::{write_lane_spec, LaneSpec, Profile, Store};
+use worklane_core::{write_lane_spec, LaneSpec, Profile, Store, TerminalBackend};
 
 fn fixture(name: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!("worklane-api-{name}-{}", std::process::id()));
@@ -310,7 +310,7 @@ fn tuios_reads_use_native_socket_protocol_without_herdr_fallback() {
     let root = fixture("tuios");
     let project = root.join("lane-home");
     fs::create_dir_all(&project).unwrap();
-    let spec = LaneSpec::new(
+    let mut spec = LaneSpec::new(
         "connector-test".into(),
         "local".into(),
         project,
@@ -320,10 +320,36 @@ fn tuios_reads_use_native_socket_protocol_without_herdr_fallback() {
     write_lane_spec(&spec).unwrap();
     let database = root.join("data/worklane/worklane-v5.db");
     fs::create_dir_all(database.parent().unwrap()).unwrap();
-    Store::open(&database)
+    let store = Store::open(&database).unwrap();
+    store.save_lane(&spec, "running", false).unwrap();
+    let legacy = call_mode(
+        &root,
+        json!({"version":1,"request_id":"legacy","method":"tuios.schema","params":{"lane":"connector-test"}}),
+        true,
+        None,
+    );
+    assert_eq!(legacy["ok"], false, "{legacy}");
+    assert!(legacy["error"]["message"]
+        .as_str()
         .unwrap()
-        .save_lane(&spec, "running", false)
-        .unwrap();
+        .contains("opted into"));
+    spec.profile.embedded_containerfile = false;
+    spec.profile.terminal_backend = TerminalBackend::TuiosV3;
+    write_lane_spec(&spec).unwrap();
+    store.save_lane(&spec, "running", false).unwrap();
+    for method in ["herdr.schema", "herdr.call"] {
+        let rejected = call_mode(
+            &root,
+            json!({"version":1,"request_id":"no-herdr","method":method,"params":{"lane":"connector-test","method":"pane.read"}}),
+            true,
+            None,
+        );
+        assert_eq!(rejected["ok"], false, "{rejected}");
+        assert!(rejected["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("unavailable for a tuios-v3 lane"));
+    }
 
     let bin = root.join("bin");
     fs::create_dir_all(&bin).unwrap();
