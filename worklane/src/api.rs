@@ -945,6 +945,195 @@ mod tests {
             assert!(validate_tuios_read(verb, &json!({"session":session}), session).is_err());
         }
         assert!(validate_tuios_read("hello", &json!([]), session).is_err());
+        assert!(validate_tuios_read("hello", &json!({"host":"remote"}), session).is_err());
+        for verb in ["get-window", "get-agent-state", "capture-pane"] {
+            assert!(
+                validate_tuios_read(verb, &json!({"session":session,"window":""}), session)
+                    .is_err()
+            );
+            assert!(
+                validate_tuios_read(verb, &json!({"session":session,"window":"w1"}), session)
+                    .is_ok()
+            );
+        }
+        for verb in ["list-workspaces", "list-agents", "session-info"] {
+            assert!(validate_tuios_read(verb, &json!({"session":session}), session).is_ok());
+            assert!(validate_tuios_read(verb, &json!({"session":"other"}), session).is_err());
+        }
+    }
+
+    #[test]
+    fn lifecycle_argv_mapping_is_explicit_for_each_mutating_and_read_shape() {
+        let cases = [
+            ("lane.list", json!({}), vec!["lane", "list"]),
+            (
+                "lane.inspect",
+                json!({"lane":"x", "fast":true}),
+                vec!["lane", "inspect", "x", "--fast"],
+            ),
+            (
+                "lane.refresh",
+                json!({"all":true}),
+                vec!["lane", "refresh", "--all"],
+            ),
+            (
+                "lane.diff",
+                json!({"lane":"x", "raw":true}),
+                vec!["lane", "diff", "x", "--raw"],
+            ),
+            (
+                "lane.reconcile.report",
+                json!({"lane":"x"}),
+                vec!["lane", "reconcile", "x"],
+            ),
+            (
+                "lane.reconcile.apply",
+                json!({"all":true}),
+                vec!["lane", "reconcile", "--all", "--apply"],
+            ),
+            (
+                "lane.create",
+                json!({"name":"x", "project":"/safe/project", "profile":"custom"}),
+                vec![
+                    "lane",
+                    "create",
+                    "x",
+                    "--project",
+                    "/safe/project",
+                    "--profile",
+                    "custom",
+                ],
+            ),
+            (
+                "lane.import",
+                json!({"path":"/safe/lane"}),
+                vec!["lane", "import", "/safe/lane"],
+            ),
+            ("lane.open", json!({"lane":"x"}), vec!["lane", "open", "x"]),
+            (
+                "lane.start",
+                json!({"lane":"x"}),
+                vec!["lane", "start", "x"],
+            ),
+            ("lane.stop", json!({"lane":"x"}), vec!["lane", "stop", "x"]),
+            (
+                "lane.delete",
+                json!({"lane":"x"}),
+                vec!["lane", "delete", "x"],
+            ),
+            (
+                "lane.forget",
+                json!({"lane":"x"}),
+                vec!["lane", "forget", "x"],
+            ),
+            (
+                "lane.rename",
+                json!({"lane":"x", "new_name":"y"}),
+                vec!["lane", "rename", "x", "y"],
+            ),
+            (
+                "lane.upgrade",
+                json!({"lane":"x", "force":true, "no_cache":true}),
+                vec!["lane", "upgrade", "x", "--force", "--no-cache"],
+            ),
+        ];
+        for (method, params, expected) in cases {
+            assert_eq!(command_args(method, &params).unwrap(), expected, "{method}");
+        }
+        for (method, params) in [
+            ("lane.start", json!([])),
+            ("lane.open", json!({})),
+            ("lane.inspect", json!({"lane":""})),
+            ("lane.inspect", json!({"lane":"x", "fast":"true"})),
+            ("lane.refresh", json!({})),
+            ("lane.refresh", json!({"all":"true"})),
+            ("lane.create", json!({"name":"x", "project":"relative"})),
+            ("lane.import", json!({"path":"relative"})),
+            ("lane.rename", json!({"lane":"x"})),
+            ("lane.upgrade", json!({"lane":"x", "no_cache":"true"})),
+            ("arbitrary-command", json!({})),
+        ] {
+            assert!(command_args(method, &params).is_err(), "{method}: {params}");
+        }
+        assert!(is_change_method("lane.open"));
+        assert!(!is_change_method("lane.inspect"));
+    }
+
+    #[test]
+    fn native_bridge_validation_requires_stable_targets_and_rejects_unbounded_methods() {
+        let methods = [
+            "workspace.rename",
+            "tab.focus",
+            "tab.create",
+            "pane.read",
+            "pane.split",
+            "agent.prompt",
+            "agent.start",
+            "agent.list",
+            "events.subscribe",
+            "server.live_handoff",
+            "pane.graphics.set",
+            "pane.current",
+        ];
+        let schema = json!({"schemas":{"request":{"oneOf":methods.iter().map(|method| {
+            json!({"properties":{"method":{"const":method}}})
+        }).collect::<Vec<_>>()}}});
+        for (method, key) in [
+            ("workspace.rename", "workspace_id"),
+            ("tab.focus", "tab_id"),
+            ("tab.create", "workspace_id"),
+            ("pane.read", "pane_id"),
+            ("agent.prompt", "target"),
+            ("agent.start", "pane_id"),
+        ] {
+            assert!(
+                validate_herdr_call(method, &json!({}), &schema).is_err(),
+                "{method}"
+            );
+            let mut params = serde_json::Map::new();
+            params.insert(key.into(), json!("explicit"));
+            assert!(
+                validate_herdr_call(method, &Value::Object(params), &schema).is_ok(),
+                "{method}"
+            );
+        }
+        assert!(validate_herdr_call("pane.split", &json!({}), &schema).is_err());
+        assert!(validate_herdr_call("pane.split", &json!({"workspace_id":"w1"}), &schema).is_ok());
+        assert!(
+            validate_herdr_call("pane.split", &json!({"target_pane_id":"p1"}), &schema).is_ok()
+        );
+        assert!(validate_herdr_call("agent.list", &json!({}), &schema).is_ok());
+        for method in [
+            "events.subscribe",
+            "server.live_handoff",
+            "pane.graphics.set",
+            "pane.current",
+        ] {
+            assert!(
+                validate_herdr_call(method, &json!({}), &schema).is_err(),
+                "{method}"
+            );
+        }
+        assert!(validate_herdr_call("missing", &json!({}), &schema).is_err());
+        assert!(validate_herdr_call("pane.read", &json!([]), &schema).is_err());
+    }
+
+    #[test]
+    fn api_envelope_and_operation_id_fail_closed() {
+        let ok = response("request-a".into(), Ok(json!({"value":1})));
+        assert!(ok.ok);
+        assert_eq!(ok.result.unwrap()["value"], 1);
+        let failed = response("request-b".into(), Err(anyhow::anyhow!("invalid input")));
+        assert!(!failed.ok);
+        assert!(failed.error.unwrap().message.contains("invalid input"));
+        assert!(validate_operation_id("00000000-0000-4000-8000-000000000001").is_ok());
+        for invalid in [
+            "not-a-uuid",
+            "00000000-0000-4000-8000-000000000001/../other",
+            "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
+        ] {
+            assert!(validate_operation_id(invalid).is_err());
+        }
     }
 
     #[test]

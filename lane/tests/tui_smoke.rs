@@ -8,7 +8,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use worklane_core::{LaneSpec, Profile, Store};
+use worklane_core::{Host, LaneSpec, Profile, Store};
 
 fn shell_quote(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
@@ -64,10 +64,17 @@ fn attach_cannot_poison_the_calling_shell_terminal() {
         Profile::default(),
     )
     .unwrap();
-    Store::open(data.join("worklane/worklane-v5.db"))
-        .unwrap()
-        .save_lane(&spec, "running", false)
+    let store = Store::open(data.join("worklane/worklane-v5.db")).unwrap();
+    store
+        .upsert_host(&Host {
+            name: "lab".into(),
+            ssh_target: "lab.example.invalid".into(),
+            local: false,
+            installed_version: None,
+            last_seen: None,
+        })
         .unwrap();
+    store.save_lane(&spec, "running", false).unwrap();
     let worklane = bin.join("worklane");
     let attached = root.join("attached");
     fs::write(
@@ -82,7 +89,8 @@ fn attach_cannot_poison_the_calling_shell_terminal() {
     let result_path = root.join("result");
     let transcript_path = root.join("transcript");
     let command = format!(
-        "before=$(stty -g); {}; lane_status=$?; after=$(stty -g); printf '%s\\n%s\\n%s\\n' \"$before\" \"$after\" \"$lane_status\" > {}",
+        "PATH={}:\"$PATH\"; export PATH; before=$(stty -g); {}; lane_status=$?; after=$(stty -g); printf '%s\\n%s\\n%s\\n' \"$before\" \"$after\" \"$lane_status\" > {}",
+        shell_quote(&bin),
         shell_quote(Path::new(env!("CARGO_BIN_EXE_lane"))),
         shell_quote(&result_path),
     );

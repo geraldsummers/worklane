@@ -4,6 +4,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
+use worklane_core::{write_lane_spec, LaneSpec, Profile, RuntimeMode, Store, TerminalBackend};
 
 const SMOKE_ID: &str = "00000000-0000-4000-8000-000000000001";
 const REGISTRY_ONLY_ID: &str = "00000000-0000-4000-8000-000000000002";
@@ -105,6 +106,156 @@ fn run_with_input(binary: &str, data: &Path, bin: &Path, input: &[u8]) -> std::p
         .unwrap();
     child.stdin.take().unwrap().write_all(input).unwrap();
     child.wait_with_output().unwrap()
+}
+
+#[test]
+fn opted_in_tuios_start_open_attach_and_failures_never_route_to_herdr() {
+    let root = temp("tuios-lifecycle");
+    let data = root.join("data");
+    let bin = root.join("bin");
+    let project = root.join("project");
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(&project).unwrap();
+    let profile = Profile {
+        image: "custom-tuios:test".into(),
+        embedded_containerfile: false,
+        runtime: RuntimeMode::PodmanInit,
+        terminal_backend: TerminalBackend::TuiosV3,
+        mount_codex_credentials: false,
+        mount_gh_credentials: false,
+        ..Profile::default()
+    };
+    let spec = LaneSpec::new("tuios-test".into(), "local".into(), project, profile).unwrap();
+    write_lane_spec(&spec).unwrap();
+    let database = data.join("worklane/worklane-v5.db");
+    fs::create_dir_all(database.parent().unwrap()).unwrap();
+    Store::open(&database)
+        .unwrap()
+        .save_lane(&spec, "running", false)
+        .unwrap();
+    let podman = bin.join("podman");
+    fs::write(
+        &podman,
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "$0.log"
+case "$*" in
+  "container exists "*) exit 0 ;;
+  *"{{.State.Status}}"*) printf 'running\n' ;;
+  *"{{.State.StartedAt}}"*) printf '2026-01-01T00:00:00Z\n' ;;
+  *"io.worklane.config-sha256"*) printf '<no value>\n' ;;
+  "diff "*) : ;;
+  *"tuios session-info -s tuios-test --json"*)
+    if test -e "$0.bad-info"; then printf 'not-json\n'; else printf '{"name":"tuios-test"}\n'; fi ;;
+  "exec --user "*)
+    case "$*" in
+      *"tuios new"*)
+        if test -e "$0.fail"; then printf 'injected TUIOS failure\n' >&2; exit 23; fi ;;
+    esac
+    ;;
+  "exec -it "*) : ;;
+  *) printf 'unexpected podman call: %s\n' "$*" >&2; exit 1 ;;
+esac
+"#,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&podman, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let binary = env!("CARGO_BIN_EXE_worklane");
+    let selected = ["--json", "lane", "start", "tuios-test"];
+    assert!(run(binary, &data, &bin, &selected).contains("running"));
+    let opened = run(
+        binary,
+        &data,
+        &bin,
+        &["--json", "lane", "open", "tuios-test"],
+    );
+    assert!(opened.contains("\"name\":\"tuios-test\""), "{opened}");
+    let log = fs::read_to_string(podman.with_extension("log")).unwrap();
+    assert!(log.contains("tuios new"));
+    assert!(log.contains("tuios session-info -s tuios-test --json"));
+    assert!(!log.to_lowercase().contains("herdr"));
+
+    fs::write(podman.with_extension("log"), "").unwrap();
+    assert!(run(binary, &data, &bin, &["lane", "attach", "tuios-test"]).is_empty());
+    let log = fs::read_to_string(podman.with_extension("log")).unwrap();
+    assert!(log.contains("tuios attach tuios-test"), "{log}");
+    assert!(!log.to_lowercase().contains("herdr"));
+    let before = Store::open(&database)
+        .unwrap()
+        .lane("tuios-test")
+        .unwrap()
+        .last_attached;
+    fs::write(podman.with_extension("fail"), "").unwrap();
+    fs::write(podman.with_extension("log"), "").unwrap();
+    let error = run_failure(binary, &data, &bin, &["lane", "attach", "tuios-test"]);
+    assert!(error.contains("TUIOS session bootstrap failed"), "{error}");
+    assert!(error.contains("injected TUIOS failure"), "{error}");
+    let log = fs::read_to_string(podman.with_extension("log")).unwrap();
+    assert!(!log.lines().any(|line| line.starts_with("exec -it")));
+    assert!(!log.to_lowercase().contains("herdr"));
+    assert_eq!(
+        Store::open(&database)
+            .unwrap()
+            .lane("tuios-test")
+            .unwrap()
+            .last_attached,
+        before
+    );
+    let open_error = run_failure(binary, &data, &bin, &["lane", "open", "tuios-test"]);
+    assert!(
+        open_error.contains("TUIOS session bootstrap failed"),
+        "{open_error}"
+    );
+    let start_error = run_failure(binary, &data, &bin, &["lane", "start", "tuios-test"]);
+    assert!(
+        start_error.contains("TUIOS session bootstrap failed"),
+        "{start_error}"
+    );
+    assert_eq!(
+        Store::open(&database)
+            .unwrap()
+            .lane("tuios-test")
+            .unwrap()
+            .last_attached,
+        before
+    );
+    fs::write(podman.with_extension("log"), "").unwrap();
+    assert!(run(
+        binary,
+        &data,
+        &bin,
+        &["lane", "attach", "tuios-test", "--shell"]
+    )
+    .is_empty());
+    let log = fs::read_to_string(podman.with_extension("log")).unwrap();
+    assert!(!log.contains("systemd-run")); // Podman-init uses a plain login shell.
+    assert!(log.contains(" zsh -l"), "{log}");
+    assert!(!log.to_lowercase().contains("herdr"));
+    assert!(!log.contains("tuios new"));
+    fs::remove_file(podman.with_extension("fail")).unwrap();
+    let before_open = Store::open(&database)
+        .unwrap()
+        .lane("tuios-test")
+        .unwrap()
+        .last_attached;
+    fs::write(podman.with_extension("bad-info"), "").unwrap();
+    let error = run_failure(binary, &data, &bin, &["lane", "open", "tuios-test"]);
+    assert!(
+        error.contains("TUIOS returned invalid session info"),
+        "{error}"
+    );
+    assert_eq!(
+        Store::open(&database)
+            .unwrap()
+            .lane("tuios-test")
+            .unwrap()
+            .last_attached,
+        before_open // --shell updated this; open failure must leave it unchanged.
+    );
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
