@@ -1344,6 +1344,120 @@ fn ensure_no_pending_operation(spec: &LaneSpec, verb: &str) -> Result<()> {
     }
     Ok(())
 }
+fn resume_existing_local_lane(
+    runner: &impl Runner,
+    store: &Store,
+    project: &Path,
+    name: &str,
+    requested_id: Option<&str>,
+) -> Result<Option<LaneStatus>> {
+    let manifest_path = project.join(".worklane/lane.toml");
+    if !manifest_path.exists() {
+        return Ok(None);
+    }
+    let existing = read_lane_spec(&manifest_path, "local".into(), None)?;
+    if existing.name != name {
+        bail!(
+            "directory already contains lane '{}' ({}) rather than requested lane '{name}'",
+            existing.name,
+            existing.id
+        )
+    }
+    if let Some(id) = requested_id {
+        if id != existing.id {
+            bail!(
+                "existing lane '{}' has UUID '{}', not requested UUID '{}'",
+                existing.name,
+                existing.id,
+                id
+            )
+        }
+    }
+    if let Some(journal) = read_operation_journal(&existing)? {
+        if journal.kind != "create"
+            || journal.requested_name != name
+            || journal.desired_manifest_sha256 != manifest_sha256(&existing)?
+        {
+            bail!(
+                "project has a pending '{}' operation at '{}'; retry it or run lane reconcile",
+                journal.kind,
+                journal.phase
+            )
+        }
+    }
+    store.save_lane(&existing, "unknown", false)?;
+    ensure_local_started(runner, &existing)?;
+    clear_operation_journal(&existing)?;
+    refresh(runner, store, &existing).map(Some)
+}
+#[derive(Clone, Copy)]
+struct NewLaneRequest<'a> {
+    name: &'a str,
+    host: &'a str,
+    project: &'a Path,
+    requested_id: Option<&'a str>,
+    profile_name: &'a str,
+    profile_json: Option<&'a str>,
+    pending: Option<&'a OperationJournal>,
+}
+fn prepare_new_lane(
+    store: &Store,
+    request: NewLaneRequest<'_>,
+    profiles: impl FnOnce() -> Result<std::collections::BTreeMap<String, Profile>>,
+) -> Result<LaneSpec> {
+    let NewLaneRequest {
+        name,
+        host,
+        project,
+        requested_id,
+        profile_name,
+        profile_json,
+        pending,
+    } = request;
+    let mut spec = if let Some(journal) = pending {
+        if journal.kind != "create" || journal.requested_name != name {
+            bail!(
+                "project has an unfinished '{}' operation for lane '{}'; run lane reconcile before creating",
+                journal.kind,
+                journal.requested_name
+            )
+        }
+        LaneSpec::from_manifest(
+            journal.desired_manifest.clone(),
+            host.into(),
+            project.into(),
+            None,
+        )?
+    } else {
+        let mut selected_profile: Profile = match profile_json {
+            Some(json) => serde_json::from_str(json)?,
+            None => profiles()?
+                .remove(profile_name)
+                .with_context(|| format!("unknown profile '{profile_name}'"))?,
+        };
+        selected_profile.resolve_runtime_for_new_lane();
+        let mut created =
+            LaneSpec::new(name.into(), host.into(), project.into(), selected_profile)?;
+        created.profile_name = profile_name.into();
+        created
+    };
+    if let Some(id) = requested_id {
+        validate_lane_id(id)?;
+        if pending.is_some() && spec.id != id {
+            bail!(
+                "pending lane '{}' has UUID '{}', not requested UUID '{}'",
+                spec.name,
+                spec.id,
+                id
+            )
+        }
+        spec.id = id.into();
+        spec.container_name = stable_container_name(&spec.session_name, id);
+    }
+    validate_profile(&spec.profile, &spec.container_home(), spec.host == "local")?;
+    validate_lane_registration(store, &spec)?;
+    Ok(spec)
+}
 fn create_local_lane(
     runner: &impl Runner,
     store: &Store,
@@ -2599,43 +2713,10 @@ fn main() -> Result<()> {
                         project
                     };
                     if host == "local" {
-                        let manifest_path = p.join(".worklane/lane.toml");
-                        if manifest_path.exists() {
-                            let existing = read_lane_spec(&manifest_path, host.clone(), None)?;
-                            if existing.name != name {
-                                bail!(
-                                    "directory already contains lane '{}' ({}) rather than requested lane '{name}'",
-                                    existing.name,
-                                    existing.id
-                                )
-                            }
-                            if let Some(requested_id) = &id {
-                                if requested_id != &existing.id {
-                                    bail!(
-                                        "existing lane '{}' has UUID '{}', not requested UUID '{}'",
-                                        existing.name,
-                                        existing.id,
-                                        requested_id
-                                    )
-                                }
-                            }
-                            if let Some(journal) = read_operation_journal(&existing)? {
-                                if journal.kind != "create"
-                                    || journal.requested_name != name
-                                    || journal.desired_manifest_sha256
-                                        != manifest_sha256(&existing)?
-                                {
-                                    bail!(
-                                        "project has a pending '{}' operation at '{}'; retry it or run lane reconcile",
-                                        journal.kind,
-                                        journal.phase
-                                    )
-                                }
-                            }
-                            store.save_lane(&existing, "unknown", false)?;
-                            ensure_local_started(&runner, &existing)?;
-                            clear_operation_journal(&existing)?;
-                            return emit(cli.json, &refresh(&runner, &store, &existing)?);
+                        if let Some(status) =
+                            resume_existing_local_lane(&runner, &store, &p, &name, id.as_deref())?
+                        {
+                            return emit(cli.json, &status);
                         }
                     }
                     let pending = if host == "local" {
@@ -2643,48 +2724,19 @@ fn main() -> Result<()> {
                     } else {
                         None
                     };
-                    let mut spec = if let Some(journal) = &pending {
-                        if journal.kind != "create" || journal.requested_name != name {
-                            bail!(
-                                "project has an unfinished '{}' operation for lane '{}'; run lane reconcile before creating",
-                                journal.kind,
-                                journal.requested_name
-                            )
-                        }
-                        LaneSpec::from_manifest(
-                            journal.desired_manifest.clone(),
-                            host.clone(),
-                            p.clone(),
-                            None,
-                        )?
-                    } else {
-                        let mut selected_profile: Profile = match profile_json {
-                            Some(json) => serde_json::from_str(&json)?,
-                            None => load_profiles()?
-                                .remove(&profile_name)
-                                .with_context(|| format!("unknown profile '{profile_name}'"))?,
-                        };
-                        selected_profile.resolve_runtime_for_new_lane();
-                        let mut created =
-                            LaneSpec::new(name.clone(), host.clone(), p.clone(), selected_profile)?;
-                        created.profile_name = profile_name;
-                        created
-                    };
-                    if let Some(id) = id {
-                        validate_lane_id(&id)?;
-                        if pending.is_some() && spec.id != id {
-                            bail!(
-                                "pending lane '{}' has UUID '{}', not requested UUID '{}'",
-                                spec.name,
-                                spec.id,
-                                id
-                            )
-                        }
-                        spec.id = id.clone();
-                        spec.container_name = stable_container_name(&spec.session_name, &id);
-                    }
-                    validate_profile(&spec.profile, &spec.container_home(), spec.host == "local")?;
-                    validate_lane_registration(&store, &spec)?;
+                    let mut spec = prepare_new_lane(
+                        &store,
+                        NewLaneRequest {
+                            name: &name,
+                            host: &host,
+                            project: &p,
+                            requested_id: id.as_deref(),
+                            profile_name: &profile_name,
+                            profile_json: profile_json.as_deref(),
+                            pending: pending.as_ref(),
+                        },
+                        load_profiles,
+                    )?;
                     if spec.host == "local" {
                         create_local_lane(&runner, &store, &spec, pending)?;
                     } else {
@@ -4555,6 +4607,208 @@ esac
         );
         assert!(store.index(&delete.id).is_err());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn new_v3_lane_selection_prefers_verified_pending_manifest_over_config_or_new_id() {
+        use std::collections::BTreeMap;
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../target/tmp/v3-selection-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(root.join("registry.db")).unwrap();
+        let profile = Profile {
+            image: "custom-tuios:test".into(),
+            terminal_backend: TerminalBackend::TuiosV3,
+            agent: AgentKind::Pi,
+            embedded_containerfile: false,
+            mount_codex_credentials: false,
+            mount_gh_credentials: false,
+            runtime: RuntimeMode::Auto,
+            ..Profile::default()
+        };
+        let selected = || Ok(BTreeMap::from([("native".into(), profile.clone())]));
+        let project = root.join("project");
+        let request = NewLaneRequest {
+            name: "private",
+            host: "local",
+            project: &project,
+            requested_id: None,
+            profile_name: "native",
+            profile_json: None,
+            pending: None,
+        };
+        let lane = prepare_new_lane(&store, request, selected).unwrap();
+        assert_eq!(lane.profile.terminal_backend, TerminalBackend::TuiosV3);
+        assert_eq!(lane.profile.effective_runtime(), RuntimeMode::PodmanInit);
+        assert_eq!(lane.profile_name, "native");
+        assert_eq!(
+            lane.container_name(),
+            stable_container_name(&lane.session_name(), &lane.id)
+        );
+        let pending = OperationJournal::new(&lane, "create", "prepared").unwrap();
+        let restored = prepare_new_lane(
+            &store,
+            NewLaneRequest {
+                requested_id: Some(&lane.id),
+                profile_name: "unused",
+                profile_json: Some("bad-profile-json"),
+                pending: Some(&pending),
+                ..request
+            },
+            || panic!("pending journal must not read profiles"),
+        )
+        .unwrap();
+        assert_eq!(restored.id, lane.id);
+        assert_eq!(restored.profile, lane.profile);
+        let different_id = uuid::Uuid::new_v4().to_string();
+        assert!(prepare_new_lane(
+            &store,
+            NewLaneRequest {
+                requested_id: Some(&different_id),
+                pending: Some(&pending),
+                ..request
+            },
+            || panic!("no profile read")
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("not requested UUID"));
+        let foreign = OperationJournal::new(&lane, "upgrade", "prepared").unwrap();
+        assert!(prepare_new_lane(
+            &store,
+            NewLaneRequest {
+                pending: Some(&foreign),
+                ..request
+            },
+            || panic!("no profile read")
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("unfinished 'upgrade'"));
+        assert!(prepare_new_lane(
+            &store,
+            NewLaneRequest {
+                profile_name: "unknown",
+                ..request
+            },
+            || Ok(BTreeMap::new())
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("unknown profile"));
+        assert!(prepare_new_lane(
+            &store,
+            NewLaneRequest {
+                profile_json: Some("{bad-json"),
+                ..request
+            },
+            || panic!("JSON profile must not consult host profiles")
+        )
+        .is_err());
+        let mut invalid = profile.clone();
+        invalid.embedded_containerfile = true;
+        let invalid_json = serde_json::to_string(&invalid).unwrap();
+        assert!(prepare_new_lane(
+            &store,
+            NewLaneRequest {
+                profile_json: Some(&invalid_json),
+                ..request
+            },
+            || panic!("JSON profile must not consult host profiles")
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("custom image"));
+        store.save_lane(&lane, "created", false).unwrap();
+        assert!(prepare_new_lane(&store, request, || Ok(BTreeMap::from([(
+            "native".into(),
+            profile
+        )])))
+        .unwrap_err()
+        .to_string()
+        .contains("already registered"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn existing_v3_manifest_replay_validates_identity_and_rejects_foreign_journals() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../target/tmp/v3-existing-manifest-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(root.join("registry.db")).unwrap();
+        let mut lane = spec("local");
+        lane.project_path = root.join("lane");
+        lane.profile.terminal_backend = TerminalBackend::TuiosV3;
+        lane.profile.agent = AgentKind::Pi;
+        lane.profile.embedded_containerfile = false;
+        std::fs::create_dir_all(&lane.project_path).unwrap();
+        let runner = MockRunner::new();
+        assert!(
+            resume_existing_local_lane(&runner, &store, &lane.project_path, &lane.name, None)
+                .unwrap()
+                .is_none()
+        );
+        write_lane_spec(&lane).unwrap();
+        assert!(resume_existing_local_lane(
+            &runner,
+            &store,
+            &lane.project_path,
+            "other-name",
+            None
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("rather than requested"));
+        let another_id = uuid::Uuid::new_v4().to_string();
+        assert!(resume_existing_local_lane(
+            &runner,
+            &store,
+            &lane.project_path,
+            &lane.name,
+            Some(&another_id)
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("not requested UUID"));
+        let foreign = OperationJournal::new(&lane, "upgrade", "prepared").unwrap();
+        write_operation_journal(&lane, &foreign).unwrap();
+        assert!(
+            resume_existing_local_lane(&runner, &store, &lane.project_path, &lane.name, None)
+                .unwrap_err()
+                .to_string()
+                .contains("pending 'upgrade'")
+        );
+        assert!(store.index(&lane.id).is_err());
+        clear_operation_journal(&lane).unwrap();
+        let journal = OperationJournal::new(&lane, "create", "runtime-applied").unwrap();
+        write_operation_journal(&lane, &journal).unwrap();
+        let first = resume_existing_local_lane(
+            &runner,
+            &store,
+            &lane.project_path,
+            &lane.name,
+            Some(&lane.id),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(first.spec.id, lane.id);
+        assert_eq!(
+            first.spec.profile.terminal_backend,
+            TerminalBackend::TuiosV3
+        );
+        assert!(read_operation_journal(&lane).unwrap().is_none());
+        assert_eq!(store.index(&lane.id).unwrap().state, "running");
+        let second =
+            resume_existing_local_lane(&runner, &store, &lane.project_path, &lane.name, None)
+                .unwrap()
+                .unwrap();
+        assert_eq!(second.spec.id, first.spec.id);
+        assert_eq!(second.spec.session_name(), first.spec.session_name());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
