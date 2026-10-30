@@ -1,10 +1,11 @@
 use serde_json::{json, Value};
 use std::{
     fs,
-    io::Write,
-    os::unix::fs::PermissionsExt,
+    io::{BufRead, BufReader, Write},
+    os::{unix::fs::PermissionsExt, unix::net::UnixListener},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    time::{Duration, Instant},
 };
 use worklane_core::{write_lane_spec, LaneSpec, Profile, Store};
 
@@ -301,5 +302,127 @@ esac
         );
         assert_eq!(rejected["ok"], false);
     }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn tuios_reads_use_native_socket_protocol_without_herdr_fallback() {
+    let root = fixture("tuios");
+    let project = root.join("lane-home");
+    fs::create_dir_all(&project).unwrap();
+    let spec = LaneSpec::new(
+        "connector-test".into(),
+        "local".into(),
+        project,
+        Profile::default(),
+    )
+    .unwrap();
+    write_lane_spec(&spec).unwrap();
+    let database = root.join("data/worklane/worklane-v5.db");
+    fs::create_dir_all(database.parent().unwrap()).unwrap();
+    Store::open(&database)
+        .unwrap()
+        .save_lane(&spec, "running", false)
+        .unwrap();
+
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    // Emulate only `timeout podman exec`; execute the production Python socket
+    // bridge unchanged against an isolated, fixture-owned Unix socket.
+    let runtime = root.join("runtime");
+    let socket_dir = runtime.join("tuios");
+    fs::create_dir_all(&socket_dir).unwrap();
+    let listener = UnixListener::bind(socket_dir.join("tuios.sock")).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let responder = std::thread::spawn(move || {
+        for expected in ["list-verbs", "capture-pane", "hello"] {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(pair) => break pair,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("no TUIOS socket request: {error}"),
+                }
+            };
+            let mut request = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            let request: Value = serde_json::from_str(&request).unwrap();
+            assert_eq!(request["verb"], expected);
+            if expected == "capture-pane" {
+                assert_eq!(request["params"]["session"], "connector-test");
+                assert_eq!(request["params"]["window"], "window-id");
+            }
+            if expected == "hello" {
+                writeln!(stream, "not-json").unwrap();
+            } else {
+                let response = json!({"id":request["id"], "result":{
+                    "type": if expected == "list-verbs" {"verbs"} else {"capture-pane"},
+                    "text":"lane output"
+                }});
+                writeln!(stream, "{response}").unwrap();
+            }
+        }
+    });
+    let timeout = bin.join("timeout");
+    fs::write(
+        &timeout,
+        format!(
+            "#!/bin/sh\nexport XDG_RUNTIME_DIR='{}'\nshift 10\nexec \"$@\"\n",
+            runtime.display()
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&timeout).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&timeout, permissions).unwrap();
+
+    let schema = call_mode(
+        &root,
+        json!({"version":1,"request_id":"schema","method":"tuios.schema","params":{"lane":"connector-test"}}),
+        true,
+        Some(&bin),
+    );
+    assert_eq!(schema["result"]["result"]["type"], "verbs", "{schema}");
+    let read = call_mode(
+        &root,
+        json!({"version":1,"request_id":"read","method":"tuios.read","params":{"lane":"connector-test","verb":"capture-pane","params":{"session":"connector-test","window":"window-id"}}}),
+        true,
+        Some(&bin),
+    );
+    assert_eq!(read["result"]["result"]["text"], "lane output", "{read}");
+    for (verb, params) in [
+        (
+            "send-text",
+            json!({"session":"connector-test","window":"window-id"}),
+        ),
+        (
+            "capture-pane",
+            json!({"session":"other","window":"window-id"}),
+        ),
+        ("capture-pane", json!({"session":"connector-test"})),
+    ] {
+        let rejected = call_mode(
+            &root,
+            json!({"version":1,"request_id":"reject","method":"tuios.read","params":{"lane":"connector-test","verb":verb,"params":params}}),
+            true,
+            Some(&bin),
+        );
+        assert_eq!(rejected["ok"], false, "{rejected}");
+    }
+    let malformed = call_mode(
+        &root,
+        json!({"version":1,"request_id":"malformed","method":"tuios.read","params":{"lane":"connector-test","verb":"hello","params":{}}}),
+        true,
+        Some(&bin),
+    );
+    assert_eq!(malformed["ok"], false, "{malformed}");
+    responder.join().unwrap();
     fs::remove_dir_all(root).unwrap();
 }

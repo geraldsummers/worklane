@@ -61,6 +61,7 @@ The bundle is refreshed from the attaching binary, so an older host binary carri
 guidance. Update the owning host before adopting a new version.
 
 - [Lane guide](docs/agents/lane.md): writable paths, tools, Herdr, coordination, and progress.
+- [TUIOS v3 transition](docs/tuios-v3-transition.md): source-only read connector slice, compatibility limits, and uncompleted runtime migration.
 - [Automation](docs/agents/automation.md): user services, allowance-driven work, and `scripts/codex-bulk`.
 - [Migration checklist](docs/agents/MIGRATE.md): backup, merge, verification, and rollback.
 

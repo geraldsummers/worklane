@@ -98,7 +98,9 @@ pub fn schema() -> Value {
             "lane.reconcile.report": {"lane": "string?", "all": "boolean?"},
             "operation.list": {},
             "operation.get": {"operation_id": "uuid"},
-            "herdr.schema": {"lane": "string"}
+            "herdr.schema": {"lane": "string"},
+            "tuios.schema": {"lane": "string", "note": "native daemon list-verbs; requires TUIOS in lane"},
+            "tuios.read": {"lane": "string", "verb": "allowlisted native read verb", "params": "object"}
         },
         "change_methods": {
             "lane.create": {"name": "string", "project": "absolute provider-host path", "profile": "string?"},
@@ -117,7 +119,7 @@ pub fn schema() -> Value {
             "herdr.call": {"lane": "string", "method": "native Herdr method", "params": "object"}
         },
         "job_states": ["queued", "running", "succeeded", "failed", "cancel_requested", "cancelled"],
-        "limits": {"request_bytes": MAX_REQUEST_BYTES, "herdr_response_bytes": MAX_HERDR_RESPONSE_BYTES, "herdr_timeout_seconds": 55}
+        "limits": {"request_bytes": MAX_REQUEST_BYTES, "herdr_response_bytes": MAX_HERDR_RESPONSE_BYTES, "herdr_timeout_seconds": 55, "tuios_response_bytes": MAX_HERDR_RESPONSE_BYTES, "tuios_timeout_seconds": 55}
     })
 }
 
@@ -723,6 +725,108 @@ sys.stdout.buffer.write(line)
     )
 }
 
+// First v3 slice: native TUIOS discovery and bounded reads only. Do not silently
+// route these to Herdr's compatibility socket: its IDs and method names differ.
+fn validate_tuios_read(verb: &str, params: &Value, lane_session: &str) -> Result<()> {
+    if !matches!(
+        verb,
+        "hello"
+            | "list-sessions"
+            | "list-workspaces"
+            | "list-windows"
+            | "session-info"
+            | "get-window"
+            | "list-agents"
+            | "get-agent-state"
+            | "capture-pane"
+    ) {
+        bail!("TUIOS verb '{verb}' is not in the read-only connector allowlist")
+    }
+    let object = params
+        .as_object()
+        .context("params.params must be an object")?;
+    if object.contains_key("host") {
+        bail!("TUIOS reads cannot target a remote host")
+    }
+    if verb != "hello"
+        && verb != "list-sessions"
+        && object.get("session").and_then(Value::as_str) != Some(lane_session)
+    {
+        bail!("TUIOS verb '{verb}' requires params.session matching the lane's session")
+    }
+    if matches!(verb, "capture-pane" | "get-window" | "get-agent-state")
+        && object
+            .get("window")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+    {
+        bail!("TUIOS verb '{verb}' requires an explicit params.window")
+    }
+    Ok(())
+}
+
+fn tuios_socket_call(spec: &worklane_core::LaneSpec, verb: &str, params: &Value) -> Result<Value> {
+    if spec.host != "local" {
+        bail!("TUIOS API is available only for local lanes in API version {API_VERSION}")
+    }
+    let request = serde_json::to_vec(&json!({
+        "id": format!("worklane:{}", Uuid::new_v4()),
+        "verb": verb,
+        "params": params,
+    }))?;
+    // TUIOS uses a line-delimited JSON socket distinct from its .herdr shim.
+    // Resolve the lane user's runtime directory *inside* the lane, never on the host.
+    let bridge = r#"import json, os, socket, sys
+runtime = os.environ.get('XDG_RUNTIME_DIR') or '/run/user/' + str(os.getuid())
+path = os.path.join(runtime, 'tuios', 'tuios.sock')
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(55)
+s.connect(path)
+s.sendall(sys.stdin.buffer.read() + b'\n')
+line = bytearray()
+while b'\n' not in line:
+    chunk = s.recv(65536)
+    if not chunk:
+        raise SystemExit('TUIOS closed the socket without a complete response')
+    line.extend(chunk)
+    if len(line) > 1048576:
+        raise SystemExit('TUIOS response exceeded 1048576 bytes')
+result, remainder = bytes(line).split(b'\n', 1)
+if remainder or not result:
+    raise SystemExit('TUIOS returned an invalid response frame')
+json.loads(result)
+sys.stdout.buffer.write(result)
+"#;
+    let reply = podman_json(
+        spec,
+        &["python3".into(), "-c".into(), bridge.into()],
+        Some(&request),
+    )?;
+    if reply.get("result").is_none() && reply.get("error").is_none() {
+        bail!("TUIOS returned neither result nor error")
+    }
+    Ok(reply)
+}
+
+fn tuios_read(params: &Value, schema: bool) -> Result<Value> {
+    let store = Store::open_default()?;
+    let spec = store.lane(&required_string(params, "lane")?)?;
+    let verb = if schema {
+        "list-verbs".to_owned()
+    } else {
+        required_string(params, "verb")?
+    };
+    let native_params = if schema {
+        json!({})
+    } else {
+        params.get("params").cloned().unwrap_or_else(|| json!({}))
+    };
+    if !schema {
+        validate_tuios_read(&verb, &native_params, &spec.session_name())?;
+    }
+    tuios_socket_call(&spec, &verb, &native_params)
+}
+
 fn dispatch(request: &ApiRequest) -> Result<Value> {
     if request.version != API_VERSION {
         bail!(
@@ -745,6 +849,8 @@ fn dispatch(request: &ApiRequest) -> Result<Value> {
         "operation.cancel" => cancel_job(&required_string(&request.params, "operation_id")?),
         "herdr.schema" => herdr_schema(&request.params),
         "herdr.call" => herdr_call(&request.params),
+        "tuios.schema" => tuios_read(&request.params, true),
+        "tuios.read" => tuios_read(&request.params, false),
         method if is_change_method(method) => submit(request),
         method => invoke_worklane(method, &request.params).map(|(value, _)| value),
     }
@@ -796,6 +902,37 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(problem.contains("absolute provider-host path"));
+    }
+
+    #[test]
+    fn tuios_reads_require_explicit_lane_session_and_window() {
+        let session = "lane-test";
+        assert!(validate_tuios_read("list-sessions", &json!({}), session).is_ok());
+        assert!(validate_tuios_read("list-windows", &json!({}), session).is_err());
+        assert!(validate_tuios_read("list-windows", &json!({"session":"other"}), session).is_err());
+        assert!(validate_tuios_read(
+            "list-windows",
+            &json!({"session":session,"host":"other"}),
+            session
+        )
+        .is_err());
+        assert!(validate_tuios_read("capture-pane", &json!({"session":session}), session).is_err());
+        assert!(validate_tuios_read(
+            "capture-pane",
+            &json!({"session":session,"window":"abc"}),
+            session
+        )
+        .is_ok());
+        for verb in [
+            "send-text",
+            "new-session",
+            "kill-session",
+            "subscribe",
+            "list-verbs",
+        ] {
+            assert!(validate_tuios_read(verb, &json!({"session":session}), session).is_err());
+        }
+        assert!(validate_tuios_read("hello", &json!([]), session).is_err());
     }
 
     #[test]
