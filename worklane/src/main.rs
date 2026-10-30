@@ -4813,6 +4813,151 @@ esac
     }
 
     #[test]
+    fn private_status_refresh_preserves_drift_and_rejects_remote_locator_spoofing() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../target/tmp/refresh-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(root.join("registry.db")).unwrap();
+        let mut lane = spec("local");
+        lane.project_path = root.join("lane");
+        lane.profile.terminal_backend = TerminalBackend::TuiosV3;
+        lane.profile.agent = AgentKind::Pi;
+        lane.profile.embedded_containerfile = false;
+        store.save_lane(&lane, "stopped", false).unwrap();
+        struct StateReader {
+            state: &'static str,
+            diff: &'static str,
+        }
+        impl Runner for StateReader {
+            fn run(&self, program: &str, args: &[String]) -> Result<String> {
+                assert_eq!(program, "podman");
+                match args.first().map(String::as_str) {
+                    Some("diff") => Ok(self.diff.into()),
+                    Some("inspect") if args.iter().any(|arg| arg.contains("StartedAt")) => {
+                        Ok("2026-01-01T00:00:00Z".into())
+                    }
+                    Some("inspect") if args.iter().any(|arg| arg.contains("config-sha256")) => {
+                        Ok("<no value>".into())
+                    }
+                    Some("inspect") => Ok(self.state.into()),
+                    other => panic!("unexpected private status read: {other:?}"),
+                }
+            }
+            fn run_output(&self, program: &str, args: &[String]) -> Result<ProcessOutput> {
+                assert_eq!(
+                    (program, args.first().map(String::as_str)),
+                    ("podman", Some("container"))
+                );
+                Ok(ProcessOutput {
+                    code: i32::from(self.state == "absent"),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+        }
+        let running = StateReader {
+            state: "running",
+            diff: "A /etc/private-fixture\n",
+        };
+        let observed = refresh(&running, &store, &lane).unwrap();
+        assert_eq!(observed.state, "running");
+        assert!(observed.drift);
+        assert!(observed
+            .drift_reasons
+            .iter()
+            .any(|r| r.contains("writable-root")));
+        assert_eq!(
+            observed.runtime_started_at.unwrap().to_rfc3339(),
+            "2026-01-01T00:00:00+00:00"
+        );
+        assert!(store.index(&lane.id).unwrap().drift);
+        let fast = refresh_state_only(
+            &StateReader {
+                state: "exited",
+                diff: "",
+            },
+            &store,
+            &lane,
+        )
+        .unwrap();
+        assert!(fast.drift);
+        assert_eq!(fast.state, "exited");
+        assert!(fast.runtime_started_at.is_none());
+        let absent = refresh(
+            &StateReader {
+                state: "absent",
+                diff: "",
+            },
+            &store,
+            &lane,
+        )
+        .unwrap();
+        assert!(!absent.drift);
+        assert_eq!(store.index(&lane.id).unwrap().state, "absent");
+
+        let mut remote_spec = spec("sandbox");
+        remote_spec.name = "remote-status".into();
+        remote_spec.project_path = root.join("remote");
+        remote_spec.profile.terminal_backend = TerminalBackend::TuiosV3;
+        remote_spec.profile.agent = AgentKind::Pi;
+        remote_spec.profile.embedded_containerfile = false;
+        store.save_lane(&remote_spec, "stopped", false).unwrap();
+        store
+            .upsert_host(&Host {
+                name: "sandbox".into(),
+                ssh_target: "fixture@example.test".into(),
+                local: false,
+                installed_version: None,
+                last_seen: None,
+            })
+            .unwrap();
+        let mut forged = remote_spec.clone();
+        forged.host = "wrong-host".into();
+        forged.project_path = PathBuf::from("/foreign/project");
+        let payload = serde_json::to_string(&LaneStatus {
+            runtime: RuntimeMode::PodmanInit,
+            spec: forged,
+            state: "running".into(),
+            drift: false,
+            drift_reasons: vec![],
+            cached_at: Utc::now(),
+            runtime_started_at: None,
+        })
+        .unwrap();
+        struct RemoteReader(String);
+        impl Runner for RemoteReader {
+            fn run(&self, _: &str, _: &[String]) -> Result<String> {
+                panic!("remote status must use correlated executor input")
+            }
+            fn run_with_input(
+                &self,
+                program: &str,
+                args: &[String],
+                input: &[u8],
+            ) -> Result<String> {
+                assert_eq!(program, "ssh");
+                assert!(args.iter().any(|arg| arg.contains("fixture@example.test")));
+                let request: ExecutorRequest = serde_json::from_slice(input)?;
+                assert_eq!(&request.args[..2], ["lane", "inspect"]);
+                Ok(serde_json::to_string(&ExecutorResponse {
+                    protocol_version: EXECUTOR_PROTOCOL,
+                    request_id: request.request_id,
+                    success: true,
+                    payload: Some(serde_json::from_str(&self.0)?),
+                    error: None,
+                })?)
+            }
+        }
+        let remote_observed = refresh(&RemoteReader(payload), &store, &remote_spec).unwrap();
+        assert_eq!(remote_observed.spec.host, "sandbox");
+        assert_eq!(remote_observed.spec.project_path, remote_spec.project_path);
+        assert_eq!(store.index(&remote_spec.id).unwrap().host, "sandbox");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn herdr_bootstrap_uses_stable_session_and_workspace_paths() {
         let source = include_str!("main.rs");
         assert!(HERDR_RECONCILE_SCRIPT.contains("--label \"$session\""));
