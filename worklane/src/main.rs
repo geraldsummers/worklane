@@ -3250,16 +3250,47 @@ mod tests {
     fn v3_image_pins_verified_tuios_and_pi_without_herdr() {
         let image = include_str!("../../Containerfile.v3");
         for expected in [
+            "FROM --platform=linux/amd64 docker.io/library/debian@sha256:1e1a22175fbf1b32157ddaf0219e1db4e5401fab2b94ed285add64d18587cd2d",
             "TUIOS_VERSION=0.11.1",
             "TUIOS_ARCHIVE_SHA256=1d7589420449c42f14a326c6351228741af0f09e0f6a517503c49bc1d418f983",
             "TUIOS_BINARY_SHA256=384f153756a802b99bee5286c776093e949662c2b7a0f4f5e2bcb39eeb0ac2f7",
             "PI_VERSION=1.4.0",
+            "COPY assets/v3/pi/package.json assets/v3/pi/package-lock.json /opt/worklane/pi/",
+            "npm ci --prefix /opt/worklane/pi --ignore-scripts",
             "tuios integration install pi --no-skill --command /usr/local/bin/tuios",
             "sha256sum -c -",
         ] {
             assert!(image.contains(expected), "v3 image missing {expected}");
         }
         assert!(!image.to_ascii_lowercase().contains("herdr"));
+        assert!(!image.contains("npm install -g"));
+        let manifest: serde_json::Value =
+            serde_json::from_str(include_str!("../../assets/v3/pi/package.json")).unwrap();
+        let lock: serde_json::Value =
+            serde_json::from_str(include_str!("../../assets/v3/pi/package-lock.json")).unwrap();
+        assert_eq!(
+            manifest["dependencies"]["@earendil-works/pi-coding-agent"],
+            "1.4.0"
+        );
+        assert_eq!(lock["lockfileVersion"], 3);
+        assert_eq!(
+            lock["packages"][""]["dependencies"],
+            manifest["dependencies"]
+        );
+        assert_eq!(lock["packages"]["node_modules/@earendil-works/pi-coding-agent"]["integrity"],
+            "sha512-Z41LpZ3yYHSC/UUps6Mr39UMFPwH8elhJBG9DY1P7kuzsE5qSK/6eMj2EHzO5evJRQWLbKSqUMw+4nCNtIyiQg==");
+        let packages = lock["packages"].as_object().unwrap();
+        assert!(packages.len() > 1);
+        for (path, entry) in packages {
+            if !path.is_empty() {
+                assert!(
+                    entry["integrity"]
+                        .as_str()
+                        .is_some_and(|hash| hash.starts_with("sha512-")),
+                    "missing integrity for {path}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -1,6 +1,8 @@
 # Experimental, isolated v3-only image recipe. Not used by the legacy defaults.
 # Build only in an isolated test environment; do not overwrite an installed lane image.
-FROM debian:trixie-slim
+# linux/amd64 manifest of docker.io/library/debian:trixie-slim; verified against
+# the registry's index sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4.
+FROM --platform=linux/amd64 docker.io/library/debian@sha256:1e1a22175fbf1b32157ddaf0219e1db4e5401fab2b94ed285add64d18587cd2d
 ARG NODE_VERSION=24.21.0
 ARG NODE_SHA256=fd8e59d5a511510f6a298afb548f18c7d2b1be404d8b4a27d94fbe49f56cb2d6
 ARG PI_VERSION=1.4.0
@@ -16,8 +18,10 @@ RUN curl --proto '=https' --tlsv1.2 -fsSL \
     "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" -o /tmp/node.tar.xz \
  && echo "${NODE_SHA256}  /tmp/node.tar.xz" | sha256sum -c - \
  && tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 \
- && rm /tmp/node.tar.xz \
- && env NPM_CONFIG_PREFIX=/usr/local npm install -g --ignore-scripts --no-audit "@earendil-works/pi-coding-agent@${PI_VERSION}" \
+ && rm /tmp/node.tar.xz
+COPY assets/v3/pi/package.json assets/v3/pi/package-lock.json /opt/worklane/pi/
+RUN npm ci --prefix /opt/worklane/pi --ignore-scripts --no-audit --fund=false \
+ && ln -s /opt/worklane/pi/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js /usr/local/bin/pi \
  && test "$(pi --version)" = "${PI_VERSION}"
 RUN curl --proto '=https' --tlsv1.2 -fsSL \
     "https://github.com/Gaurav-Gosain/tuios/releases/download/v${TUIOS_VERSION}/tuios_${TUIOS_VERSION}_Linux_x86_64.tar.gz" -o /tmp/tuios.tar.gz \
