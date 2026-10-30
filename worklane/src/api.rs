@@ -580,14 +580,6 @@ fn podman_json_with_runner(
     serde_json::from_str(&output).with_context(|| format!("lane {label} API returned invalid JSON"))
 }
 
-fn podman_json(
-    spec: &worklane_core::LaneSpec,
-    command: &[String],
-    input: Option<&[u8]>,
-) -> Result<Value> {
-    podman_json_with_runner(&SystemRunner, spec, command, input)
-}
-
 fn require_herdr_backend(spec: &worklane_core::LaneSpec) -> Result<()> {
     if spec.profile.terminal_backend != TerminalBackend::Herdr {
         bail!("Herdr API is unavailable for a tuios-v3 lane")
@@ -597,9 +589,14 @@ fn require_herdr_backend(spec: &worklane_core::LaneSpec) -> Result<()> {
 
 fn herdr_schema(params: &Value) -> Result<Value> {
     let store = Store::open_default()?;
+    herdr_schema_with_runner(&SystemRunner, &store, params)
+}
+
+fn herdr_schema_with_runner(runner: &impl Runner, store: &Store, params: &Value) -> Result<Value> {
     let spec = store.lane(&required_string(params, "lane")?)?;
     require_herdr_backend(&spec)?;
-    podman_json(
+    podman_json_with_runner(
+        runner,
         &spec,
         &[
             "herdr".into(),
@@ -674,11 +671,16 @@ fn validate_herdr_call(method: &str, params: &Value, schema: &Value) -> Result<(
 
 fn herdr_call(params: &Value) -> Result<Value> {
     let store = Store::open_default()?;
+    herdr_call_with_runner(&SystemRunner, &store, params)
+}
+
+fn herdr_call_with_runner(runner: &impl Runner, store: &Store, params: &Value) -> Result<Value> {
     let spec = store.lane(&required_string(params, "lane")?)?;
     require_herdr_backend(&spec)?;
     let method = required_string(params, "method")?;
     let native_params = params.get("params").cloned().unwrap_or_else(|| json!({}));
-    let schema = podman_json(
+    let schema = podman_json_with_runner(
+        runner,
         &spec,
         &[
             "herdr".into(),
@@ -731,7 +733,8 @@ sys.stdout.buffer.write(line)
         "/home/dev/.config/herdr/sessions/{}/herdr.sock",
         spec.session_name()
     );
-    podman_json(
+    podman_json_with_runner(
+        runner,
         &spec,
         &["python3".into(), "-c".into(), bridge.into(), socket],
         Some(&request),
@@ -778,12 +781,21 @@ fn validate_tuios_read(verb: &str, params: &Value, lane_session: &str) -> Result
     Ok(())
 }
 
-fn tuios_socket_call(spec: &worklane_core::LaneSpec, verb: &str, params: &Value) -> Result<Value> {
+fn tuios_socket_call_with_runner(
+    runner: &impl Runner,
+    spec: &worklane_core::LaneSpec,
+    verb: &str,
+    params: &Value,
+) -> Result<Value> {
     if spec.host != "local" {
         bail!("TUIOS API is available only for local lanes in API version {API_VERSION}")
     }
+    if spec.profile.terminal_backend != TerminalBackend::TuiosV3 {
+        bail!("native TUIOS API requires a lane opted into terminal_backend = 'tuios-v3'")
+    }
+    let request_id = format!("worklane:{}", Uuid::new_v4());
     let request = serde_json::to_vec(&json!({
-        "id": format!("worklane:{}", Uuid::new_v4()),
+        "id": request_id,
         "verb": verb,
         "params": params,
     }))?;
@@ -810,11 +822,15 @@ if remainder or not result:
 json.loads(result)
 sys.stdout.buffer.write(result)
 "#;
-    let reply = podman_json(
+    let reply = podman_json_with_runner(
+        runner,
         spec,
         &["python3".into(), "-c".into(), bridge.into()],
         Some(&request),
     )?;
+    if reply.get("id").and_then(Value::as_str) != Some(request_id.as_str()) {
+        bail!("TUIOS returned a response for a different request id")
+    }
     if reply.get("result").is_none() && reply.get("error").is_none() {
         bail!("TUIOS returned neither result nor error")
     }
@@ -823,6 +839,15 @@ sys.stdout.buffer.write(result)
 
 fn tuios_read(params: &Value, schema: bool) -> Result<Value> {
     let store = Store::open_default()?;
+    tuios_read_with_runner(&SystemRunner, &store, params, schema)
+}
+
+fn tuios_read_with_runner(
+    runner: &impl Runner,
+    store: &Store,
+    params: &Value,
+    schema: bool,
+) -> Result<Value> {
     let spec = store.lane(&required_string(params, "lane")?)?;
     if spec.profile.terminal_backend != TerminalBackend::TuiosV3 {
         bail!("native TUIOS API requires a lane opted into terminal_backend = 'tuios-v3'")
@@ -840,7 +865,7 @@ fn tuios_read(params: &Value, schema: bool) -> Result<Value> {
     if !schema {
         validate_tuios_read(&verb, &native_params, &spec.session_name())?;
     }
-    tuios_socket_call(&spec, &verb, &native_params)
+    tuios_socket_call_with_runner(runner, &spec, &verb, &native_params)
 }
 
 fn dispatch(request: &ApiRequest) -> Result<Value> {
@@ -918,6 +943,340 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(problem.contains("absolute provider-host path"));
+    }
+
+    #[test]
+    fn legacy_connector_checks_installed_schema_and_explicit_pane_before_socket_call() {
+        use std::sync::Mutex;
+        use worklane_core::{AgentKind, LaneSpec, Profile};
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../target/tmp/legacy-api-selection-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(root.join("registry.db")).unwrap();
+        let legacy = LaneSpec::new(
+            "private-legacy".into(),
+            "local".into(),
+            root.join("legacy"),
+            Profile::default(),
+        )
+        .unwrap();
+        std::fs::create_dir_all(&legacy.project_path).unwrap();
+        worklane_core::write_lane_spec(&legacy).unwrap();
+        store.save_lane(&legacy, "running", false).unwrap();
+        let profile = Profile {
+            terminal_backend: TerminalBackend::TuiosV3,
+            agent: AgentKind::Pi,
+            embedded_containerfile: false,
+            mount_codex_credentials: false,
+            ..Profile::default()
+        };
+        let native = LaneSpec::new(
+            "private-native".into(),
+            "local".into(),
+            root.join("native"),
+            profile,
+        )
+        .unwrap();
+        std::fs::create_dir_all(&native.project_path).unwrap();
+        worklane_core::write_lane_spec(&native).unwrap();
+        store.save_lane(&native, "running", false).unwrap();
+        struct LegacyRunner(Mutex<Vec<(Vec<String>, Option<Value>)>>);
+        impl Runner for LegacyRunner {
+            fn run(&self, program: &str, args: &[String]) -> Result<String> {
+                assert_eq!(program, "timeout");
+                assert!(args
+                    .windows(4)
+                    .any(|args| args == ["herdr", "api", "schema", "--json"]));
+                self.0.lock().unwrap().push((args.to_vec(), None));
+                Ok(json!({"schemas":{"request":{"oneOf":[
+                    {"properties":{"method":{"const":"pane.read"}}},
+                    {"properties":{"method":{"const":"pane.current"}}}
+                ]}}})
+                .to_string())
+            }
+            fn run_with_input(
+                &self,
+                program: &str,
+                args: &[String],
+                input: &[u8],
+            ) -> Result<String> {
+                assert_eq!(program, "timeout");
+                let request: Value = serde_json::from_slice(input)?;
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((args.to_vec(), Some(request.clone())));
+                Ok(
+                    json!({"id":request["id"],"result":{"pane_id":request["params"]["pane_id"]}})
+                        .to_string(),
+                )
+            }
+        }
+        let runner = LegacyRunner(Mutex::new(vec![]));
+        assert!(herdr_schema_with_runner(&runner, &store, &json!({"lane":native.name})).is_err());
+        assert!(herdr_call_with_runner(
+            &runner,
+            &store,
+            &json!({"lane":native.name,"method":"pane.read","params":{"pane_id":"w1:p1"}})
+        )
+        .is_err());
+        assert!(runner.0.lock().unwrap().is_empty());
+        let selected = json!({"lane":legacy.name});
+        assert!(
+            herdr_schema_with_runner(&runner, &store, &selected).unwrap()["schemas"].is_object()
+        );
+        for (method, params) in [
+            ("pane.read", json!({})),
+            ("pane.current", json!({"pane_id":"w1:p1"})),
+            ("agent.start", json!({"pane_id":"w1:p1"})),
+        ] {
+            assert!(herdr_call_with_runner(
+                &runner,
+                &store,
+                &json!({"lane":legacy.name,"method":method,"params":params})
+            )
+            .is_err());
+        }
+        assert!(runner
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(_, request)| request.is_none()));
+        let reply = herdr_call_with_runner(
+            &runner,
+            &store,
+            &json!({"lane":legacy.name,"method":"pane.read","params":{"pane_id":"w1:p1"}}),
+        )
+        .unwrap();
+        assert_eq!(reply["result"]["pane_id"], "w1:p1");
+        let calls = runner.0.lock().unwrap();
+        let (args, request) = calls.last().unwrap();
+        assert!(args
+            .iter()
+            .any(|arg| arg.contains(&format!("/sessions/{}/herdr.sock", legacy.session_name()))));
+        assert!(!args.iter().any(|arg| arg.contains("tuios.sock")));
+        assert_eq!(request.as_ref().unwrap()["method"], "pane.read");
+        assert_eq!(request.as_ref().unwrap()["params"]["pane_id"], "w1:p1");
+        drop(calls);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_socket_bridge_rejects_cross_request_replies_and_non_v3_lanes() {
+        use std::sync::Mutex;
+        use worklane_core::{AgentKind, Profile};
+        struct NativeRunner {
+            mode: &'static str,
+            calls: Mutex<Vec<(Vec<String>, Value)>>,
+        }
+        impl Runner for NativeRunner {
+            fn run(&self, _: &str, _: &[String]) -> Result<String> {
+                panic!("native socket bridge must use stdin, never a real subprocess")
+            }
+            fn run_with_input(
+                &self,
+                program: &str,
+                args: &[String],
+                input: &[u8],
+            ) -> Result<String> {
+                assert_eq!(program, "timeout");
+                let request: Value = serde_json::from_slice(input)?;
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push((args.to_vec(), request.clone()));
+                match self.mode {
+                    "invalid-json" => Ok("not-json".into()),
+                    "too-large" => Ok("x".repeat(MAX_HERDR_RESPONSE_BYTES + 1)),
+                    "runner-error" => bail!("private bridge failed"),
+                    "missing-envelope" => Ok(serde_json::json!({"id":request["id"]}).to_string()),
+                    mode => Ok(serde_json::json!({
+                        "id": if mode == "wrong-id" { "other-request" } else { request["id"].as_str().unwrap() },
+                        "result": if mode == "error" { Value::Null } else { json!({"protocol":1}) },
+                        "error": if mode == "error" { json!({"code":"session_not_found"}) } else { Value::Null }
+                    }).to_string()),
+                }
+            }
+        }
+        let runner = |mode| NativeRunner {
+            mode,
+            calls: Mutex::new(vec![]),
+        };
+        let profile = Profile {
+            terminal_backend: TerminalBackend::TuiosV3,
+            agent: AgentKind::Pi,
+            embedded_containerfile: false,
+            mount_codex_credentials: false,
+            ..Profile::default()
+        };
+        let spec = worklane_core::LaneSpec::new(
+            "native-private".into(),
+            "local".into(),
+            std::path::PathBuf::from("/private/fixture"),
+            profile,
+        )
+        .unwrap();
+        let good = runner("success");
+        let reply = tuios_socket_call_with_runner(
+            &good,
+            &spec,
+            "capture-pane",
+            &json!({"session":spec.session_name(),"window":"w1"}),
+        )
+        .unwrap();
+        assert_eq!(reply["result"]["protocol"], 1);
+        let calls = good.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1["verb"], "capture-pane");
+        assert_eq!(calls[0].1["params"]["window"], "w1");
+        assert!(calls[0].1["id"].as_str().unwrap().starts_with("worklane:"));
+        assert!(calls[0].0.contains(&"--interactive".into()));
+        assert!(calls[0].0.contains(&spec.container_name()));
+        assert!(calls[0].0.iter().any(|arg| arg.contains("tuios.sock")));
+        assert!(!calls[0].0.iter().any(|arg| arg.contains("herdr.sock")));
+        drop(calls);
+        for (mode, expected) in [
+            ("wrong-id", "different request id"),
+            ("missing-envelope", "neither result nor error"),
+            ("invalid-json", "invalid JSON"),
+            ("too-large", "response exceeded"),
+            ("runner-error", "lane TUIOS API failed"),
+        ] {
+            let fake = runner(mode);
+            let err = tuios_socket_call_with_runner(&fake, &spec, "hello", &json!({})).unwrap_err();
+            assert!(err.to_string().contains(expected), "{mode}: {err:#}");
+        }
+        let error =
+            tuios_socket_call_with_runner(&runner("error"), &spec, "hello", &json!({})).unwrap();
+        assert_eq!(error["error"]["code"], "session_not_found");
+        let mut foreign = spec.clone();
+        foreign.host = "foreign".into();
+        let blocked = runner("success");
+        assert!(
+            tuios_socket_call_with_runner(&blocked, &foreign, "hello", &json!({}))
+                .unwrap_err()
+                .to_string()
+                .contains("only for local")
+        );
+        assert!(blocked.calls.lock().unwrap().is_empty());
+        let mut legacy = spec;
+        legacy.profile = Profile::default();
+        assert!(
+            tuios_socket_call_with_runner(&blocked, &legacy, "hello", &json!({}))
+                .unwrap_err()
+                .to_string()
+                .contains("opted into")
+        );
+        assert!(blocked.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn native_api_selection_blocks_legacy_remote_and_unscoped_reads_before_socket_access() {
+        use std::sync::Mutex;
+        use worklane_core::{AgentKind, LaneSpec, Profile};
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../target/tmp/native-api-selection-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(root.join("registry.db")).unwrap();
+        let profile = Profile {
+            terminal_backend: TerminalBackend::TuiosV3,
+            agent: AgentKind::Pi,
+            embedded_containerfile: false,
+            mount_codex_credentials: false,
+            ..Profile::default()
+        };
+        let native = LaneSpec::new(
+            "private-native".into(),
+            "local".into(),
+            root.join("native"),
+            profile.clone(),
+        )
+        .unwrap();
+        let legacy = LaneSpec::new(
+            "private-legacy".into(),
+            "local".into(),
+            root.join("legacy"),
+            Profile::default(),
+        )
+        .unwrap();
+        let foreign = LaneSpec::new(
+            "private-remote".into(),
+            "sandbox".into(),
+            root.join("remote"),
+            profile,
+        )
+        .unwrap();
+        for spec in [&native, &legacy] {
+            std::fs::create_dir_all(&spec.project_path).unwrap();
+            worklane_core::write_lane_spec(spec).unwrap();
+        }
+        for spec in [&native, &legacy, &foreign] {
+            store.save_lane(spec, "running", false).unwrap();
+        }
+        struct SelectionRunner(Mutex<Vec<Value>>);
+        impl Runner for SelectionRunner {
+            fn run(&self, _: &str, _: &[String]) -> Result<String> {
+                panic!("native selector must use the bounded input bridge")
+            }
+            fn run_with_input(
+                &self,
+                program: &str,
+                args: &[String],
+                input: &[u8],
+            ) -> Result<String> {
+                assert_eq!(program, "timeout");
+                assert!(args.contains(&"--interactive".into()));
+                let request: Value = serde_json::from_slice(input)?;
+                self.0.lock().unwrap().push(request.clone());
+                Ok(json!({"id":request["id"],"result":{"verb":request["verb"]}}).to_string())
+            }
+        }
+        let runner = SelectionRunner(Mutex::new(vec![]));
+        for (params, schema) in [
+            (json!({"lane":legacy.name}), true),
+            (json!({"lane":foreign.name}), true),
+            (
+                json!({"lane":native.name,"verb":"start-agent","params":{"session":native.session_name()}}),
+                false,
+            ),
+            (
+                json!({"lane":native.name,"verb":"capture-pane","params":{"session":"other","window":"w1"}}),
+                false,
+            ),
+            (
+                json!({"lane":native.name,"verb":"capture-pane","params":{"session":native.session_name()}}),
+                false,
+            ),
+            (json!({"lane":"not-a-lane","verb":"hello"}), false),
+        ] {
+            assert!(
+                tuios_read_with_runner(&runner, &store, &params, schema).is_err(),
+                "{params}"
+            );
+        }
+        assert!(runner.0.lock().unwrap().is_empty());
+        let selected = json!({"lane":native.name,"verb":"capture-pane",
+            "params":{"session":native.session_name(),"window":"w1"}});
+        assert_eq!(
+            tuios_read_with_runner(&runner, &store, &selected, false).unwrap()["result"]["verb"],
+            "capture-pane"
+        );
+        assert_eq!(
+            tuios_read_with_runner(&runner, &store, &json!({"lane":native.name}), true).unwrap()
+                ["result"]["verb"],
+            "list-verbs"
+        );
+        let requests = runner.0.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["params"]["window"], "w1");
+        assert_eq!(requests[1]["params"], json!({}));
+        drop(requests);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

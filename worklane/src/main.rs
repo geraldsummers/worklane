@@ -1240,6 +1240,10 @@ fn refresh<R: Runner>(runner: &R, store: &Store, spec: &LaneSpec) -> Result<Lane
         .context("remote host unexpectedly treated as local")?;
         let remote_status: LaneStatus = serde_json::from_str(&out)
             .context("remote worklane did not return a LaneStatus JSON document")?;
+        if remote_status.spec.id != spec.id || remote_status.spec.session_name != spec.session_name
+        {
+            bail!("remote lane inspect identity mismatch")
+        }
         let mut resolved = remote_status.spec;
         resolved.host = spec.host.clone();
         resolved.project_path = spec.project_path.clone();
@@ -1287,6 +1291,10 @@ fn refresh_state_only<R: Runner>(runner: &R, store: &Store, spec: &LaneSpec) -> 
         .context("remote host unexpectedly treated as local")?;
         let remote_status: LaneStatus = serde_json::from_str(&out)
             .context("remote worklane did not return a LaneStatus JSON document")?;
+        if remote_status.spec.id != spec.id || remote_status.spec.session_name != spec.session_name
+        {
+            bail!("remote lane inspect identity mismatch")
+        }
         let mut resolved = remote_status.spec;
         resolved.host = spec.host.clone();
         resolved.project_path = spec.project_path.clone();
@@ -1604,6 +1612,22 @@ fn lane_diff_with_runner(
         serde_json::from_str(&out).context("remote lane diff returned invalid JSON")
     }
 }
+fn refresh_selected_lanes(
+    runner: &impl Runner,
+    store: &Store,
+    selector: Option<&str>,
+    all: bool,
+) -> Result<Vec<LaneStatus>> {
+    if all {
+        refresh_all(runner, store)
+    } else {
+        Ok(vec![refresh(
+            runner,
+            store,
+            &store.lane(selector.context("provide a lane or --all")?)?,
+        )?])
+    }
+}
 fn refresh_all<R: Runner>(runner: &R, store: &Store) -> Result<Vec<LaneStatus>> {
     let specs = store
         .lanes()?
@@ -1772,6 +1796,216 @@ fn reconcile_local(
     }
     Ok(report)
 }
+fn import_local_lane(runner: &impl Runner, store: &Store, path: &Path) -> Result<LaneStatus> {
+    let manifest = if path.is_dir() {
+        path.join(".worklane").join("lane.toml")
+    } else {
+        path.to_path_buf()
+    }
+    .canonicalize()
+    .context("lane manifest does not exist")?;
+    if manifest.file_name().and_then(|name| name.to_str()) != Some("lane.toml")
+        || manifest
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            != Some(".worklane")
+    {
+        bail!("manifest must be located at <directory>/.worklane/lane.toml")
+    }
+    let spec = read_lane_spec(&manifest, "local".into(), None)?;
+    validate_profile(&spec.profile, &spec.container_home(), true)?;
+    if let Ok(existing) = store.index(&spec.id) {
+        if existing.host != spec.host || existing.manifest_path != manifest {
+            bail!(
+                "lane '{}' UUID '{}' is already indexed as '{}' at {}:{}; reconcile the conflict before importing",
+                spec.name, spec.id, existing.name, existing.host,
+                existing.manifest_path.display()
+            )
+        }
+    } else {
+        validate_lane_registration(store, &spec)?;
+    }
+    store.save_lane(&spec, "unknown", false)?;
+    refresh_state_only(runner, store, &spec)
+}
+
+fn forget_selected_lane(store: &Store, selector: &str) -> Result<serde_json::Value> {
+    let index = store.index(selector)?;
+    if index.host == "local" {
+        let project = index
+            .manifest_path
+            .parent()
+            .and_then(Path::parent)
+            .context("indexed manifest path has no project parent")?;
+        if let Some(journal) = read_operation_journal_at(project)? {
+            bail!(
+                "cannot forget lane '{}' while '{}' is paused at '{}'; retry it or run lane reconcile",
+                index.name,
+                journal.kind,
+                journal.phase
+            )
+        }
+    }
+    store.remove_lane(&index.id)?;
+    Ok(serde_json::json!({"forgot":index.name}))
+}
+
+fn select_upgrade_specs(store: &Store, selector: Option<&str>, all: bool) -> Result<Vec<LaneSpec>> {
+    let specs: Vec<LaneSpec> = if all {
+        store
+            .lanes()?
+            .into_iter()
+            .map(|status| status.spec)
+            .collect()
+    } else {
+        vec![store.lane(selector.context("provide a lane or --all")?)?]
+    };
+    if specs
+        .iter()
+        .any(|spec| spec.profile.terminal_backend == TerminalBackend::TuiosV3)
+    {
+        bail!("tuios-v3 lane upgrade requires a separately verified pinned image; refusing the legacy image rebuild path")
+    }
+    Ok(specs)
+}
+
+fn upgrade_remote_with_runner(
+    runner: &impl Runner,
+    store: &Store,
+    spec: &LaneSpec,
+    all: bool,
+    force: bool,
+    no_cache: bool,
+) -> Result<Vec<serde_json::Value>> {
+    let mut args = vec!["lane".into(), "upgrade".into()];
+    if all {
+        args.push("--all".into());
+    } else {
+        args.push(spec.id.clone());
+    }
+    if force {
+        args.push("--force".into());
+    }
+    if no_cache {
+        args.push("--no-cache".into());
+    }
+    let output = if all {
+        remote_host(runner, store, &spec.host, args)?
+    } else {
+        remote(runner, store, spec, args)?
+    }
+    .context("remote host unexpectedly treated as local")?;
+    Ok(match serde_json::from_str::<serde_json::Value>(&output)? {
+        serde_json::Value::Array(values) => values,
+        value => vec![value],
+    })
+}
+
+fn delete_selected_lane(
+    runner: &impl Runner,
+    store: &Store,
+    selector: &str,
+) -> Result<serde_json::Value> {
+    let spec = match store.lane(selector) {
+        Ok(spec) => spec,
+        Err(error) => {
+            if let Some(tombstone) = store.tombstone(selector)? {
+                if tombstone.operation == "delete" {
+                    return Ok(serde_json::json!({
+                        "lane_id":tombstone.lane_id, "lane_name":tombstone.lane_name,
+                        "deleted":true, "already_complete":true
+                    }));
+                }
+            }
+            return Err(error);
+        }
+    };
+    let status = refresh(runner, store, &spec)?;
+    if status.drift {
+        bail!("container has writable-root drift; inspect it before deleting")
+    }
+    if spec.host == "local" {
+        delete_local_lane(runner, store, &spec)?;
+    } else {
+        remote(
+            runner,
+            store,
+            &spec,
+            vec!["lane".into(), "delete".into(), spec.id.clone()],
+        )?
+        .context("remote host unexpectedly treated as local")?;
+        store.record_tombstone(&spec.id, &spec.name, "delete")?;
+        store.remove_lane(&spec.id)?;
+    }
+    Ok(serde_json::json!({"lane_id":spec.id,"lane_name":spec.name,"deleted":true}))
+}
+
+fn rename_selected_lane(
+    runner: &impl Runner,
+    store: &Store,
+    selector: &str,
+    new_name: &str,
+) -> Result<LaneSpec> {
+    let spec = store.lane(selector)?;
+    if spec.name == new_name {
+        if spec.host == "local" {
+            if let Some(journal) = read_operation_journal(&spec)? {
+                if journal.kind == "rename"
+                    && journal.requested_name == new_name
+                    && journal.desired_manifest_sha256 == manifest_sha256(&spec)?
+                {
+                    store.save_lane(&spec, "unknown", false)?;
+                    clear_operation_journal(&spec)?;
+                } else {
+                    bail!(
+                        "lane has a pending '{}' operation at '{}'; retry it or run lane reconcile",
+                        journal.kind,
+                        journal.phase
+                    )
+                }
+            }
+        }
+        return Ok(spec);
+    }
+    let mut renamed = spec.clone();
+    renamed.name = new_name.into();
+    validate_lane_name(new_name)?;
+    if store
+        .lanes()?
+        .iter()
+        .any(|status| status.spec.id != spec.id && status.spec.name == new_name)
+    {
+        bail!("lane name '{new_name}' is already registered")
+    }
+    if let Some(out) = remote(
+        runner,
+        store,
+        &spec,
+        vec![
+            "lane".into(),
+            "rename".into(),
+            spec.id.clone(),
+            new_name.into(),
+        ],
+    )? {
+        let mut remote_renamed: LaneSpec = serde_json::from_str(&out)
+            .context("remote worklane did not return the renamed LaneSpec")?;
+        if remote_renamed.id != spec.id
+            || remote_renamed.session_name != spec.session_name
+            || remote_renamed.name != new_name
+        {
+            bail!("remote lane rename identity mismatch")
+        }
+        remote_renamed.host = spec.host.clone();
+        remote_renamed.project_path = spec.project_path.clone();
+        store.save_lane(&remote_renamed, "unknown", false)?;
+        Ok(remote_renamed)
+    } else {
+        rename_local_lane(store, &spec, &renamed)
+    }
+}
+
 fn reconcile_selected(
     runner: &impl Runner,
     store: &Store,
@@ -2896,40 +3130,7 @@ fn main() -> Result<()> {
                 }
                 LaneAction::List => emit(cli.json, &store.lanes()?),
                 LaneAction::Import { path } => {
-                    let manifest = if path.is_dir() {
-                        path.join(".worklane").join("lane.toml")
-                    } else {
-                        path
-                    }
-                    .canonicalize()
-                    .context("lane manifest does not exist")?;
-                    if manifest.file_name().and_then(|name| name.to_str()) != Some("lane.toml")
-                        || manifest
-                            .parent()
-                            .and_then(Path::file_name)
-                            .and_then(|name| name.to_str())
-                            != Some(".worklane")
-                    {
-                        bail!("manifest must be located at <directory>/.worklane/lane.toml")
-                    }
-                    let spec = read_lane_spec(&manifest, "local".into(), None)?;
-                    validate_profile(&spec.profile, &spec.container_home(), spec.host == "local")?;
-                    if let Ok(existing) = store.index(&spec.id) {
-                        if existing.host != spec.host || existing.manifest_path != manifest {
-                            bail!(
-                                "lane '{}' UUID '{}' is already indexed as '{}' at {}:{}; reconcile the conflict before importing",
-                                spec.name,
-                                spec.id,
-                                existing.name,
-                                existing.host,
-                                existing.manifest_path.display()
-                            )
-                        }
-                    } else {
-                        validate_lane_registration(&store, &spec)?;
-                    }
-                    store.save_lane(&spec, "unknown", false)?;
-                    emit(cli.json, &refresh_state_only(&runner, &store, &spec)?)
+                    emit(cli.json, &import_local_lane(&runner, &store, &path)?)
                 }
                 LaneAction::Inspect { lane, fast } => {
                     let s = store.lane(&lane)?;
@@ -2940,71 +3141,14 @@ fn main() -> Result<()> {
                     };
                     emit(cli.json, &status)
                 }
-                LaneAction::Rename { lane, new_name } => {
-                    let s = store.lane(&lane)?;
-                    if s.name == new_name {
-                        if s.host == "local" {
-                            if let Some(journal) = read_operation_journal(&s)? {
-                                if journal.kind == "rename"
-                                    && journal.requested_name == new_name
-                                    && journal.desired_manifest_sha256 == manifest_sha256(&s)?
-                                {
-                                    store.save_lane(&s, "unknown", false)?;
-                                    clear_operation_journal(&s)?;
-                                } else {
-                                    bail!(
-                                        "lane has a pending '{}' operation at '{}'; retry it or run lane reconcile",
-                                        journal.kind,
-                                        journal.phase
-                                    )
-                                }
-                            }
-                        }
-                        return emit(cli.json, &s);
-                    }
-                    let mut renamed = s.clone();
-                    renamed.name = new_name.clone();
-                    validate_lane_name(&new_name)?;
-                    if store
-                        .lanes()?
-                        .iter()
-                        .any(|status| status.spec.id != s.id && status.spec.name == new_name)
-                    {
-                        bail!("lane name '{new_name}' is already registered")
-                    }
-                    if let Some(out) = remote(
-                        &runner,
-                        &store,
-                        &s,
-                        vec![
-                            "lane".into(),
-                            "rename".into(),
-                            s.id.clone(),
-                            new_name.clone(),
-                        ],
-                    )? {
-                        let mut remote_renamed: LaneSpec = serde_json::from_str(&out)
-                            .context("remote worklane did not return the renamed LaneSpec")?;
-                        remote_renamed.host = s.host.clone();
-                        remote_renamed.project_path = s.project_path.clone();
-                        store.save_lane(&remote_renamed, "unknown", false)?;
-                        emit(cli.json, &remote_renamed)
-                    } else {
-                        emit(cli.json, &rename_local_lane(&store, &s, &renamed)?)
-                    }
-                }
-                LaneAction::Refresh { lane, all } => {
-                    let statuses = if all {
-                        refresh_all(&runner, &store)?
-                    } else {
-                        vec![refresh(
-                            &runner,
-                            &store,
-                            &store.lane(&lane.context("provide a lane or --all")?)?,
-                        )?]
-                    };
-                    emit(cli.json, &statuses)
-                }
+                LaneAction::Rename { lane, new_name } => emit(
+                    cli.json,
+                    &rename_selected_lane(&runner, &store, &lane, &new_name)?,
+                ),
+                LaneAction::Refresh { lane, all } => emit(
+                    cli.json,
+                    &refresh_selected_lanes(&runner, &store, lane.as_deref(), all)?,
+                ),
                 LaneAction::Diff { lane, raw } => {
                     let s = store.lane(&lane)?;
                     emit(cli.json, &lane_diff_with_runner(&runner, &store, &s, raw)?)
@@ -3137,17 +3281,7 @@ fn main() -> Result<()> {
                     force,
                     no_cache,
                 } => {
-                    let specs = if all {
-                        store.lanes()?.into_iter().map(|x| x.spec).collect()
-                    } else {
-                        vec![store.lane(&lane.context("provide a lane or --all")?)?]
-                    };
-                    if specs
-                        .iter()
-                        .any(|spec| spec.profile.terminal_backend == TerminalBackend::TuiosV3)
-                    {
-                        bail!("tuios-v3 lane upgrade requires a separately verified pinned image; refusing the legacy image rebuild path")
-                    }
+                    let specs = select_upgrade_specs(&store, lane.as_deref(), all)?;
                     report_phase(
                         None,
                         "running",
@@ -3167,19 +3301,9 @@ fn main() -> Result<()> {
                             if !upgraded_remote_hosts.insert(s.host.clone()) {
                                 continue;
                             }
-                            let mut args = vec!["lane".into(), "upgrade".into(), "--all".into()];
-                            if force {
-                                args.push("--force".into());
-                            }
-                            if no_cache {
-                                args.push("--no-cache".into());
-                            }
-                            let value = remote_host(&runner, &store, &s.host, args)?
-                                .context("remote host unexpectedly treated as local")?;
-                            match serde_json::from_str::<serde_json::Value>(&value)? {
-                                serde_json::Value::Array(values) => out.extend(values),
-                                value => out.push(value),
-                            }
+                            out.extend(upgrade_remote_with_runner(
+                                &runner, &store, &s, true, force, no_cache,
+                            )?);
                             continue;
                         }
                         let before = refresh(&runner, &store, &s)?;
@@ -3258,19 +3382,9 @@ fn main() -> Result<()> {
                                 "new container is ready; persistent home and project data were preserved",
                             );
                         } else {
-                            let mut args = vec!["lane".into(), "upgrade".into(), s.id.clone()];
-                            if force {
-                                args.push("--force".into());
-                            }
-                            if no_cache {
-                                args.push("--no-cache".into());
-                            }
-                            let value = remote(&runner, &store, &s, args)?
-                                .context("remote host unexpectedly treated as local")?;
-                            match serde_json::from_str::<serde_json::Value>(&value)? {
-                                serde_json::Value::Array(values) => out.extend(values),
-                                value => out.push(value),
-                            }
+                            out.extend(upgrade_remote_with_runner(
+                                &runner, &store, &s, false, force, no_cache,
+                            )?);
                         }
                     }
                     report_phase(
@@ -3286,68 +3400,10 @@ fn main() -> Result<()> {
                     emit(cli.json, &out)
                 }
                 LaneAction::Delete { lane } => {
-                    let s = match store.lane(&lane) {
-                        Ok(spec) => spec,
-                        Err(error) => {
-                            if let Some(tombstone) = store.tombstone(&lane)? {
-                                if tombstone.operation == "delete" {
-                                    return emit(
-                                        cli.json,
-                                        &serde_json::json!({
-                                            "lane_id": tombstone.lane_id,
-                                            "lane_name": tombstone.lane_name,
-                                            "deleted": true,
-                                            "already_complete": true
-                                        }),
-                                    );
-                                }
-                            }
-                            return Err(error);
-                        }
-                    };
-                    let status = refresh(&runner, &store, &s)?;
-                    if status.drift {
-                        bail!("container has writable-root drift; inspect it before deleting")
-                    }
-                    if s.host != "local" {
-                        remote(
-                            &runner,
-                            &store,
-                            &s,
-                            vec!["lane".into(), "delete".into(), s.id.clone()],
-                        )?
-                        .context("remote host unexpectedly treated as local")?;
-                    }
-                    if s.host == "local" {
-                        delete_local_lane(&runner, &store, &s)?;
-                    } else {
-                        store.record_tombstone(&s.id, &s.name, "delete")?;
-                        store.remove_lane(&s.id)?;
-                    }
-                    emit(
-                        cli.json,
-                        &serde_json::json!({"lane_id":s.id,"lane_name":s.name,"deleted":true}),
-                    )
+                    emit(cli.json, &delete_selected_lane(&runner, &store, &lane)?)
                 }
                 LaneAction::Forget { lane } => {
-                    let index = store.index(&lane)?;
-                    if index.host == "local" {
-                        let project = index
-                            .manifest_path
-                            .parent()
-                            .and_then(Path::parent)
-                            .context("indexed manifest path has no project parent")?;
-                        if let Some(journal) = read_operation_journal_at(project)? {
-                            bail!(
-                                "cannot forget lane '{}' while '{}' is paused at '{}'; retry it or run lane reconcile",
-                                index.name,
-                                journal.kind,
-                                journal.phase
-                            )
-                        }
-                    }
-                    store.remove_lane(&index.id)?;
-                    emit(cli.json, &serde_json::json!({"forgot":index.name}))
+                    emit(cli.json, &forget_selected_lane(&store, &lane)?)
                 }
                 LaneAction::Reconcile { lane, all, apply } => emit(
                     cli.json,
@@ -4567,6 +4623,119 @@ esac
     }
 
     #[test]
+    fn selected_rename_preserves_native_session_and_rejects_forged_remote_identity() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../target/tmp/rename-selected-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(root.join("registry.db")).unwrap();
+        let mut local = spec("local");
+        local.project_path = root.join("local");
+        local.profile.terminal_backend = TerminalBackend::TuiosV3;
+        local.profile.agent = AgentKind::Pi;
+        local.profile.embedded_containerfile = false;
+        local.profile.mount_codex_credentials = false;
+        std::fs::create_dir_all(&local.project_path).unwrap();
+        write_lane_spec(&local).unwrap();
+        store.save_lane(&local, "stopped", false).unwrap();
+        let mut remote_spec = local.clone();
+        remote_spec.id = uuid::Uuid::new_v4().to_string();
+        remote_spec.name = "rename-remote".into();
+        remote_spec.host = "sandbox".into();
+        remote_spec.project_path = root.join("remote");
+        remote_spec.container_name =
+            stable_container_name(&remote_spec.session_name, &remote_spec.id);
+        store.save_lane(&remote_spec, "stopped", false).unwrap();
+        store
+            .upsert_host(&Host {
+                name: "sandbox".into(),
+                ssh_target: "fixture@example.test".into(),
+                local: false,
+                installed_version: None,
+                last_seen: None,
+            })
+            .unwrap();
+        struct RenameRunner {
+            remote: LaneSpec,
+            forge: bool,
+            calls: Mutex<Vec<Vec<String>>>,
+        }
+        impl Runner for RenameRunner {
+            fn run(&self, _: &str, _: &[String]) -> Result<String> {
+                panic!("local rename must not run Podman")
+            }
+            fn run_with_input(
+                &self,
+                program: &str,
+                args: &[String],
+                input: &[u8],
+            ) -> Result<String> {
+                assert_eq!(program, "ssh");
+                assert!(args.iter().any(|arg| arg.contains("fixture@example.test")));
+                let request: ExecutorRequest = serde_json::from_slice(input)?;
+                assert_eq!(&request.args[..2], ["lane", "rename"]);
+                assert_eq!(request.args[2], self.remote.id);
+                self.calls.lock().unwrap().push(request.args.clone());
+                let mut reply = self.remote.clone();
+                reply.name = request.args[3].clone();
+                reply.host = "forged-host".into();
+                reply.project_path = PathBuf::from("/forged/project");
+                if self.forge {
+                    reply.id = uuid::Uuid::new_v4().to_string();
+                }
+                Ok(serde_json::to_string(&ExecutorResponse {
+                    protocol_version: EXECUTOR_PROTOCOL,
+                    request_id: request.request_id,
+                    success: true,
+                    payload: Some(serde_json::to_value(reply)?),
+                    error: None,
+                })?)
+            }
+        }
+        let fake = |forge| RenameRunner {
+            remote: remote_spec.clone(),
+            forge,
+            calls: Mutex::new(vec![]),
+        };
+        let good = fake(false);
+        assert!(rename_selected_lane(&good, &store, &local.id, "invalid name").is_err());
+        assert!(
+            rename_selected_lane(&good, &store, &local.id, &remote_spec.name)
+                .unwrap_err()
+                .to_string()
+                .contains("already registered")
+        );
+        assert!(good.calls.lock().unwrap().is_empty());
+        let renamed_local =
+            rename_selected_lane(&good, &store, &local.id, "renamed-native").unwrap();
+        assert_eq!(renamed_local.session_name, local.session_name);
+        assert_eq!(renamed_local.container_name, local.container_name);
+        assert_eq!(store.lane(&local.id).unwrap().name, "renamed-native");
+        assert_eq!(
+            rename_selected_lane(&good, &store, &local.id, "renamed-native")
+                .unwrap()
+                .id,
+            local.id
+        );
+        assert!(
+            rename_selected_lane(&fake(true), &store, &remote_spec.id, "remote-new")
+                .unwrap_err()
+                .to_string()
+                .contains("identity mismatch")
+        );
+        assert_eq!(store.lane(&remote_spec.id).unwrap().name, remote_spec.name);
+        let renamed_remote =
+            rename_selected_lane(&good, &store, &remote_spec.id, "remote-new").unwrap();
+        assert_eq!(renamed_remote.host, "sandbox");
+        assert_eq!(renamed_remote.project_path, remote_spec.project_path);
+        assert_eq!(renamed_remote.session_name, remote_spec.session_name);
+        assert_eq!(store.lane(&remote_spec.id).unwrap().name, "remote-new");
+        assert_eq!(good.calls.lock().unwrap().len(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn selected_reconcile_uses_explicit_lane_ids_and_rebinds_remote_cache_locators() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
             "../target/tmp/reconcile-selection-{}",
@@ -5070,6 +5239,326 @@ esac
     }
 
     #[test]
+    fn upgrade_preflight_rejects_v3_before_any_legacy_remote_build_and_scopes_remote_flags() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../target/tmp/upgrade-select-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(root.join("registry.db")).unwrap();
+        let mut native = spec("local");
+        native.project_path = root.join("native");
+        native.profile.terminal_backend = TerminalBackend::TuiosV3;
+        native.profile.agent = AgentKind::Pi;
+        native.profile.embedded_containerfile = false;
+        std::fs::create_dir_all(&native.project_path).unwrap();
+        write_lane_spec(&native).unwrap();
+        store.save_lane(&native, "stopped", false).unwrap();
+        let mut legacy = spec("sandbox");
+        legacy.name = "remote-legacy".into();
+        legacy.project_path = root.join("remote");
+        store.save_lane(&legacy, "stopped", false).unwrap();
+        store
+            .upsert_host(&Host {
+                name: "sandbox".into(),
+                ssh_target: "fixture@example.test".into(),
+                local: false,
+                installed_version: None,
+                last_seen: None,
+            })
+            .unwrap();
+        assert!(select_upgrade_specs(&store, None, false)
+            .unwrap_err()
+            .to_string()
+            .contains("lane or --all"));
+        for selection in [(Some(native.id.as_str()), false), (None, true)] {
+            assert!(select_upgrade_specs(&store, selection.0, selection.1)
+                .unwrap_err()
+                .to_string()
+                .contains("separately verified pinned image"));
+        }
+        assert_eq!(
+            select_upgrade_specs(&store, Some(&legacy.id), false).unwrap()[0].id,
+            legacy.id
+        );
+        struct RemoteUpgradeRunner {
+            calls: Mutex<Vec<Vec<String>>>,
+            fail: bool,
+        }
+        impl Runner for RemoteUpgradeRunner {
+            fn run(&self, _: &str, _: &[String]) -> Result<String> {
+                panic!("remote upgrade cannot run local Podman")
+            }
+            fn run_with_input(
+                &self,
+                program: &str,
+                args: &[String],
+                input: &[u8],
+            ) -> Result<String> {
+                assert_eq!(program, "ssh");
+                assert!(args.iter().any(|arg| arg.contains("fixture@example.test")));
+                let request: ExecutorRequest = serde_json::from_slice(input)?;
+                assert_eq!(&request.args[..2], ["lane", "upgrade"]);
+                self.calls.lock().unwrap().push(request.args.clone());
+                if self.fail {
+                    bail!("private transport failed")
+                }
+                let payload = if request.args.contains(&"--all".into()) {
+                    serde_json::json!([{"outcome":"first"},{"outcome":"second"}])
+                } else {
+                    serde_json::json!({"outcome":"single"})
+                };
+                Ok(serde_json::to_string(&ExecutorResponse {
+                    protocol_version: EXECUTOR_PROTOCOL,
+                    request_id: request.request_id,
+                    success: true,
+                    payload: Some(payload),
+                    error: None,
+                })?)
+            }
+        }
+        let runner = RemoteUpgradeRunner {
+            calls: Mutex::new(vec![]),
+            fail: false,
+        };
+        assert_eq!(
+            upgrade_remote_with_runner(&runner, &store, &legacy, false, true, false).unwrap()[0]
+                ["outcome"],
+            "single"
+        );
+        assert_eq!(
+            upgrade_remote_with_runner(&runner, &store, &legacy, true, false, true)
+                .unwrap()
+                .len(),
+            2
+        );
+        let calls = runner.calls.lock().unwrap();
+        assert_eq!(
+            &calls[0][..4],
+            ["lane", "upgrade", legacy.id.as_str(), "--force"]
+        );
+        assert_eq!(&calls[1][..4], ["lane", "upgrade", "--all", "--no-cache"]);
+        drop(calls);
+        assert!(upgrade_remote_with_runner(
+            &RemoteUpgradeRunner {
+                calls: Mutex::new(vec![]),
+                fail: true
+            },
+            &store,
+            &legacy,
+            false,
+            false,
+            false
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("private transport failed"));
+        assert_eq!(store.index(&legacy.id).unwrap().state, "stopped");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn import_v3_manifest_requires_canonical_location_and_never_rebinds_existing_uuid() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../target/tmp/import-select-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(root.join("registry.db")).unwrap();
+        let mut lane = spec("local");
+        lane.project_path = root.join("private-lane");
+        lane.profile.terminal_backend = TerminalBackend::TuiosV3;
+        lane.profile.agent = AgentKind::Pi;
+        lane.profile.embedded_containerfile = false;
+        std::fs::create_dir_all(&lane.project_path).unwrap();
+        write_lane_spec(&lane).unwrap();
+        std::fs::write(lane.project_path.join("user-data"), "persistent").unwrap();
+        let reader = RuntimeStateRunner("exited");
+        assert!(import_local_lane(&reader, &store, &root.join("absent"))
+            .unwrap_err()
+            .to_string()
+            .contains("does not exist"));
+        std::fs::write(root.join("lane.toml"), "not a manifest").unwrap();
+        assert!(import_local_lane(&reader, &store, &root.join("lane.toml"))
+            .unwrap_err()
+            .to_string()
+            .contains("must be located"));
+        let imported = import_local_lane(&reader, &store, &lane.project_path).unwrap();
+        assert_eq!(imported.spec.id, lane.id);
+        assert_eq!(imported.spec.session_name, lane.session_name);
+        assert_eq!(imported.state, "exited");
+        assert_eq!(
+            import_local_lane(&reader, &store, &lane.manifest_path())
+                .unwrap()
+                .spec
+                .id,
+            lane.id
+        );
+        let mut copied = lane.clone();
+        copied.project_path = root.join("copied-project");
+        std::fs::create_dir_all(&copied.project_path).unwrap();
+        write_lane_spec(&copied).unwrap();
+        assert!(import_local_lane(&reader, &store, &copied.project_path)
+            .unwrap_err()
+            .to_string()
+            .contains("already indexed"));
+        let duplicate = LaneSpec::new(
+            lane.name.clone(),
+            "local".into(),
+            root.join("duplicate"),
+            lane.profile.clone(),
+        )
+        .unwrap();
+        std::fs::create_dir_all(&duplicate.project_path).unwrap();
+        write_lane_spec(&duplicate).unwrap();
+        assert!(import_local_lane(&reader, &store, &duplicate.project_path)
+            .unwrap_err()
+            .to_string()
+            .contains("already registered"));
+        assert_eq!(
+            store
+                .index(&lane.id)
+                .unwrap()
+                .manifest_path
+                .canonicalize()
+                .unwrap(),
+            lane.manifest_path().canonicalize().unwrap()
+        );
+        assert_eq!(
+            std::fs::read_to_string(lane.project_path.join("user-data")).unwrap(),
+            "persistent"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn forget_selection_refuses_paused_native_operation_but_never_removes_user_manifest() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../target/tmp/forget-selected-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(root.join("registry.db")).unwrap();
+        let mut native = spec("local");
+        native.project_path = root.join("native");
+        native.profile.terminal_backend = TerminalBackend::TuiosV3;
+        native.profile.agent = AgentKind::Pi;
+        native.profile.embedded_containerfile = false;
+        std::fs::create_dir_all(&native.project_path).unwrap();
+        write_lane_spec(&native).unwrap();
+        store.save_lane(&native, "stopped", false).unwrap();
+        let journal = OperationJournal::new(&native, "delete", "prepared").unwrap();
+        write_operation_journal(&native, &journal).unwrap();
+        let refusal = forget_selected_lane(&store, &native.id)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refusal.contains("cannot forget")
+                && refusal.contains("delete")
+                && refusal.contains("prepared")
+        );
+        assert!(store.index(&native.id).is_ok());
+        assert!(native.manifest_path().exists());
+        clear_operation_journal(&native).unwrap();
+        assert_eq!(
+            forget_selected_lane(&store, &native.id).unwrap()["forgot"],
+            native.name
+        );
+        assert!(store.index(&native.id).is_err());
+        assert!(native.manifest_path().exists()); // Forget unregisters; it does not delete a lane.
+        let mut remote_spec = spec("sandbox");
+        remote_spec.name = "remote-forget".into();
+        remote_spec.project_path = root.join("remote");
+        store.save_lane(&remote_spec, "running", false).unwrap();
+        assert_eq!(
+            forget_selected_lane(&store, &remote_spec.id).unwrap()["forgot"],
+            remote_spec.name
+        );
+        assert!(store.index(&remote_spec.id).is_err());
+        assert!(forget_selected_lane(&store, "missing").is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn selected_v3_delete_blocks_drift_then_replays_tombstone_without_runtime_access() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../target/tmp/delete-selected-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(root.join("registry.db")).unwrap();
+        let mut lane = spec("local");
+        lane.project_path = root.join("lane");
+        lane.profile.terminal_backend = TerminalBackend::TuiosV3;
+        lane.profile.agent = AgentKind::Pi;
+        lane.profile.embedded_containerfile = false;
+        lane.profile.mount_codex_credentials = false;
+        std::fs::create_dir_all(&lane.project_path).unwrap();
+        std::fs::write(lane.project_path.join("keep-user-data"), b"private").unwrap();
+        write_lane_spec(&lane).unwrap();
+        store.save_lane(&lane, "exited", false).unwrap();
+        struct DeleteRunner {
+            state: UpgradeStateRunner,
+            diff: &'static str,
+        }
+        impl Runner for DeleteRunner {
+            fn run(&self, program: &str, args: &[String]) -> Result<String> {
+                if program == "podman" {
+                    if args.first().is_some_and(|arg| arg == "diff") {
+                        return Ok(self.diff.into());
+                    }
+                    if args.iter().any(|arg| arg.contains("StartedAt")) {
+                        return Ok("2026-01-01T00:00:00Z".into());
+                    }
+                    if args.iter().any(|arg| arg.contains("config-sha256")) {
+                        return Ok("<no value>".into());
+                    }
+                }
+                self.state.run(program, args)
+            }
+            fn run_output(&self, program: &str, args: &[String]) -> Result<ProcessOutput> {
+                self.state.run_output(program, args)
+            }
+        }
+        let fixture = |diff| DeleteRunner {
+            state: UpgradeStateRunner::new(&lane, [(lane.container_name(), "exited".into())]),
+            diff,
+        };
+        let dirty = fixture("A /etc/private-fixture\n");
+        assert!(delete_selected_lane(&dirty, &store, &lane.id)
+            .unwrap_err()
+            .to_string()
+            .contains("drift"));
+        assert!(lane.manifest_path().exists());
+        assert!(store.index(&lane.id).is_ok());
+        assert_eq!(
+            dirty.state.state(&lane.container_name()).as_deref(),
+            Some("exited")
+        );
+        let clean = fixture("A /tmp/cache\n");
+        let removed = delete_selected_lane(&clean, &store, &lane.id).unwrap();
+        assert_eq!(removed["deleted"], true);
+        assert!(removed.get("already_complete").is_none());
+        assert_eq!(clean.state.state(&lane.container_name()), None);
+        assert!(!lane.manifest_path().exists());
+        assert!(store.index(&lane.id).is_err());
+        assert_eq!(
+            std::fs::read(lane.project_path.join("keep-user-data")).unwrap(),
+            b"private"
+        );
+        assert_eq!(
+            delete_selected_lane(&clean, &store, &lane.id).unwrap()["already_complete"],
+            true
+        );
+        assert_eq!(
+            delete_selected_lane(&clean, &store, &lane.name).unwrap()["lane_id"],
+            lane.id
+        );
+        assert!(delete_selected_lane(&clean, &store, "not-a-lane").is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn local_v3_delete_refuses_foreign_runtime_then_recovers_without_deleting_home() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
             "../target/tmp/v3-delete-test-{}",
@@ -5244,6 +5733,74 @@ esac
         ensure_no_pending_operation(&lane, "start").unwrap();
         assert_eq!(store.index(&lane.id).unwrap().state, "exited");
         assert!(store.index(&lane.id).unwrap().drift);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn selected_refresh_requires_lane_unless_all_and_updates_only_selected_registry_entries() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../target/tmp/refresh-select-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(root.join("registry.db")).unwrap();
+        let mut first = spec("local");
+        first.project_path = root.join("first");
+        first.profile.terminal_backend = TerminalBackend::TuiosV3;
+        first.profile.agent = AgentKind::Pi;
+        first.profile.embedded_containerfile = false;
+        let second = LaneSpec::new(
+            "second-fixture".into(),
+            "local".into(),
+            root.join("second"),
+            first.profile.clone(),
+        )
+        .unwrap();
+        for spec in [&first, &second] {
+            std::fs::create_dir_all(&spec.project_path).unwrap();
+            write_lane_spec(spec).unwrap();
+            store.save_lane(spec, "stopped", false).unwrap();
+        }
+        struct RefreshRunner(Mutex<Vec<String>>);
+        impl Runner for RefreshRunner {
+            fn run(&self, program: &str, args: &[String]) -> Result<String> {
+                assert_eq!(program, "podman");
+                self.0.lock().unwrap().push(args.last().unwrap().clone());
+                match args.first().map(String::as_str) {
+                    Some("diff") => Ok("A /tmp/cache\n".into()),
+                    Some("inspect") if args.iter().any(|arg| arg.contains("StartedAt")) => {
+                        Ok("2026-01-01T00:00:00Z".into())
+                    }
+                    Some("inspect") if args.iter().any(|arg| arg.contains("config-sha256")) => {
+                        Ok("<no value>".into())
+                    }
+                    Some("inspect") => Ok("running".into()),
+                    other => panic!("unexpected fixture command: {other:?}"),
+                }
+            }
+            fn run_output(&self, _: &str, _: &[String]) -> Result<ProcessOutput> {
+                Ok(ProcessOutput {
+                    code: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+        }
+        let runner = RefreshRunner(Mutex::new(vec![]));
+        assert!(refresh_selected_lanes(&runner, &store, None, false)
+            .unwrap_err()
+            .to_string()
+            .contains("lane or --all"));
+        assert!(runner.0.lock().unwrap().is_empty());
+        let single = refresh_selected_lanes(&runner, &store, Some(&first.id), false).unwrap();
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].spec.id, first.id);
+        assert_eq!(single[0].state, "running");
+        assert_eq!(store.index(&second.id).unwrap().state, "stopped");
+        let all = refresh_selected_lanes(&runner, &store, None, true).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(store.index(&second.id).unwrap().state, "running");
+        assert!(!all.iter().any(|status| status.drift));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -5447,9 +6004,39 @@ esac
                 })?)
             }
         }
-        let remote_observed = refresh(&RemoteReader(payload), &store, &remote_spec).unwrap();
+        let remote_observed =
+            refresh(&RemoteReader(payload.clone()), &store, &remote_spec).unwrap();
         assert_eq!(remote_observed.spec.host, "sandbox");
         assert_eq!(remote_observed.spec.project_path, remote_spec.project_path);
+        assert_eq!(store.index(&remote_spec.id).unwrap().host, "sandbox");
+        store.save_lane(&remote_spec, "stopped", true).unwrap();
+        let fast = refresh_state_only(&RemoteReader(payload), &store, &remote_spec).unwrap();
+        assert_eq!(fast.spec.host, "sandbox");
+        assert_eq!(fast.spec.project_path, remote_spec.project_path);
+        assert!(fast.drift);
+        assert!(store.index(&remote_spec.id).unwrap().drift);
+        let mut forged_id = remote_spec.clone();
+        forged_id.id = uuid::Uuid::new_v4().to_string();
+        let forged_payload = serde_json::to_string(&LaneStatus {
+            runtime: RuntimeMode::PodmanInit,
+            spec: forged_id.clone(),
+            state: "running".into(),
+            drift: false,
+            drift_reasons: vec![],
+            cached_at: Utc::now(),
+            runtime_started_at: None,
+        })
+        .unwrap();
+        for inspect in [false, true] {
+            let fake = RemoteReader(forged_payload.clone());
+            let error = if inspect {
+                refresh_state_only(&fake, &store, &remote_spec).unwrap_err()
+            } else {
+                refresh(&fake, &store, &remote_spec).unwrap_err()
+            };
+            assert!(error.to_string().contains("identity mismatch"));
+        }
+        assert!(store.index(&forged_id.id).is_err());
         assert_eq!(store.index(&remote_spec.id).unwrap().host, "sandbox");
         std::fs::remove_dir_all(root).unwrap();
     }
