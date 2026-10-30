@@ -223,8 +223,13 @@ pub fn load_profiles() -> Result<BTreeMap<String, Profile>> {
     Ok(profiles)
 }
 pub fn validate_profile(profile: &Profile, home: &Path, require_sources: bool) -> Result<()> {
-    if profile.terminal_backend == TerminalBackend::TuiosV3 && profile.embedded_containerfile {
-        bail!("tuios-v3 requires a custom image with TUIOS installed; the embedded image contains Herdr")
+    if profile.terminal_backend == TerminalBackend::TuiosV3 {
+        if profile.embedded_containerfile {
+            bail!("tuios-v3 requires a custom image with TUIOS installed; the embedded image contains Herdr")
+        }
+        if profile.agent != AgentKind::Pi {
+            bail!("tuios-v3 requires Pi; Codex is not a v3 lane agent")
+        }
     }
     if profile.agent == AgentKind::Pi && profile.embedded_containerfile {
         bail!("Pi lanes require a custom Pi image; the embedded image contains Codex")
@@ -1659,6 +1664,12 @@ mod tests {
             .to_string()
             .contains("custom image"));
         legacy.embedded_containerfile = false;
+        assert!(validate_profile(&legacy, Path::new("/home/dev"), false)
+            .unwrap_err()
+            .to_string()
+            .contains("requires Pi"));
+        legacy.agent = AgentKind::Pi;
+        legacy.mount_codex_credentials = false;
         assert!(validate_profile(&legacy, Path::new("/home/dev"), false).is_ok());
         let encoded = toml::to_string(&legacy).unwrap();
         assert!(encoded.contains("terminal_backend = \"tuios-v3\""));

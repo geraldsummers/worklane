@@ -7,7 +7,7 @@ use std::{
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
-use worklane_core::{write_lane_spec, LaneSpec, Profile, Store, TerminalBackend};
+use worklane_core::{write_lane_spec, AgentKind, LaneSpec, Profile, Store, TerminalBackend};
 
 fn fixture(name: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!("worklane-api-{name}-{}", std::process::id()));
@@ -334,6 +334,8 @@ fn tuios_reads_use_native_socket_protocol_without_herdr_fallback() {
         .unwrap()
         .contains("opted into"));
     spec.profile.embedded_containerfile = false;
+    spec.profile.agent = AgentKind::Pi;
+    spec.profile.mount_codex_credentials = false;
     spec.profile.terminal_backend = TerminalBackend::TuiosV3;
     write_lane_spec(&spec).unwrap();
     store.save_lane(&spec, "running", false).unwrap();

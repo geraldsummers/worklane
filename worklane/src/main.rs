@@ -1460,10 +1460,13 @@ fn lane_attach_args(
 // Only a custom image explicitly selected by a lane may use this backend. Never
 // try Herdr if TUIOS is missing or its headless session cannot be inspected.
 fn validate_tuios_image(spec: &LaneSpec) -> Result<()> {
-    if spec.profile.terminal_backend == TerminalBackend::TuiosV3
-        && spec.profile.embedded_containerfile
-    {
-        bail!("tuios-v3 requires a custom image with TUIOS installed; the embedded image contains Herdr")
+    if spec.profile.terminal_backend == TerminalBackend::TuiosV3 {
+        if spec.profile.embedded_containerfile {
+            bail!("tuios-v3 requires a custom image with TUIOS installed; the embedded image contains Herdr")
+        }
+        if spec.profile.agent != AgentKind::Pi {
+            bail!("tuios-v3 requires Pi; Codex is not a v3 lane agent")
+        }
     }
     Ok(())
 }
@@ -3249,6 +3252,9 @@ mod tests {
         selected.profile.terminal_backend = TerminalBackend::TuiosV3;
         assert!(validate_tuios_image(&selected).is_err());
         selected.profile.embedded_containerfile = false;
+        assert!(validate_tuios_image(&selected).is_err());
+        selected.profile.agent = AgentKind::Pi;
+        selected.profile.mount_codex_credentials = false;
         validate_tuios_image(&selected).unwrap();
         let script = bootstrap_tuios_script();
         assert!(script.contains("tuios new \"$session\" --detach --cwd \"$workspace\""));

@@ -4,7 +4,9 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
-use worklane_core::{write_lane_spec, LaneSpec, Profile, RuntimeMode, Store, TerminalBackend};
+use worklane_core::{
+    write_lane_spec, AgentKind, LaneSpec, Profile, RuntimeMode, Store, TerminalBackend,
+};
 
 const SMOKE_ID: &str = "00000000-0000-4000-8000-000000000001";
 const REGISTRY_ONLY_ID: &str = "00000000-0000-4000-8000-000000000002";
@@ -118,6 +120,7 @@ fn opted_in_tuios_start_open_attach_and_failures_never_route_to_herdr() {
     fs::create_dir_all(&project).unwrap();
     let profile = Profile {
         image: "custom-tuios:test".into(),
+        agent: AgentKind::Pi,
         embedded_containerfile: false,
         runtime: RuntimeMode::PodmanInit,
         terminal_backend: TerminalBackend::TuiosV3,

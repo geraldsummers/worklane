@@ -1,19 +1,40 @@
-//! Fail-closed policy for a future native TUIOS agent adapter.
+//! Fail-closed v0.11.1 TUIOS Pi supervision policy (not yet wired to lane startup).
 //!
-//! This is deliberately not wired to `lane start`: no pinned TUIOS binary or
-//! verified native agent response schema ships with Worklane yet. The adapter
-//! must implement these methods against an installed native TUIOS protocol,
-//! never against the `.herdr` compatibility socket. The read/start/read cycle
-//! also needs a daemon-side uniqueness guarantee or an exclusive lane lock
-//! before it is safe to invoke concurrently in production.
+//! The real adapter must call native `list-agents` with `all: true` in the
+//! explicit lane session, then select the reserved pane name. Plain
+//! `list-agents` omits unrecognised panes, even when `start-agent` timed out
+//! *after creating one*. Never infer absence from that shorter list.
+//! Read/start/read is not atomic: runtime wiring also needs an exclusive lane
+//! lock or daemon-side uniqueness and a real Pi hook/ready-state acceptance test.
 
 use crate::{AgentKind, LaneSpec, TerminalBackend};
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
+use serde_json::Value;
 use std::path::Path;
+
+pub const PI_PANE_NAME: &str = "worklane-pi";
+
+/// Explicit argv for a future `start-agent pi -s SESSION --name worklane-pi
+/// --cwd WORKSPACE --json -- [args]` adapter. No shell parses these arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PiLaunch {
+    pub executable: &'static str,
+    pub name: &'static str,
+    pub args: &'static [&'static str],
+}
+impl Default for PiLaunch {
+    fn default() -> Self {
+        Self {
+            executable: "pi",
+            name: PI_PANE_NAME,
+            args: &["--provider", "openai-codex", "--model", "gpt-6-sol"],
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentActivity {
-    Starting,
+    None,
     Working,
     NeedsInput,
     Idle,
@@ -21,23 +42,106 @@ pub enum AgentActivity {
     Errored,
     Unknown,
 }
+impl AgentActivity {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "none" => Ok(Self::None),
+            "working" => Ok(Self::Working),
+            "needs_input" => Ok(Self::NeedsInput),
+            "idle" => Ok(Self::Idle),
+            "done" => Ok(Self::Done),
+            "errored" => Ok(Self::Errored),
+            "unknown" => Ok(Self::Unknown),
+            other => bail!("unsupported native TUIOS agent state '{other}'"),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentObservation {
     pub session: String,
     pub window_id: String,
-    pub kind: AgentKind,
+    pub name: String,
+    pub harness_id: String,
     pub activity: AgentActivity,
 }
 
-/// The adapter must return *all* known agents in the explicit session, including
-/// done and errored agents. Omitting terminal states would silently relaunch them.
-pub trait NativeAgentControl {
-    fn list_agents(&mut self, session: &str) -> Result<Vec<AgentObservation>>;
-    fn start_agent(
+/// Decode a native v0.11.1 `list-agents` result produced with `all: true`.
+/// The caller must use that flag; the reply itself does not echo it.
+/// Nonmatching windows are ordinary shells. The reserved name is never ignored.
+pub fn decode_candidates(reply: &Value, session: &str) -> Result<Vec<AgentObservation>> {
+    if reply["type"] != "agent_list" || reply["session"] != session {
+        bail!("unexpected native TUIOS agent-list reply or session")
+    }
+    let entries = reply["agents"]
+        .as_array()
+        .context("TUIOS agent list omitted agents")?;
+    entries
+        .iter()
+        .filter(|entry| entry["name"] == PI_PANE_NAME)
+        .map(|entry| {
+            let text = |key| -> Result<String> {
+                entry[key]
+                    .as_str()
+                    .map(str::to_owned)
+                    .with_context(|| format!("TUIOS agent omitted {key}"))
+            };
+            Ok(AgentObservation {
+                session: text("session")?,
+                window_id: text("window_id")?,
+                name: text("name")?,
+                harness_id: text("harness_id")?,
+                activity: AgentActivity::parse(&text("state")?)?,
+            })
+        })
+        .collect()
+}
+
+/// Decode either the CLI `start-agent --json` result or the native socket
+/// `agent_started` result. CLI exit status 1 (or a native successful envelope)
+/// with `outcome: timeout` still leaves a pane alive. Never retry blindly.
+pub fn decode_start_reply(reply: &Value, session: &str) -> Result<AgentObservation> {
+    let valid_shape = reply["type"] == "agent_started"
+        || (reply.get("type").is_none() && reply["success"] == true);
+    if !valid_shape
+        || reply["session"] != session
+        || reply["name"] != PI_PANE_NAME
+        || reply["agent"] != "pi"
+    {
+        bail!("unexpected TUIOS Pi start-agent reply or target")
+    }
+    if reply["outcome"] != "ready" || reply["ready"] != true {
+        bail!("TUIOS Pi is not ready; its pane may have been kept, inspect before retrying")
+    }
+    let window_id = reply["window_id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .context("TUIOS Pi start-agent omitted window_id")?;
+    let activity = AgentActivity::parse(
+        reply["state"]
+            .as_str()
+            .context("TUIOS Pi start-agent omitted state")?,
+    )?;
+    if activity != AgentActivity::Idle {
+        bail!("TUIOS Pi returned a non-idle start state; inspect before retrying")
+    }
+    Ok(AgentObservation {
+        session: session.into(),
+        window_id: window_id.into(),
+        name: PI_PANE_NAME.into(),
+        harness_id: "pi".into(), // Must be independently verified by list-agents.
+        activity,
+    })
+}
+
+/// A real implementation must read **all** session windows, including those
+/// with state `none`, and must never call the `.herdr` compatibility socket.
+pub trait NativePiControl {
+    fn list_candidates(&mut self, session: &str) -> Result<Vec<AgentObservation>>;
+    fn start_pi(
         &mut self,
         session: &str,
-        kind: AgentKind,
+        launch: &PiLaunch,
         workspace: &Path,
     ) -> Result<AgentObservation>;
 }
@@ -49,56 +153,59 @@ pub enum AgentOutcome {
 }
 
 fn validate_observation(spec: &LaneSpec, observed: &AgentObservation) -> Result<()> {
-    if observed.session != spec.session_name() || observed.kind != spec.profile.agent {
-        bail!("TUIOS agent belongs to another session or has the wrong agent kind")
+    if observed.session != spec.session_name()
+        || observed.name != PI_PANE_NAME
+        || observed.harness_id != "pi"
+    {
+        bail!("TUIOS Pi pane has unexpected session, name, or harness")
     }
     if observed.window_id.is_empty() {
-        bail!("TUIOS agent did not report a stable window ID")
+        bail!("TUIOS Pi agent did not report a stable window ID")
     }
-    if matches!(
+    if !matches!(
         observed.activity,
-        AgentActivity::Done | AgentActivity::Errored | AgentActivity::Unknown
+        AgentActivity::Working | AgentActivity::NeedsInput | AgentActivity::Idle
     ) {
-        bail!("TUIOS agent is terminal or unknown; manual inspection is required")
+        bail!("TUIOS Pi pane is not recognised as active; inspect before retrying")
     }
     Ok(())
 }
 
-/// Reconcile exactly one agent without guessing which window is focused.
-/// A returned error never triggers a Herdr fallback or a retrying agent spawn.
-pub fn ensure_agent(spec: &LaneSpec, client: &mut impl NativeAgentControl) -> Result<AgentOutcome> {
+/// Reconcile one explicitly named Pi agent. Does not send text or answer prompts.
+/// On any error, do not fall back to Herdr or start another pane.
+pub fn ensure_agent(spec: &LaneSpec, client: &mut impl NativePiControl) -> Result<AgentOutcome> {
     if spec.profile.terminal_backend != TerminalBackend::TuiosV3 {
         bail!("native TUIOS agent operations require an opted-in tuios-v3 lane")
     }
     if spec.profile.embedded_containerfile {
         bail!("native TUIOS agents require a custom TUIOS image")
     }
-    if spec.profile.agent != AgentKind::Codex {
-        bail!("native TUIOS Pi agent integration is not yet verified")
+    if spec.profile.agent != AgentKind::Pi {
+        bail!("v3 requires Pi; refusing to start Codex through TUIOS")
     }
     let session = spec.session_name();
-    let initial = client.list_agents(&session)?;
+    let initial = client.list_candidates(&session)?;
     match initial.as_slice() {
         [existing] => {
             validate_observation(spec, existing)?;
             Ok(AgentOutcome::Existing(existing.clone()))
         }
         [] => {
-            let launched =
-                client.start_agent(&session, spec.profile.agent, &spec.container_home())?;
-            validate_observation(spec, &launched)?;
-            let confirmed = client.list_agents(&session)?;
+            let started =
+                client.start_pi(&session, &PiLaunch::default(), &spec.container_home())?;
+            validate_observation(spec, &started)?;
+            let confirmed = client.list_candidates(&session)?;
             match confirmed.as_slice() {
-                [agent] if agent.window_id == launched.window_id => {
+                [agent] if agent.window_id == started.window_id => {
                     validate_observation(spec, agent)?;
                     Ok(AgentOutcome::Launched(agent.clone()))
                 }
                 _ => bail!(
-                    "TUIOS did not confirm exactly the launched agent; inspect before retrying"
+                    "TUIOS did not confirm exactly the launched Pi pane; inspect before retrying"
                 ),
             }
         }
-        _ => bail!("multiple TUIOS agents found; refusing an ambiguous launch"),
+        _ => bail!("multiple TUIOS Pi panes found; refusing an ambiguous launch"),
     }
 }
 
@@ -122,27 +229,28 @@ mod tests {
             }
         }
     }
-    impl NativeAgentControl for MockNative {
-        fn list_agents(&mut self, session: &str) -> Result<Vec<AgentObservation>> {
-            self.calls.push(format!("list:{session}"));
+    impl NativePiControl for MockNative {
+        fn list_candidates(&mut self, session: &str) -> Result<Vec<AgentObservation>> {
+            self.calls.push(format!("list-all:{session}"));
             self.observations
                 .pop_front()
-                .expect("mock must specify every native read")
+                .expect("missing native mock read")
         }
-        fn start_agent(
+        fn start_pi(
             &mut self,
             session: &str,
-            kind: AgentKind,
+            launch: &PiLaunch,
             workspace: &Path,
         ) -> Result<AgentObservation> {
-            self.calls.push(format!(
-                "start:{session}:{}:{}",
-                kind.as_str(),
-                workspace.display()
-            ));
-            self.start_result
-                .take()
-                .expect("mock must specify native launch outcome")
+            assert_eq!(launch.executable, "pi");
+            assert_eq!(launch.name, PI_PANE_NAME);
+            assert_eq!(
+                launch.args,
+                ["--provider", "openai-codex", "--model", "gpt-6-sol"]
+            );
+            self.calls
+                .push(format!("start:{session}:pi:{}", workspace.display()));
+            self.start_result.take().expect("missing native mock start")
         }
     }
     fn lane() -> LaneSpec {
@@ -151,7 +259,9 @@ mod tests {
             "local".into(),
             PathBuf::from("/work/project"),
             Profile {
+                agent: AgentKind::Pi,
                 embedded_containerfile: false,
+                mount_codex_credentials: false,
                 terminal_backend: TerminalBackend::TuiosV3,
                 ..Profile::default()
             },
@@ -162,15 +272,14 @@ mod tests {
         AgentObservation {
             session: "v3-agent".into(),
             window_id: "window-123".into(),
-            kind: AgentKind::Codex,
+            name: PI_PANE_NAME.into(),
+            harness_id: "pi".into(),
             activity,
         }
     }
-
     #[test]
-    fn existing_active_agent_is_preserved_without_spawning_or_answering_prompts() {
+    fn pi_existing_active_agent_is_preserved_without_prompt_or_spawn() {
         for activity in [
-            AgentActivity::Starting,
             AgentActivity::Working,
             AgentActivity::NeedsInput,
             AgentActivity::Idle,
@@ -180,14 +289,13 @@ mod tests {
                 ensure_agent(&lane(), &mut client).unwrap(),
                 AgentOutcome::Existing(agent(activity))
             );
-            assert_eq!(client.calls, ["list:v3-agent"]);
+            assert_eq!(client.calls, ["list-all:v3-agent"]);
         }
     }
-
     #[test]
-    fn absent_agent_is_launched_once_and_must_be_observed_again_by_stable_id() {
+    fn pi_launch_once_is_confirmed_by_native_agent_identity_and_window_id() {
         let mut client = MockNative::new(vec![vec![], vec![agent(AgentActivity::Idle)]]);
-        client.start_result = Some(Ok(agent(AgentActivity::Starting)));
+        client.start_result = Some(Ok(agent(AgentActivity::Idle)));
         assert_eq!(
             ensure_agent(&lane(), &mut client).unwrap(),
             AgentOutcome::Launched(agent(AgentActivity::Idle))
@@ -195,15 +303,24 @@ mod tests {
         assert_eq!(
             client.calls,
             [
-                "list:v3-agent",
-                "start:v3-agent:codex:/home/dev",
-                "list:v3-agent"
+                "list-all:v3-agent",
+                "start:v3-agent:pi:/home/dev",
+                "list-all:v3-agent"
             ]
         );
     }
-
     #[test]
-    fn terminal_unknown_duplicate_or_foreign_agents_never_trigger_a_restart() {
+    fn timeout_kept_unrecognised_pi_pane_never_gets_a_second_launch() {
+        // v0.11.1 `start-agent` can time out but keep a pane with state none;
+        // plain list-agents omits it. list-agents all:true must reveal it.
+        let mut stale = agent(AgentActivity::None);
+        stale.harness_id.clear();
+        let mut client = MockNative::new(vec![vec![stale]]);
+        assert!(ensure_agent(&lane(), &mut client).is_err());
+        assert_eq!(client.calls, ["list-all:v3-agent"]);
+    }
+    #[test]
+    fn invalid_or_multiple_panes_and_legacy_profiles_fail_before_launch() {
         for activity in [
             AgentActivity::Done,
             AgentActivity::Errored,
@@ -211,99 +328,87 @@ mod tests {
         ] {
             let mut client = MockNative::new(vec![vec![agent(activity)]]);
             assert!(ensure_agent(&lane(), &mut client).is_err());
-            assert_eq!(client.calls, ["list:v3-agent"]);
+            assert_eq!(client.calls, ["list-all:v3-agent"]);
         }
-        let mut foreign = agent(AgentActivity::Working);
-        foreign.session = "other".into();
-        for observations in [vec![foreign], vec![agent(AgentActivity::Idle); 2]] {
-            let mut client = MockNative::new(vec![observations]);
+        let mut foreign = agent(AgentActivity::Idle);
+        foreign.session = "another".into();
+        for candidates in [vec![foreign], vec![agent(AgentActivity::Idle); 2]] {
+            let mut client = MockNative::new(vec![candidates]);
             assert!(ensure_agent(&lane(), &mut client).is_err());
-            assert_eq!(client.calls, ["list:v3-agent"]);
+            assert_eq!(client.calls, ["list-all:v3-agent"]);
         }
-        let mut missing_id = agent(AgentActivity::Working);
-        missing_id.window_id.clear();
-        let mut client = MockNative::new(vec![vec![missing_id]]);
-        assert!(ensure_agent(&lane(), &mut client).is_err());
-    }
-
-    #[test]
-    fn launch_failure_or_inconsistent_confirmation_fails_closed_without_retry() {
-        let mut failed = MockNative::new(vec![vec![]]);
-        failed.start_result = Some(Err(anyhow::anyhow!("native start failed")));
-        assert!(ensure_agent(&lane(), &mut failed)
-            .unwrap_err()
-            .to_string()
-            .contains("native start failed"));
-        assert_eq!(failed.calls.len(), 2);
-
-        for observed in [vec![], vec![agent(AgentActivity::Idle); 2]] {
-            let mut client = MockNative::new(vec![vec![], observed]);
-            client.start_result = Some(Ok(agent(AgentActivity::Starting)));
-            assert!(ensure_agent(&lane(), &mut client).is_err());
-            assert_eq!(client.calls.len(), 3);
-        }
-        let mut different = agent(AgentActivity::Working);
-        different.window_id = "other-window".into();
-        let mut client = MockNative::new(vec![vec![], vec![different]]);
-        client.start_result = Some(Ok(agent(AgentActivity::Starting)));
-        assert!(ensure_agent(&lane(), &mut client).is_err());
-    }
-
-    #[test]
-    fn discovery_failure_or_bad_start_reply_never_retries_or_falls_back() {
-        let mut unreachable = MockNative::new(vec![]);
-        unreachable
-            .observations
-            .push_back(Err(anyhow::anyhow!("native daemon unavailable")));
-        assert!(ensure_agent(&lane(), &mut unreachable)
-            .unwrap_err()
-            .to_string()
-            .contains("native daemon unavailable"));
-        assert_eq!(unreachable.calls, ["list:v3-agent"]);
-
-        for invalid in [
-            AgentObservation {
-                session: "other".into(),
-                ..agent(AgentActivity::Idle)
-            },
-            AgentObservation {
-                window_id: String::new(),
-                ..agent(AgentActivity::Idle)
-            },
-            AgentObservation {
-                kind: AgentKind::Pi,
-                ..agent(AgentActivity::Idle)
-            },
-            agent(AgentActivity::Errored),
-        ] {
-            let mut client = MockNative::new(vec![vec![]]);
-            client.start_result = Some(Ok(invalid));
-            assert!(ensure_agent(&lane(), &mut client).is_err());
-            assert_eq!(client.calls.len(), 2); // Never re-read or spawn again on a bad reply.
-        }
-        let mut lost = MockNative::new(vec![vec![]]);
-        lost.observations
-            .push_back(Err(anyhow::anyhow!("native read lost")));
-        lost.start_result = Some(Ok(agent(AgentActivity::Starting)));
-        assert!(ensure_agent(&lane(), &mut lost)
-            .unwrap_err()
-            .to_string()
-            .contains("native read lost"));
-        assert_eq!(lost.calls.len(), 3);
-    }
-
-    #[test]
-    fn legacy_and_unverified_profiles_are_rejected_before_any_native_call() {
         let mut legacy = lane();
-        legacy.profile.terminal_backend = TerminalBackend::Herdr;
         let mut client = MockNative::new(vec![]);
+        legacy.profile.terminal_backend = TerminalBackend::Herdr;
         assert!(ensure_agent(&legacy, &mut client).is_err());
         legacy.profile.terminal_backend = TerminalBackend::TuiosV3;
         legacy.profile.embedded_containerfile = true;
         assert!(ensure_agent(&legacy, &mut client).is_err());
         legacy.profile.embedded_containerfile = false;
-        legacy.profile.agent = AgentKind::Pi;
+        legacy.profile.agent = AgentKind::Codex;
         assert!(ensure_agent(&legacy, &mut client).is_err());
         assert!(client.calls.is_empty());
+    }
+    #[test]
+    fn errors_and_post_start_mismatch_never_retry_or_fall_back() {
+        let mut absent = MockNative::new(vec![]);
+        absent
+            .observations
+            .push_back(Err(anyhow::anyhow!("native daemon unavailable")));
+        assert!(ensure_agent(&lane(), &mut absent).is_err());
+        assert_eq!(absent.calls, ["list-all:v3-agent"]);
+        let mut failed = MockNative::new(vec![vec![]]);
+        failed.start_result = Some(Err(anyhow::anyhow!("timeout; pane kept")));
+        assert!(ensure_agent(&lane(), &mut failed)
+            .unwrap_err()
+            .to_string()
+            .contains("pane kept"));
+        assert_eq!(failed.calls.len(), 2);
+        for second in [vec![], vec![agent(AgentActivity::Idle); 2]] {
+            let mut client = MockNative::new(vec![vec![], second]);
+            client.start_result = Some(Ok(agent(AgentActivity::Idle)));
+            assert!(ensure_agent(&lane(), &mut client).is_err());
+            assert_eq!(client.calls.len(), 3);
+        }
+        let mut wrong = agent(AgentActivity::Idle);
+        wrong.window_id = "other-window".into();
+        let mut client = MockNative::new(vec![vec![], vec![wrong]]);
+        client.start_result = Some(Ok(agent(AgentActivity::Idle)));
+        assert!(ensure_agent(&lane(), &mut client).is_err());
+    }
+    #[test]
+    fn v0111_native_reply_decoders_reject_unrecognised_and_timed_out_pi() {
+        let list = serde_json::json!({"type":"agent_list","session":"v3-agent","agents":[
+            {"name":"Terminal abc","session":"v3-agent","state":"none"},
+            {"name":"worklane-pi","session":"v3-agent","window_id":"w-pi","harness_id":"","state":"none"}
+        ]});
+        let candidates = decode_candidates(&list, "v3-agent").unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].activity, AgentActivity::None);
+        assert!(decode_candidates(&list, "other").is_err());
+        assert!(decode_candidates(
+            &serde_json::json!({"type":"agent_list","session":"v3-agent"}),
+            "v3-agent"
+        )
+        .is_err());
+        let timeout = serde_json::json!({"success":true,"session":"v3-agent","name":"worklane-pi","agent":"pi","outcome":"timeout","ready":false,"state":"none","window_id":"w-pi"});
+        assert!(decode_start_reply(&timeout, "v3-agent")
+            .unwrap_err()
+            .to_string()
+            .contains("pane may have been kept"));
+        let native_timeout = serde_json::json!({"type":"agent_started","session":"v3-agent","name":"worklane-pi","agent":"pi","outcome":"timeout","ready":false,"state":"none","window_id":"w-pi"});
+        assert!(decode_start_reply(&native_timeout, "v3-agent").is_err());
+        let mut ready = timeout;
+        ready["outcome"] = "ready".into();
+        ready["ready"] = true.into();
+        ready["state"] = "idle".into();
+        assert_eq!(
+            decode_start_reply(&ready, "v3-agent").unwrap().window_id,
+            "w-pi"
+        );
+        ready["state"] = "done".into();
+        assert!(decode_start_reply(&ready, "v3-agent").is_err());
+        ready["state"] = "unknown_future_value".into();
+        assert!(decode_start_reply(&ready, "v3-agent").is_err());
     }
 }
