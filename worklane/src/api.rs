@@ -480,6 +480,13 @@ fn cancel_job(id: &str) -> Result<Value> {
 }
 
 pub fn worker(id: &str) -> Result<()> {
+    worker_with_invoke(id, invoke_worklane)
+}
+
+fn worker_with_invoke(
+    id: &str,
+    invoke: impl FnOnce(&str, &Value) -> Result<(Value, Vec<Value>)>,
+) -> Result<()> {
     validate_operation_id(id)?;
     let lock_path = ensure_state_dir()?.join(format!("{id}.lock"));
     let lock = OpenOptions::new()
@@ -504,7 +511,7 @@ pub fn worker(id: &str) -> Result<()> {
     job.state = "running".into();
     job.updated_at = Utc::now();
     write_job(&job)?;
-    match invoke_worklane(&job.method, &job.params) {
+    match invoke(&job.method, &job.params) {
         Ok((result, events)) => {
             job = read_job(id)?;
             if matches!(job.state.as_str(), "cancel_requested" | "cancelled") {
@@ -1425,8 +1432,59 @@ mod tests {
             .contains("ctl --user stop"));
         assert!(submit(&request("lane.open", json!({}))).is_err());
 
+        let success_id = Uuid::new_v4().to_string();
+        job.operation_id = success_id.clone();
+        job.state = "queued".into();
+        write_job(&job).unwrap();
+        worker_with_invoke(&success_id, |method, params| {
+            assert_eq!(method, "lane.open");
+            assert_eq!(params["lane"], "v3-private");
+            Ok((
+                json!({"lane":"v3-private"}),
+                vec![json!({"phase":"opened"})],
+            ))
+        })
+        .unwrap();
+        let completed = read_job(&success_id).unwrap();
+        assert_eq!(completed.state, "succeeded");
+        assert_eq!(completed.result.unwrap()["lane"], "v3-private");
+        assert_eq!(completed.events[0]["phase"], "opened");
+        worker_with_invoke(&success_id, |_, _| {
+            panic!("a terminal operation must not run again")
+        })
+        .unwrap();
+
+        let failure_id = Uuid::new_v4().to_string();
+        job.operation_id = failure_id.clone();
+        write_job(&job).unwrap();
+        worker_with_invoke(&failure_id, |_, _| {
+            Err(anyhow::anyhow!("private backend failed"))
+        })
+        .unwrap();
+        let failed_job = read_job(&failure_id).unwrap();
+        assert_eq!(failed_job.state, "failed");
+        assert_eq!(failed_job.error.unwrap().code, "lifecycle-command-failed");
+
+        let race_id = Uuid::new_v4().to_string();
+        job.operation_id = race_id.clone();
+        write_job(&job).unwrap();
+        worker_with_invoke(&race_id, |_, _| {
+            let mut cancelled = read_job(&race_id).unwrap();
+            cancelled.state = "cancel_requested".into();
+            write_job(&cancelled).unwrap();
+            Ok((
+                json!({"should_not_publish":true}),
+                vec![json!({"phase":"stopped"})],
+            ))
+        })
+        .unwrap();
+        let cancelled = read_job(&race_id).unwrap();
+        assert_eq!(cancelled.state, "cancelled");
+        assert!(cancelled.result.is_none());
+        assert_eq!(cancelled.events[0]["phase"], "stopped");
+
         fs::write(state_dir().join("unfinished.json.new"), b"not json").unwrap();
-        assert_eq!(list_jobs().unwrap().len(), 4); // Ignore incomplete atomic write.
+        assert_eq!(list_jobs().unwrap().len(), 7); // Ignore incomplete atomic write.
         fs::write(state_dir().join("broken.json"), b"not json").unwrap();
         assert!(list_jobs().is_err());
         drop(guard);
