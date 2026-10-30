@@ -145,6 +145,7 @@ case "$*" in
   "container exists "*) exit 0 ;;
   *"{{.State.Status}}"*) printf 'running\n' ;;
   *"{{.State.StartedAt}}"*) printf '2026-01-01T00:00:00Z\n' ;;
+  *"io.worklane.id"*) cat "$0.owner" ;;
   *"io.worklane.config-sha256"*) printf '<no value>\n' ;;
   "diff "*) : ;;
   *"tuios session-info -s tuios-test --json"*)
@@ -166,6 +167,11 @@ esac
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&podman, fs::Permissions::from_mode(0o755)).unwrap();
     }
+    fs::write(
+        bin.join("podman.owner"),
+        format!("{}|{}\n", spec.id, spec.session_name),
+    )
+    .unwrap();
     let binary = env!("CARGO_BIN_EXE_worklane");
     let selected = ["--json", "lane", "start", "tuios-test"];
     assert!(run(binary, &data, &bin, &selected).contains("running"));
@@ -1043,6 +1049,7 @@ case "$1:$2" in
   image:inspect) printf 'sha256:test-image\n'; exit 0 ;;
   inspect:--format)
     case "$3" in
+      *Labels*) printf '%s|drift\n' "${4#worklane-drift-}" ;;
       *StartedAt*) printf '2026-08-02 10:00:00 +1000 AEST\n' ;;
       *) printf 'running\n' ;;
     esac

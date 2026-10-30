@@ -1003,6 +1003,7 @@ fn append_profile_devices(args: &mut Vec<String>, profile: &Profile) {
 fn ensure_local_started<R: Runner>(r: &R, spec: &LaneSpec) -> Result<()> {
     match host_runtime_state(r, spec)?.as_str() {
         "running" => {
+            verify_container_owner(r, &spec.container_name(), spec)?;
             if spec.profile.effective_runtime() == RuntimeMode::Systemd {
                 let (_, uid, _) = current_identity(r)?;
                 wait_for_systemd_user_manager(r, spec, &spec.container_name(), &uid)?;
@@ -1010,6 +1011,7 @@ fn ensure_local_started<R: Runner>(r: &R, spec: &LaneSpec) -> Result<()> {
         }
         "absent" => create_local_container(r, spec, &spec.container_name())?,
         "stopped" | "exited" | "created" => {
+            verify_container_owner(r, &spec.container_name(), spec)?;
             podman(r, ["start", &spec.container_name()])?;
             if spec.profile.effective_runtime() == RuntimeMode::Systemd {
                 let (_, uid, _) = current_identity(r)?;
@@ -1379,6 +1381,87 @@ fn create_local_lane(
         "committing the registry projection",
     );
     store.save_lane(spec, "created", false)?;
+    clear_operation_journal(spec)
+}
+fn rename_local_lane(store: &Store, source: &LaneSpec, requested: &LaneSpec) -> Result<LaneSpec> {
+    let _lock = lock_lane_operation(source)?;
+    let mut renamed = requested.clone();
+    let mut journal = match read_operation_journal(source)? {
+        Some(journal) if journal.kind == "rename" && journal.requested_name == requested.name => {
+            renamed = LaneSpec::from_manifest(
+                journal.desired_manifest.clone(),
+                source.host.clone(),
+                source.project_path.clone(),
+                source.last_attached,
+            )?;
+            journal
+        }
+        Some(journal) => bail!(
+            "cannot rename while '{}' is paused at '{}'; retry it or run lane reconcile",
+            journal.kind,
+            journal.phase
+        ),
+        None => OperationJournal::new(&renamed, "rename", "prepared")?,
+    };
+    if renamed.id != source.id || renamed.session_name != source.session_name {
+        bail!("rename journal changed stable lane identity; resolve the conflict manually")
+    }
+    write_operation_journal(source, &journal)?;
+    report_phase(
+        Some((&source.id, &source.name)),
+        "running",
+        "committing-manifest",
+        "updating the authoritative display name",
+    );
+    write_lane_spec(&renamed)?;
+    journal.phase = "manifest-applied".into();
+    journal.updated_at = Utc::now();
+    write_operation_journal(&renamed, &journal)?;
+    store.save_lane(&renamed, "unknown", false)?;
+    clear_operation_journal(&renamed)?;
+    Ok(renamed)
+}
+fn delete_local_lane(runner: &impl Runner, store: &Store, spec: &LaneSpec) -> Result<()> {
+    let _lock = lock_lane_operation(spec)?;
+    let mut journal = match read_operation_journal(spec)? {
+        Some(journal) if journal.kind == "delete" => journal,
+        Some(journal) => bail!(
+            "cannot delete while '{}' is paused at '{}'; retry it or run lane reconcile",
+            journal.kind,
+            journal.phase
+        ),
+        None => OperationJournal::new(spec, "delete", "prepared")?,
+    };
+    if journal.lane_id != spec.id || journal.desired_manifest_sha256 != manifest_sha256(spec)? {
+        bail!("delete journal does not match the selected lane and desired manifest")
+    }
+    write_operation_journal(spec, &journal)?;
+    report_phase(
+        Some((&spec.id, &spec.name)),
+        "running",
+        "removing-runtime",
+        "removing the verified disposable container",
+    );
+    remove_owned_container(runner, &spec.container_name(), spec)?;
+    journal.phase = "runtime-removed".into();
+    journal.updated_at = Utc::now();
+    write_operation_journal(spec, &journal)?;
+    let manifest = spec.manifest_path();
+    let backup = manifest.with_file_name(format!(
+        "lane.toml.deleted-{}-{}",
+        spec.session_name, journal.operation_id
+    ));
+    if manifest.exists() {
+        fs::rename(&manifest, &backup)?;
+    }
+    journal.phase = "manifest-removed".into();
+    journal.updated_at = Utc::now();
+    write_operation_journal(spec, &journal)?;
+    store.record_tombstone(&spec.id, &spec.name, "delete")?;
+    store.remove_lane(&spec.id)?;
+    if backup.exists() {
+        fs::remove_file(backup)?;
+    }
     clear_operation_journal(spec)
 }
 fn refresh_all<R: Runner>(runner: &R, store: &Store) -> Result<Vec<LaneStatus>> {
@@ -2217,10 +2300,10 @@ fn execute_local_session(
     Ok(snapshot)
 }
 
-fn run_executor() -> Result<()> {
-    let mut input = Vec::new();
-    io::stdin().read_to_end(&mut input)?;
-    let request: ExecutorRequest = serde_json::from_slice(&input)?;
+fn executor_reply_with(
+    request: ExecutorRequest,
+    execute: impl FnOnce(&[String]) -> Result<std::process::Output>,
+) -> Result<(ExecutorResponse, Vec<u8>)> {
     if request.protocol_version != EXECUTOR_PROTOCOL {
         bail!("executor protocol mismatch: deploy a matching worklane binary")
     }
@@ -2228,11 +2311,7 @@ fn run_executor() -> Result<()> {
     if request.args.first().is_some_and(|arg| arg == "executor") {
         bail!("nested executor request rejected")
     }
-    let output = Command::new(std::env::current_exe()?)
-        .arg("--json")
-        .args(&request.args)
-        .output()?;
-    io::stderr().write_all(&output.stderr)?;
+    let output = execute(&request.args)?;
     let response = if output.status.success() {
         ExecutorResponse {
             protocol_version: EXECUTOR_PROTOCOL,
@@ -2260,6 +2339,19 @@ fn run_executor() -> Result<()> {
             }),
         }
     };
+    Ok((response, output.stderr))
+}
+fn run_executor() -> Result<()> {
+    let mut input = Vec::new();
+    io::stdin().read_to_end(&mut input)?;
+    let request: ExecutorRequest = serde_json::from_slice(&input)?;
+    let (response, stderr) = executor_reply_with(request, |args| {
+        Ok(Command::new(std::env::current_exe()?)
+            .arg("--json")
+            .args(args)
+            .output()?)
+    })?;
+    io::stderr().write_all(&stderr)?;
     emit(true, &response)
 }
 fn strict_ssh_args(target: &str, command: String) -> Vec<String> {
@@ -2725,41 +2817,7 @@ fn main() -> Result<()> {
                         store.save_lane(&remote_renamed, "unknown", false)?;
                         emit(cli.json, &remote_renamed)
                     } else {
-                        let _lock = lock_lane_operation(&s)?;
-                        let mut journal = match read_operation_journal(&s)? {
-                            Some(journal)
-                                if journal.kind == "rename"
-                                    && journal.requested_name == new_name =>
-                            {
-                                renamed = LaneSpec::from_manifest(
-                                    journal.desired_manifest.clone(),
-                                    s.host.clone(),
-                                    s.project_path.clone(),
-                                    s.last_attached,
-                                )?;
-                                journal
-                            }
-                            Some(journal) => bail!(
-                                "cannot rename while '{}' is paused at '{}'; retry it or run lane reconcile",
-                                journal.kind,
-                                journal.phase
-                            ),
-                            None => OperationJournal::new(&renamed, "rename", "prepared")?,
-                        };
-                        write_operation_journal(&s, &journal)?;
-                        report_phase(
-                            Some((&s.id, &s.name)),
-                            "running",
-                            "committing-manifest",
-                            "updating the authoritative display name",
-                        );
-                        write_lane_spec(&renamed)?;
-                        journal.phase = "manifest-applied".into();
-                        journal.updated_at = Utc::now();
-                        write_operation_journal(&renamed, &journal)?;
-                        store.save_lane(&renamed, "unknown", false)?;
-                        clear_operation_journal(&renamed)?;
-                        emit(cli.json, &renamed)
+                        emit(cli.json, &rename_local_lane(&store, &s, &renamed)?)
                     }
                 }
                 LaneAction::Refresh { lane, all } => {
@@ -3112,44 +3170,7 @@ fn main() -> Result<()> {
                         .context("remote host unexpectedly treated as local")?;
                     }
                     if s.host == "local" {
-                        let _lock = lock_lane_operation(&s)?;
-                        let mut journal = match read_operation_journal(&s)? {
-                            Some(journal) if journal.kind == "delete" => journal,
-                            Some(journal) => bail!(
-                                "cannot delete while '{}' is paused at '{}'; retry it or run lane reconcile",
-                                journal.kind,
-                                journal.phase
-                            ),
-                            None => OperationJournal::new(&s, "delete", "prepared")?,
-                        };
-                        write_operation_journal(&s, &journal)?;
-                        report_phase(
-                            Some((&s.id, &s.name)),
-                            "running",
-                            "removing-runtime",
-                            "removing the verified disposable container",
-                        );
-                        remove_owned_container(&runner, &s.container_name(), &s)?;
-                        journal.phase = "runtime-removed".into();
-                        journal.updated_at = Utc::now();
-                        write_operation_journal(&s, &journal)?;
-                        let manifest = s.manifest_path();
-                        let backup = manifest.with_file_name(format!(
-                            "lane.toml.deleted-{}-{}",
-                            s.session_name, journal.operation_id
-                        ));
-                        if manifest.exists() {
-                            fs::rename(&manifest, &backup)?;
-                        }
-                        journal.phase = "manifest-removed".into();
-                        journal.updated_at = Utc::now();
-                        write_operation_journal(&s, &journal)?;
-                        store.record_tombstone(&s.id, &s.name, "delete")?;
-                        store.remove_lane(&s.id)?;
-                        if backup.exists() {
-                            fs::remove_file(backup)?;
-                        }
-                        clear_operation_journal(&s)?;
+                        delete_local_lane(&runner, &store, &s)?;
                     } else {
                         store.record_tombstone(&s.id, &s.name, "delete")?;
                         store.remove_lane(&s.id)?;
@@ -3355,6 +3376,9 @@ mod tests {
                     ("ssh", _, _) if args.last().is_some_and(|arg| arg == "id -un") => {
                         "gerald".into()
                     }
+                    ("podman", Some("inspect"), _) if args.iter().any(|a| a.contains("Labels")) => {
+                        fixture_owner_label(args)
+                    }
                     ("podman", Some("inspect"), _) => "running".into(),
                     _ => String::new(),
                 },
@@ -3409,6 +3433,76 @@ mod tests {
         spec.profile.mount_codex_credentials = false;
         spec.profile.mount_gh_credentials = false;
         spec
+    }
+    fn fixture_owner_label(args: &[String]) -> String {
+        let name = args.last().expect("fixture inspect has a container name");
+        let name = name.trim_end_matches(".next").trim_end_matches(".previous");
+        let id = &name[name.len() - 36..]; // stable_container_name appends a canonical UUID.
+        let session = name
+            .strip_prefix("worklane-")
+            .unwrap()
+            .strip_suffix(&format!("-{id}"))
+            .unwrap();
+        format!("{id}|{session}")
+    }
+
+    #[test]
+    fn executor_validates_request_before_dispatch_and_keeps_correlated_errors() {
+        use std::os::unix::process::ExitStatusExt;
+        let request = new_executor_request(vec!["lane".into(), "list".into()]);
+        let make_output = |code, stdout: &[u8], stderr: &[u8]| std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.to_vec(),
+            stderr: stderr.to_vec(),
+        };
+        let (reply, stderr) = executor_reply_with(request.clone(), |args| {
+            assert_eq!(args, ["lane", "list"]);
+            Ok(make_output(0, br#"{"lanes":[]}"#, b"fixture progress\n"))
+        })
+        .unwrap();
+        assert!(reply.success);
+        assert_eq!(reply.request_id, request.request_id);
+        assert_eq!(reply.payload.unwrap()["lanes"], serde_json::json!([]));
+        assert_eq!(stderr, b"fixture progress\n");
+        let (failure, stderr) = executor_reply_with(request.clone(), |_| {
+            Ok(make_output(1, b"not-json", b"private fixture failed\n"))
+        })
+        .unwrap();
+        assert!(!failure.success);
+        assert_eq!(failure.request_id, request.request_id);
+        assert!(failure.payload.is_none());
+        assert_eq!(failure.error.unwrap().code, "executor-command-failed");
+        assert_eq!(stderr, b"private fixture failed\n");
+        assert!(
+            executor_reply_with(request.clone(), |_| Ok(make_output(0, b"not-json", b"")))
+                .unwrap_err()
+                .to_string()
+                .contains("without a valid JSON")
+        );
+        let mut invalid = request.clone();
+        invalid.protocol_version += 1;
+        assert!(
+            executor_reply_with(invalid, |_| panic!("wrong protocol must not dispatch"))
+                .unwrap_err()
+                .to_string()
+                .contains("protocol mismatch")
+        );
+        invalid = request.clone();
+        invalid.request_id = "not-a-uuid".into();
+        assert!(
+            executor_reply_with(invalid, |_| panic!("bad ID must not dispatch"))
+                .unwrap_err()
+                .to_string()
+                .contains("canonical UUID")
+        );
+        invalid = request;
+        invalid.args = vec!["executor".into()];
+        assert!(
+            executor_reply_with(invalid, |_| panic!("nested executor must not dispatch"))
+                .unwrap_err()
+                .to_string()
+                .contains("nested executor")
+        );
     }
 
     #[test]
@@ -3578,6 +3672,9 @@ mod tests {
                 if program == "podman" {
                     self.calls.lock().unwrap().push(args.to_vec());
                     assert_eq!(args[0], "inspect");
+                    if args.iter().any(|arg| arg.contains("Labels")) {
+                        return Ok(fixture_owner_label(args));
+                    }
                     return Ok("running".into());
                 }
                 assert_eq!(program, "id");
@@ -4479,6 +4576,9 @@ esac
             fn run(&self, program: &str, args: &[String]) -> Result<String> {
                 assert_eq!(program, "podman");
                 match args.first().map(String::as_str) {
+                    Some("inspect") if args.iter().any(|arg| arg.contains("Labels")) => {
+                        Ok(fixture_owner_label(args))
+                    }
                     Some("inspect") => Ok("exited".into()),
                     Some("start") => bail!("private fixture refused container start"),
                     command => panic!("unexpected container command: {command:?}"),
@@ -4531,6 +4631,124 @@ esac
             store.lane(&lane.id).unwrap().profile.terminal_backend,
             TerminalBackend::TuiosV3
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn local_v3_delete_refuses_foreign_runtime_then_recovers_without_deleting_home() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../target/tmp/v3-delete-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(root.join("registry.db")).unwrap();
+        let mut lane = spec("local");
+        lane.project_path = root.join("lane");
+        lane.profile.terminal_backend = TerminalBackend::TuiosV3;
+        lane.profile.agent = AgentKind::Pi;
+        lane.profile.embedded_containerfile = false;
+        std::fs::create_dir_all(&lane.project_path).unwrap();
+        std::fs::write(lane.project_path.join("user-data"), b"must persist").unwrap();
+        write_lane_spec(&lane).unwrap();
+        store.save_lane(&lane, "running", false).unwrap();
+        struct ForeignRuntime(UpgradeStateRunner);
+        impl Runner for ForeignRuntime {
+            fn run(&self, program: &str, args: &[String]) -> Result<String> {
+                if program == "podman" && args.iter().any(|arg| arg.contains("Labels")) {
+                    return Ok("foreign-id|foreign-session".into());
+                }
+                self.0.run(program, args)
+            }
+            fn run_output(&self, program: &str, args: &[String]) -> Result<ProcessOutput> {
+                self.0.run_output(program, args)
+            }
+        }
+        let name = lane.container_name();
+        let foreign = ForeignRuntime(UpgradeStateRunner::new(
+            &lane,
+            [(name.clone(), "running".into())],
+        ));
+        assert!(delete_local_lane(&foreign, &store, &lane)
+            .unwrap_err()
+            .to_string()
+            .contains("owned"));
+        assert_eq!(foreign.0.state(&name).as_deref(), Some("running"));
+        assert!(lane.manifest_path().exists());
+        assert!(store.index(&lane.id).is_ok());
+        let journal = read_operation_journal(&lane).unwrap().unwrap();
+        assert_eq!(journal.phase, "prepared");
+        let owned = UpgradeStateRunner::new(&lane, [(name.clone(), "running".into())]);
+        delete_local_lane(&owned, &store, &lane).unwrap();
+        assert!(owned.state(&name).is_none());
+        assert!(!lane.manifest_path().exists());
+        assert!(store.index(&lane.id).is_err());
+        assert_eq!(
+            store.tombstone_operation(&lane.id).unwrap().as_deref(),
+            Some("delete")
+        );
+        assert!(read_operation_journal(&lane).unwrap().is_none());
+        assert_eq!(
+            std::fs::read(lane.project_path.join("user-data")).unwrap(),
+            b"must persist"
+        );
+        assert!(std::fs::read_dir(lane.manifest_path().parent().unwrap())
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("lane.toml.deleted-")));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn local_v3_rename_keeps_session_identity_and_replays_manifest_commit() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../target/tmp/v3-rename-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(root.join("registry.db")).unwrap();
+        let mut lane = spec("local");
+        lane.project_path = root.join("lane");
+        lane.profile.terminal_backend = TerminalBackend::TuiosV3;
+        lane.profile.agent = AgentKind::Pi;
+        lane.profile.embedded_containerfile = false;
+        std::fs::create_dir_all(&lane.project_path).unwrap();
+        write_lane_spec(&lane).unwrap();
+        store.save_lane(&lane, "running", false).unwrap();
+        let mut first = lane.clone();
+        first.name = "new-display".into();
+        let renamed = rename_local_lane(&store, &lane, &first).unwrap();
+        assert_eq!(renamed.id, lane.id);
+        assert_eq!(renamed.session_name(), lane.session_name());
+        assert_eq!(renamed.container_name(), lane.container_name());
+        assert_eq!(store.index(&lane.id).unwrap().name, "new-display");
+        assert!(read_operation_journal(&renamed).unwrap().is_none());
+        assert_eq!(
+            store.lane(&lane.id).unwrap().profile.terminal_backend,
+            TerminalBackend::TuiosV3
+        );
+
+        let mut desired = renamed.clone();
+        desired.name = "final-display".into();
+        let mut pending = OperationJournal::new(&desired, "rename", "prepared").unwrap();
+        pending.phase = "manifest-applied".into();
+        write_lane_spec(&desired).unwrap();
+        write_operation_journal(&renamed, &pending).unwrap();
+        let mut wrong = desired.clone();
+        wrong.name = "other-display".into();
+        assert!(rename_local_lane(&store, &renamed, &wrong)
+            .unwrap_err()
+            .to_string()
+            .contains("cannot rename while"));
+        assert_eq!(store.index(&lane.id).unwrap().name, "new-display");
+        assert!(read_operation_journal(&renamed).unwrap().is_some());
+        let recovered = rename_local_lane(&store, &renamed, &desired).unwrap();
+        assert_eq!(recovered.name, "final-display");
+        assert_eq!(recovered.session_name(), lane.session_name());
+        assert_eq!(store.index(&lane.id).unwrap().name, "final-display");
+        assert!(read_operation_journal(&recovered).unwrap().is_none());
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -5396,6 +5614,65 @@ CMD ["sleep", "infinity"]
     }
 
     #[test]
+    fn existing_v3_containers_require_matching_owner_before_start_or_bootstrap() {
+        struct ExistingContainer {
+            state: &'static str,
+            calls: Mutex<Vec<Vec<String>>>,
+        }
+        impl Runner for ExistingContainer {
+            fn run(&self, program: &str, args: &[String]) -> Result<String> {
+                assert_eq!(program, "podman");
+                self.calls.lock().unwrap().push(args.to_vec());
+                if args.iter().any(|arg| arg.contains("Labels")) {
+                    return Ok("foreign-id|foreign-session".into());
+                }
+                match args.first().map(String::as_str) {
+                    Some("inspect") => Ok(self.state.into()),
+                    Some("start") => bail!("must never start a foreign container"),
+                    _ => panic!("unexpected podman mutation on a foreign container"),
+                }
+            }
+            fn run_output(&self, program: &str, args: &[String]) -> Result<ProcessOutput> {
+                assert_eq!(
+                    (program, args.first().map(String::as_str)),
+                    ("podman", Some("container"))
+                );
+                Ok(ProcessOutput {
+                    code: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+        }
+        let mut lane = spec("local");
+        lane.profile.terminal_backend = TerminalBackend::TuiosV3;
+        lane.profile.agent = AgentKind::Pi;
+        lane.profile.embedded_containerfile = false;
+        for state in ["running", "exited"] {
+            let runner = ExistingContainer {
+                state,
+                calls: Mutex::new(vec![]),
+            };
+            let err = ensure_local_started(&runner, &lane)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("not owned"), "{err}");
+            assert!(!runner
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|args| args.first().is_some_and(|arg| arg == "start")));
+        }
+        let owned = UpgradeStateRunner::new(&lane, [(lane.container_name(), "exited".into())]);
+        ensure_local_started(&owned, &lane).unwrap();
+        assert_eq!(
+            owned.state(&lane.container_name()).as_deref(),
+            Some("running")
+        );
+    }
+
+    #[test]
     fn ensure_local_started_skips_running_container() {
         let runner = MockRunner::new();
         let lane = spec("local");
@@ -5689,6 +5966,11 @@ CMD ["sleep", "infinity"]
                             if args.last().is_some_and(|arg| arg == "worklane:latest") =>
                         {
                             "sha256:image".into()
+                        }
+                        ("podman", Some("inspect"), _)
+                            if args.iter().any(|arg| arg.contains("Labels")) =>
+                        {
+                            fixture_owner_label(args)
                         }
                         ("podman", Some("inspect"), _) => "exited".into(),
                         _ => String::new(),
