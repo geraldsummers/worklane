@@ -11,7 +11,7 @@ use std::{
     process::{Command, Stdio},
 };
 use uuid::Uuid;
-use worklane_core::{ErrorReport, Store, TerminalBackend};
+use worklane_core::{ErrorReport, Runner, Store, SystemRunner, TerminalBackend};
 
 pub const API_VERSION: u32 = 1;
 const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
@@ -533,55 +533,52 @@ pub fn worker(id: &str) -> Result<()> {
     write_job(&job)
 }
 
+fn podman_json_with_runner(
+    r: &impl Runner,
+    spec: &worklane_core::LaneSpec,
+    command: &[String],
+    input: Option<&[u8]>,
+) -> Result<Value> {
+    let label = if spec.profile.terminal_backend == TerminalBackend::TuiosV3 {
+        "TUIOS"
+    } else {
+        "Herdr"
+    };
+    if spec.host != "local" {
+        bail!("{label} API is available only for local lanes in API version {API_VERSION}")
+    }
+    let mut args = vec![
+        "--signal=KILL".into(),
+        "60s".into(),
+        "podman".into(),
+        "exec".into(),
+        "--user".into(),
+        "dev".into(),
+        "--workdir".into(),
+        "/home/dev".into(),
+    ];
+    if input.is_some() {
+        args.push("--interactive".into());
+    }
+    args.push(spec.container_name());
+    args.extend_from_slice(command);
+    let output = match input {
+        Some(bytes) => r.run_with_input("timeout", &args, bytes),
+        None => r.run("timeout", &args),
+    }
+    .with_context(|| format!("lane {label} API failed"))?;
+    if output.len() > MAX_HERDR_RESPONSE_BYTES {
+        bail!("{label} response exceeded {MAX_HERDR_RESPONSE_BYTES} bytes")
+    }
+    serde_json::from_str(&output).with_context(|| format!("lane {label} API returned invalid JSON"))
+}
+
 fn podman_json(
     spec: &worklane_core::LaneSpec,
     command: &[String],
     input: Option<&[u8]>,
 ) -> Result<Value> {
-    if spec.host != "local" {
-        bail!("Herdr API is available only for local lanes in API version {API_VERSION}")
-    }
-    let mut child = Command::new("timeout");
-    child.args([
-        "--signal=KILL",
-        "60s",
-        "podman",
-        "exec",
-        "--user",
-        "dev",
-        "--workdir",
-        "/home/dev",
-    ]);
-    if input.is_some() {
-        child.arg("--interactive");
-    }
-    child.arg(spec.container_name());
-    child.args(command);
-    child.stdout(Stdio::piped()).stderr(Stdio::piped());
-    if input.is_some() {
-        child.stdin(Stdio::piped());
-    }
-    let mut child = child
-        .spawn()
-        .context("enter lane container for Herdr API")?;
-    if let Some(input) = input {
-        child
-            .stdin
-            .take()
-            .context("Herdr bridge stdin")?
-            .write_all(input)?;
-    }
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        bail!(
-            "lane Herdr API failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
-    }
-    if output.stdout.len() > MAX_HERDR_RESPONSE_BYTES {
-        bail!("Herdr response exceeded {MAX_HERDR_RESPONSE_BYTES} bytes")
-    }
-    serde_json::from_slice(&output.stdout).context("lane Herdr API returned invalid JSON")
+    podman_json_with_runner(&SystemRunner, spec, command, input)
 }
 
 fn require_herdr_backend(spec: &worklane_core::LaneSpec) -> Result<()> {
@@ -1149,6 +1146,127 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("pane_id"));
+    }
+
+    #[test]
+    fn native_and_legacy_bridges_keep_explicit_targets_and_bounded_errors() {
+        use std::sync::Mutex;
+        use worklane_core::{AgentKind, LaneSpec, Profile};
+        type BridgeCall = (Vec<String>, Option<Vec<u8>>);
+        struct MockBridge {
+            calls: Mutex<Vec<BridgeCall>>,
+            body: String,
+            fail: bool,
+        }
+        impl Runner for MockBridge {
+            fn run(&self, program: &str, args: &[String]) -> Result<String> {
+                assert_eq!(program, "timeout");
+                self.calls.lock().unwrap().push((args.to_vec(), None));
+                if self.fail {
+                    bail!("fixture socket disconnected")
+                }
+                Ok(self.body.clone())
+            }
+            fn run_with_input(
+                &self,
+                program: &str,
+                args: &[String],
+                input: &[u8],
+            ) -> Result<String> {
+                assert_eq!(program, "timeout");
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push((args.to_vec(), Some(input.to_vec())));
+                if self.fail {
+                    bail!("fixture socket disconnected")
+                }
+                Ok(self.body.clone())
+            }
+        }
+        let profile = Profile {
+            agent: AgentKind::Pi,
+            terminal_backend: TerminalBackend::TuiosV3,
+            embedded_containerfile: false,
+            mount_codex_credentials: false,
+            ..Profile::default()
+        };
+        let lane = LaneSpec::new(
+            "v3-bridge".into(),
+            "local".into(),
+            PathBuf::from("/private/project"),
+            profile,
+        )
+        .unwrap();
+        let request = br#"{"id":"test","verb":"hello","params":{}}"#;
+        let command = vec!["python3".into(), "-c".into(), "native socket bridge".into()];
+        let mock = |body: String, fail| MockBridge {
+            calls: Mutex::new(vec![]),
+            body,
+            fail,
+        };
+        let runner = mock(r#"{"id":"test","result":{"protocol":1}}"#.into(), false);
+        let reply = podman_json_with_runner(&runner, &lane, &command, Some(request)).unwrap();
+        assert_eq!(reply["result"]["protocol"], 1);
+        let calls = runner.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1.as_deref(), Some(request.as_slice()));
+        assert_eq!(
+            &calls[0].0[..8],
+            [
+                "--signal=KILL",
+                "60s",
+                "podman",
+                "exec",
+                "--user",
+                "dev",
+                "--workdir",
+                "/home/dev"
+            ]
+        );
+        assert!(calls[0].0.contains(&"--interactive".into()));
+        assert!(calls[0].0.contains(&lane.container_name()));
+        assert!(!calls[0].0.iter().any(|arg| arg.contains("herdr")));
+        drop(calls);
+        assert_eq!(
+            podman_json_with_runner(&runner, &lane, &command, None).unwrap()["result"]["protocol"],
+            1
+        );
+        assert!(!runner.calls.lock().unwrap()[1]
+            .0
+            .contains(&"--interactive".into()));
+        for (body, fail, expected) in [
+            (
+                "bad-json".to_owned(),
+                false,
+                "TUIOS API returned invalid JSON",
+            ),
+            (
+                "x".repeat(MAX_HERDR_RESPONSE_BYTES + 1),
+                false,
+                "TUIOS response exceeded",
+            ),
+            (String::new(), true, "lane TUIOS API failed"),
+        ] {
+            let fixture = mock(body, fail);
+            let err =
+                podman_json_with_runner(&fixture, &lane, &command, Some(request)).unwrap_err();
+            assert!(err.to_string().contains(expected), "{err:#}");
+        }
+        let mut remote = lane.clone();
+        remote.host = "remote".into();
+        assert!(podman_json_with_runner(&runner, &remote, &command, None)
+            .unwrap_err()
+            .to_string()
+            .contains("TUIOS API is available only for local"));
+        let mut legacy = lane;
+        legacy.profile = Profile::default();
+        assert!(
+            podman_json_with_runner(&mock(String::new(), true), &legacy, &command, None)
+                .unwrap_err()
+                .to_string()
+                .contains("lane Herdr API failed")
+        );
     }
 
     #[test]

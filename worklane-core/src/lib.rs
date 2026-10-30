@@ -2037,6 +2037,43 @@ mod tests {
     }
 
     #[test]
+    fn system_runner_reports_subprocess_stdout_stderr_and_exit_status_without_a_lane() {
+        let runner = SystemRunner;
+        let sh = |script: &str| vec!["-c".into(), script.into()];
+        assert_eq!(
+            runner.run("/bin/sh", &sh("printf '  ok\\n'")).unwrap(),
+            "ok"
+        );
+        assert!(runner
+            .run("/bin/sh", &sh("echo denied >&2; exit 7"))
+            .unwrap_err()
+            .to_string()
+            .contains("denied"));
+        assert_eq!(
+            runner
+                .run_with_input("/bin/sh", &sh("cat"), b"private fixture\n")
+                .unwrap(),
+            "private fixture"
+        );
+        assert!(runner
+            .run_with_input("/bin/sh", &sh("echo input-failed >&2; exit 3"), b"")
+            .unwrap_err()
+            .to_string()
+            .contains("input-failed"));
+        let output = runner
+            .run_output(
+                "/bin/sh",
+                &sh("echo result; echo private-error >&2; exit 5"),
+            )
+            .unwrap();
+        assert_eq!(
+            (output.code, output.stdout.as_str(), output.stderr.as_str()),
+            (5, "result", "private-error")
+        );
+        assert!(runner.run("/no-such-worklane-fixture", &[]).is_err());
+    }
+
+    #[test]
     fn remove_lane_and_hash_file_work() {
         let path = std::env::temp_dir().join(format!("worklane-store-{}.db", Uuid::new_v4()));
         let store = Store::open(&path).unwrap();
