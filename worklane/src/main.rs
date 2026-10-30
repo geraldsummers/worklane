@@ -2483,6 +2483,150 @@ fn deployment_script(version: &str, checksum: &str) -> String {
         "set -eu; dir=\"$HOME/.local/share/worklane/bin\"; tmp=\"$dir/worklane-{version}.tmp\"; dst=\"$dir/worklane-{version}\"; test \"$(sha256sum \"$tmp\" | cut -d' ' -f1)\" = '{checksum}'; chmod 755 \"$tmp\"; mv -f \"$tmp\" \"$dst\"; ln -sfn \"$dst\" \"$HOME/.local/bin/worklane.new\"; mv -Tf \"$HOME/.local/bin/worklane.new\" \"$HOME/.local/bin/worklane\""
     )
 }
+fn build_image_for_host(
+    runner: &impl Runner,
+    store: &Store,
+    host: &str,
+    file: Option<&PathBuf>,
+    context: &Path,
+    tag: &str,
+    no_cache: bool,
+) -> Result<serde_json::Value> {
+    let mut args = vec![
+        "image".into(),
+        "build".into(),
+        "--host".into(),
+        "local".into(),
+        "--context".into(),
+        context.display().to_string(),
+        "--tag".into(),
+        tag.into(),
+    ];
+    if let Some(file) = file {
+        args.extend(["--file".into(), file.display().to_string()]);
+    }
+    if no_cache {
+        args.push("--no-cache".into());
+    }
+    if let Some(out) = remote_host(runner, store, host, args)? {
+        let mut value: serde_json::Value = serde_json::from_str(&out)?;
+        value["host"] = serde_json::Value::String(host.into());
+        Ok(value)
+    } else {
+        eprintln!("worklane: building image '{tag}'...");
+        podman_stream(
+            runner,
+            image_build_args(runner, file, context, tag, no_cache, false)?,
+        )?;
+        Ok(serde_json::json!({"host":host,"image":tag,"id":image_identity(runner,tag)?}))
+    }
+}
+fn inspect_image_for_host(
+    runner: &impl Runner,
+    store: &Store,
+    host: &str,
+    image: &str,
+) -> Result<serde_json::Value> {
+    let args = vec![
+        "image".into(),
+        "inspect".into(),
+        "--host".into(),
+        "local".into(),
+        image.into(),
+    ];
+    if let Some(out) = remote_host(runner, store, host, args)? {
+        let mut value: serde_json::Value = serde_json::from_str(&out)?;
+        value["host"] = serde_json::Value::String(host.into());
+        Ok(value)
+    } else {
+        Ok(serde_json::json!({
+            "host":host, "image":image,
+            "present":image_exists(runner,image)?,
+            "id":image_identity(runner,image).ok()
+        }))
+    }
+}
+fn probe_hosts(runner: &impl Runner, store: &Store) -> Result<Vec<serde_json::Value>> {
+    let mut statuses = Vec::new();
+    for mut host in store.hosts()? {
+        let reachable = host.local
+            || runner
+                .run(
+                    "ssh",
+                    &strict_ssh_args(
+                        &host.ssh_target,
+                        "~/.local/bin/worklane --help >/dev/null".into(),
+                    ),
+                )
+                .is_ok();
+        if reachable {
+            host.last_seen = Some(Utc::now());
+            store.upsert_host(&host)?;
+        }
+        statuses.push(serde_json::json!({"host":host,"reachable":reachable}));
+    }
+    Ok(statuses)
+}
+fn bootstrap_host(runner: &impl Runner, store: &Store, name: &str) -> Result<String> {
+    let host = store
+        .hosts()?
+        .into_iter()
+        .find(|host| host.name == name)
+        .context("unknown host")?;
+    runner.run(
+        "ssh",
+        &strict_ssh_args(
+            &host.ssh_target,
+            "mkdir -p ~/.local/bin ~/.local/share/worklane/bin ~/.local/share/worklane/lanes"
+                .into(),
+        ),
+    )?;
+    Ok(host.name)
+}
+fn deploy_host_binary(
+    runner: &impl Runner,
+    store: &Store,
+    name: &str,
+    binary: &Path,
+    checksum: Option<&str>,
+) -> Result<(Host, String)> {
+    let mut host = store
+        .hosts()?
+        .into_iter()
+        .find(|host| host.name == name)
+        .context("unknown host")?;
+    let actual = sha256_file(binary)?;
+    if checksum.is_some_and(|expected| expected != actual) {
+        bail!("checksum does not match binary")
+    }
+    let version = env!("CARGO_PKG_VERSION");
+    let remote_path = format!("~/.local/share/worklane/bin/worklane-{version}.tmp");
+    runner.run(
+        "ssh",
+        &strict_ssh_args(
+            &host.ssh_target,
+            "mkdir -p ~/.local/bin ~/.local/share/worklane/bin".into(),
+        ),
+    )?;
+    runner.run(
+        "scp",
+        &[
+            "-o".into(),
+            "BatchMode=yes".into(),
+            "-o".into(),
+            "StrictHostKeyChecking=yes".into(),
+            binary.display().to_string(),
+            format!("{}:{}", host.ssh_target, remote_path),
+        ],
+    )?;
+    runner.run(
+        "ssh",
+        &strict_ssh_args(&host.ssh_target, deployment_script(version, &actual)),
+    )?;
+    host.installed_version = Some(version.into());
+    store.upsert_host(&host)?;
+    Ok((host, actual))
+}
 fn main() -> Result<()> {
     let cli = Cli::parse();
     if let Top::Api(command) = &cli.command {
@@ -2531,46 +2675,12 @@ fn main() -> Result<()> {
                 emit(cli.json, &h)
             }
             HostAction::List => emit(cli.json, &store.hosts()?),
-            HostAction::Status => {
-                let mut out: Vec<serde_json::Value> = Vec::new();
-                for mut h in store.hosts()? {
-                    let ok = if h.local {
-                        true
-                    } else {
-                        SystemRunner
-                            .run(
-                                "ssh",
-                                &strict_ssh_args(
-                                    &h.ssh_target,
-                                    "~/.local/bin/worklane --help >/dev/null".into(),
-                                ),
-                            )
-                            .is_ok()
-                    };
-                    if ok {
-                        h.last_seen = Some(Utc::now());
-                        store.upsert_host(&h)?
-                    };
-                    out.push(serde_json::json!({"host":h,"reachable":ok}));
-                }
-                emit(cli.json, &out)
-            }
+            HostAction::Status => emit(cli.json, &probe_hosts(&runner, &store)?),
             HostAction::Bootstrap { name } => {
-                let h = store
-                    .hosts()?
-                    .into_iter()
-                    .find(|x| x.name == name)
-                    .context("unknown host")?;
-                SystemRunner.run(
-                    "ssh",
-                    &strict_ssh_args(
-                        &h.ssh_target,
-                        "mkdir -p ~/.local/bin ~/.local/share/worklane/bin ~/.local/share/worklane/lanes".into(),
-                    ),
-                )?;
+                let selected = bootstrap_host(&runner, &store, &name)?;
                 emit(
                     cli.json,
-                    &serde_json::json!({"host":h.name,"bootstrapped":true}),
+                    &serde_json::json!({"host":selected,"bootstrapped":true}),
                 )
             }
             HostAction::Deploy {
@@ -2578,46 +2688,11 @@ fn main() -> Result<()> {
                 binary,
                 checksum,
             } => {
-                let mut h = store
-                    .hosts()?
-                    .into_iter()
-                    .find(|x| x.name == name)
-                    .context("unknown host")?;
-                let sum = sha256_file(&binary)?;
-                if let Some(expected) = checksum {
-                    if expected != sum {
-                        bail!("checksum does not match binary")
-                    }
-                };
-                let version = env!("CARGO_PKG_VERSION");
-                let remote_path = format!("~/.local/share/worklane/bin/worklane-{version}.tmp");
-                SystemRunner.run(
-                    "ssh",
-                    &strict_ssh_args(
-                        &h.ssh_target,
-                        "mkdir -p ~/.local/bin ~/.local/share/worklane/bin".into(),
-                    ),
-                )?;
-                SystemRunner.run(
-                    "scp",
-                    &[
-                        "-o".into(),
-                        "BatchMode=yes".into(),
-                        "-o".into(),
-                        "StrictHostKeyChecking=yes".into(),
-                        binary.display().to_string(),
-                        format!("{}:{}", h.ssh_target, remote_path),
-                    ],
-                )?;
-                SystemRunner.run(
-                    "ssh",
-                    &strict_ssh_args(&h.ssh_target, deployment_script(version, &sum)),
-                )?;
-                h.installed_version = Some(version.into());
-                store.upsert_host(&h)?;
+                let (host, sum) =
+                    deploy_host_binary(&runner, &store, &name, &binary, checksum.as_deref())?;
                 emit(
                     cli.json,
-                    &serde_json::json!({"host":name,"sha256":sum,"activated":true}),
+                    &serde_json::json!({"host":host.name,"sha256":sum,"activated":true}),
                 )
             }
         },
@@ -2628,59 +2703,22 @@ fn main() -> Result<()> {
                 context,
                 tag,
                 no_cache,
-            } => {
-                let mut args = vec![
-                    "image".into(),
-                    "build".into(),
-                    "--host".into(),
-                    "local".into(),
-                    "--context".into(),
-                    context.display().to_string(),
-                    "--tag".into(),
-                    tag.clone(),
-                ];
-                if let Some(file) = &file {
-                    args.extend(["--file".into(), file.display().to_string()]);
-                }
-                if no_cache {
-                    args.push("--no-cache".into());
-                }
-                if let Some(out) = remote_host(&runner, &store, &host, args)? {
-                    let mut value: serde_json::Value = serde_json::from_str(&out)?;
-                    value["host"] = serde_json::Value::String(host);
-                    emit(cli.json, &value)
-                } else {
-                    let r = SystemRunner;
-                    eprintln!("worklane: building image '{tag}'...");
-                    podman_stream(
-                        &r,
-                        image_build_args(&r, file.as_ref(), &context, &tag, no_cache, false)?,
-                    )?;
-                    emit(
-                        cli.json,
-                        &serde_json::json!({"host":host,"image":tag,"id":image_identity(&r,&tag)?}),
-                    )
-                }
-            }
-            ImageAction::Inspect { host, image } => {
-                let args = vec![
-                    "image".into(),
-                    "inspect".into(),
-                    "--host".into(),
-                    "local".into(),
-                    image.clone(),
-                ];
-                if let Some(out) = remote_host(&runner, &store, &host, args)? {
-                    let mut value: serde_json::Value = serde_json::from_str(&out)?;
-                    value["host"] = serde_json::Value::String(host);
-                    emit(cli.json, &value)
-                } else {
-                    emit(
-                        cli.json,
-                        &serde_json::json!({"host":host,"image":image,"present":image_exists(&SystemRunner,&image)?,"id":image_identity(&SystemRunner,&image).ok()}),
-                    )
-                }
-            }
+            } => emit(
+                cli.json,
+                &build_image_for_host(
+                    &runner,
+                    &store,
+                    &host,
+                    file.as_ref(),
+                    &context,
+                    &tag,
+                    no_cache,
+                )?,
+            ),
+            ImageAction::Inspect { host, image } => emit(
+                cli.json,
+                &inspect_image_for_host(&runner, &store, &host, &image)?,
+            ),
             ImageAction::Edit => {
                 let path = ensure_standard_containerfile()?;
                 let editor = std::env::var("VISUAL")
@@ -5227,6 +5265,376 @@ esac
         assert!(source.contains("ps -p \"$old_pid\" -o args="));
         assert!(source.contains("*\"$manager\"*) kill \"$old_pid\""));
         assert!(source.contains("manager_pid=$!"));
+    }
+
+    #[test]
+    fn host_probes_and_bootstrap_use_only_explicit_verified_ssh_targets() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../target/tmp/host-probe-fixture-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(root.join("registry.db")).unwrap();
+        store
+            .upsert_host(&Host {
+                name: "local".into(),
+                ssh_target: "never-use-ssh".into(),
+                local: true,
+                installed_version: None,
+                last_seen: None,
+            })
+            .unwrap();
+        for name in ["online", "offline"] {
+            store
+                .upsert_host(&Host {
+                    name: name.into(),
+                    ssh_target: format!("fixture-{name}@example.test"),
+                    local: false,
+                    installed_version: None,
+                    last_seen: None,
+                })
+                .unwrap();
+        }
+        struct FakeProbe(Mutex<Vec<Vec<String>>>);
+        impl Runner for FakeProbe {
+            fn run(&self, program: &str, args: &[String]) -> Result<String> {
+                assert_eq!(program, "ssh");
+                self.0.lock().unwrap().push(args.to_vec());
+                if args.iter().any(|arg| arg.contains("fixture-offline@")) {
+                    bail!("fixture unreachable")
+                }
+                Ok(String::new())
+            }
+        }
+        let runner = FakeProbe(Mutex::new(vec![]));
+        let statuses = probe_hosts(&runner, &store).unwrap();
+        assert_eq!(
+            statuses
+                .iter()
+                .find(|status| status["host"]["name"] == "online")
+                .unwrap()["reachable"],
+            true
+        );
+        assert_eq!(
+            statuses
+                .iter()
+                .find(|status| status["host"]["name"] == "offline")
+                .unwrap()["reachable"],
+            false
+        );
+        assert_eq!(
+            statuses
+                .iter()
+                .find(|status| status["host"]["name"] == "local")
+                .unwrap()["reachable"],
+            true
+        );
+        let hosts = store.hosts().unwrap();
+        assert!(hosts
+            .iter()
+            .find(|h| h.name == "online")
+            .unwrap()
+            .last_seen
+            .is_some());
+        assert!(hosts
+            .iter()
+            .find(|h| h.name == "offline")
+            .unwrap()
+            .last_seen
+            .is_none());
+        assert_eq!(runner.0.lock().unwrap().len(), 2); // Never probe the local host over SSH.
+        assert_eq!(bootstrap_host(&runner, &store, "online").unwrap(), "online");
+        assert!(bootstrap_host(&runner, &store, "offline").is_err());
+        assert!(bootstrap_host(&runner, &store, "unknown").is_err());
+        let calls = runner.0.lock().unwrap();
+        assert_eq!(calls.len(), 4);
+        for args in calls.iter() {
+            assert!(args.contains(&"BatchMode=yes".into()));
+            assert!(args.contains(&"StrictHostKeyChecking=yes".into()));
+        }
+        assert!(calls[2]
+            .iter()
+            .any(|arg| arg.contains("fixture-online@example.test")));
+        assert!(calls[2]
+            .iter()
+            .any(|arg| arg.contains("mkdir -p ~/.local/bin")));
+        drop(calls);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn image_build_planning_uses_private_runner_and_scopes_remote_host_reply() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../target/tmp/image-build-fixture-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("Containerfile.private");
+        std::fs::write(&file, "FROM scratch\n").unwrap();
+        let store = Store::open(root.join("registry.db")).unwrap();
+        struct FakeImageRunner {
+            calls: Mutex<Vec<(String, Vec<String>)>>,
+            fail_build: bool,
+        }
+        impl Runner for FakeImageRunner {
+            fn run(&self, program: &str, args: &[String]) -> Result<String> {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push((program.into(), args.to_vec()));
+                if program == "id" {
+                    return Ok(match args[0].as_str() {
+                        "-un" => "fixture",
+                        "-u" | "-g" => "1000",
+                        _ => panic!("unexpected ID lookup"),
+                    }
+                    .into());
+                }
+                assert_eq!(
+                    (program, args.first().map(String::as_str)),
+                    ("podman", Some("image"))
+                );
+                Ok("sha256:private-image-id".into())
+            }
+            fn run_streaming(&self, program: &str, args: &[String]) -> Result<String> {
+                assert_eq!(
+                    (program, args.first().map(String::as_str)),
+                    ("podman", Some("build"))
+                );
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push((program.into(), args.to_vec()));
+                if self.fail_build {
+                    bail!("fixture image build failed")
+                }
+                Ok(String::new())
+            }
+            fn run_with_input(&self, program: &str, _: &[String], input: &[u8]) -> Result<String> {
+                assert_eq!(program, "ssh");
+                let request: ExecutorRequest = serde_json::from_slice(input)?;
+                assert_eq!(&request.args[0], "image");
+                assert_eq!(&request.args[2..4], ["--host", "local"]);
+                let payload = match request.args[1].as_str() {
+                    "build" => {
+                        assert!(request.args.contains(&"--no-cache".into()));
+                        serde_json::json!({"host":"forged", "id":"remote-private-image"})
+                    }
+                    "inspect" => {
+                        serde_json::json!({"host":"forged", "present":true, "id":"remote-private-image"})
+                    }
+                    other => panic!("unexpected image action {other}"),
+                };
+                Ok(serde_json::to_string(&ExecutorResponse {
+                    protocol_version: EXECUTOR_PROTOCOL,
+                    request_id: request.request_id,
+                    success: true,
+                    payload: Some(payload),
+                    error: None,
+                })?)
+            }
+        }
+        let fake = |fail_build| FakeImageRunner {
+            calls: Mutex::new(vec![]),
+            fail_build,
+        };
+        let local = fake(false);
+        let result = build_image_for_host(
+            &local,
+            &store,
+            "local",
+            Some(&file),
+            &root,
+            "private:test",
+            true,
+        )
+        .unwrap();
+        assert_eq!(result["id"], "sha256:private-image-id");
+        let calls = local.calls.lock().unwrap();
+        assert!(calls
+            .iter()
+            .any(|(_, args)| args.first().is_some_and(|arg| arg == "build")
+                && args.contains(&"--no-cache".into())
+                && args.contains(&file.display().to_string())));
+        drop(calls);
+        let failure = fake(true);
+        assert!(build_image_for_host(
+            &failure,
+            &store,
+            "local",
+            Some(&file),
+            &root,
+            "private:test",
+            false
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("fixture image build failed"));
+        assert!(!failure
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, args)| args.first().is_some_and(|arg| arg == "image")));
+        store
+            .upsert_host(&Host {
+                name: "sandbox".into(),
+                ssh_target: "fixture@example.test".into(),
+                local: false,
+                installed_version: None,
+                last_seen: None,
+            })
+            .unwrap();
+        let remote = fake(false);
+        let result = build_image_for_host(
+            &remote,
+            &store,
+            "sandbox",
+            Some(&file),
+            &root,
+            "private:test",
+            true,
+        )
+        .unwrap();
+        assert_eq!(result["host"], "sandbox");
+        assert_eq!(result["id"], "remote-private-image");
+        assert!(remote.calls.lock().unwrap().is_empty()); // No local Podman build for a remote host.
+        let local_inspect =
+            inspect_image_for_host(&fake(false), &store, "local", "private:test").unwrap();
+        assert_eq!(local_inspect["present"], true);
+        assert_eq!(local_inspect["id"], "sha256:private-image-id");
+        let remote_inspect =
+            inspect_image_for_host(&remote, &store, "sandbox", "private:test").unwrap();
+        assert_eq!(remote_inspect["host"], "sandbox");
+        assert_eq!(remote_inspect["id"], "remote-private-image");
+        assert!(remote.calls.lock().unwrap().is_empty());
+        assert!(inspect_image_for_host(&fake(false), &store, "missing", "private:test").is_err());
+        assert!(build_image_for_host(
+            &fake(false),
+            &store,
+            "missing",
+            Some(&file),
+            &root,
+            "private:test",
+            false
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("not configured"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn host_deploy_checks_local_provenance_before_transport_and_commits_only_after_activation() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../target/tmp/host-deploy-fixture-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let binary = root.join("verified-worklane");
+        std::fs::write(&binary, b"private executable fixture").unwrap();
+        let checksum = sha256_file(&binary).unwrap();
+        let store = Store::open(root.join("registry.db")).unwrap();
+        store
+            .upsert_host(&Host {
+                name: "sandbox".into(),
+                ssh_target: "fixture@example.test".into(),
+                local: false,
+                installed_version: None,
+                last_seen: None,
+            })
+            .unwrap();
+        struct FakeTransport {
+            calls: Mutex<Vec<(String, Vec<String>)>>,
+            fail_scp: bool,
+        }
+        impl Runner for FakeTransport {
+            fn run(&self, program: &str, args: &[String]) -> Result<String> {
+                assert!(program == "ssh" || program == "scp");
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push((program.into(), args.to_vec()));
+                if program == "scp" && self.fail_scp {
+                    bail!("fixture transfer refused")
+                }
+                Ok(String::new())
+            }
+        }
+        let fake = |fail_scp| FakeTransport {
+            calls: Mutex::new(vec![]),
+            fail_scp,
+        };
+        let no_network = fake(false);
+        assert!(deploy_host_binary(&no_network, &store, "missing", &binary, None).is_err());
+        assert!(deploy_host_binary(
+            &no_network,
+            &store,
+            "sandbox",
+            &binary,
+            Some("incorrect checksum")
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("checksum does not match"));
+        assert!(no_network.calls.lock().unwrap().is_empty());
+        assert!(store
+            .hosts()
+            .unwrap()
+            .iter()
+            .find(|h| h.name == "sandbox")
+            .unwrap()
+            .installed_version
+            .is_none());
+        let refused = fake(true);
+        assert!(
+            deploy_host_binary(&refused, &store, "sandbox", &binary, Some(&checksum))
+                .unwrap_err()
+                .to_string()
+                .contains("fixture transfer refused")
+        );
+        assert_eq!(refused.calls.lock().unwrap().len(), 2);
+        assert!(store
+            .hosts()
+            .unwrap()
+            .iter()
+            .find(|h| h.name == "sandbox")
+            .unwrap()
+            .installed_version
+            .is_none());
+        let successful = fake(false);
+        let (activated, actual) =
+            deploy_host_binary(&successful, &store, "sandbox", &binary, Some(&checksum)).unwrap();
+        assert_eq!(actual, checksum);
+        assert_eq!(
+            activated.installed_version.as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(
+            store
+                .hosts()
+                .unwrap()
+                .iter()
+                .find(|h| h.name == "sandbox")
+                .unwrap()
+                .installed_version,
+            activated.installed_version
+        );
+        let calls = successful.calls.lock().unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .map(|(program, _)| program.as_str())
+                .collect::<Vec<_>>(),
+            ["ssh", "scp", "ssh"]
+        );
+        for (_, args) in calls.iter() {
+            assert!(args.contains(&"BatchMode=yes".into()));
+            assert!(args.contains(&"StrictHostKeyChecking=yes".into()));
+        }
+        assert!(calls[1].1.contains(&binary.display().to_string()));
+        assert!(calls[2].1.iter().any(|arg| arg.contains(&checksum)));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
