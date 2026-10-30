@@ -1498,34 +1498,34 @@ tuios list-windows -s "$session" --json >/dev/null
 "#
 }
 
-fn bootstrap_tuios(spec: &LaneSpec) -> Result<()> {
+fn bootstrap_tuios_with_runner(r: &impl Runner, spec: &LaneSpec) -> Result<()> {
     validate_tuios_image(spec)?;
-    let (_, uid, gid) = current_identity(&SystemRunner)?;
+    let (_, uid, gid) = current_identity(r)?;
     if spec.profile.effective_runtime() == RuntimeMode::PodmanInit {
         // Podman-init has no user-runtime-dir service. /run is already a
         // container-private tmpfs; provision the daemon socket directory there.
-        let output = Command::new("podman")
-            .args([
-                "exec",
-                "--user",
-                "0",
-                &spec.container_name(),
-                "install",
-                "-d",
-                "-m",
-                "0700",
-                "-o",
-                &uid,
-                "-g",
-                &gid,
-                &format!("/run/user/{uid}"),
-            ])
-            .output()
+        let args = vec![
+            "exec".into(),
+            "--user".into(),
+            "0".into(),
+            spec.container_name(),
+            "install".into(),
+            "-d".into(),
+            "-m".into(),
+            "0700".into(),
+            "-o".into(),
+            uid.clone(),
+            "-g".into(),
+            gid,
+            format!("/run/user/{uid}"),
+        ];
+        let output = r
+            .run_output("podman", &args)
             .context("prepare private TUIOS runtime directory")?;
-        if !output.status.success() {
+        if output.code != 0 {
             bail!(
                 "TUIOS runtime directory bootstrap failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
+                output.stderr.trim()
             )
         }
     }
@@ -1547,17 +1547,17 @@ fn bootstrap_tuios(spec: &LaneSpec) -> Result<()> {
         "-c".into(),
         bootstrap_tuios_script().into(),
     ]);
-    let output = Command::new("podman")
-        .args(args)
-        .output()
+    let output = r
+        .run_output("podman", &args)
         .context("bootstrap native TUIOS session")?;
-    if !output.status.success() {
-        bail!(
-            "TUIOS session bootstrap failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
+    if output.code != 0 {
+        bail!("TUIOS session bootstrap failed: {}", output.stderr.trim())
     }
     Ok(())
+}
+
+fn bootstrap_tuios(spec: &LaneSpec) -> Result<()> {
+    bootstrap_tuios_with_runner(&SystemRunner, spec)
 }
 
 fn bootstrap_herdr_script() -> &'static str {
@@ -1921,8 +1921,12 @@ fn bootstrap_shell(spec: &LaneSpec) -> Result<()> {
     }
     Ok(())
 }
-fn tuios_session_info(spec: &LaneSpec) -> Result<serde_json::Value> {
-    let (_, uid, _) = current_identity(&SystemRunner)?;
+fn session_snapshot_with_runner(
+    r: &impl Runner,
+    spec: &LaneSpec,
+    backend: TerminalBackend,
+) -> Result<serde_json::Value> {
+    let (_, uid, _) = current_identity(r)?;
     let mut args = vec![
         "exec".into(),
         "--user".into(),
@@ -1931,56 +1935,50 @@ fn tuios_session_info(spec: &LaneSpec) -> Result<serde_json::Value> {
         spec.container_home().display().to_string(),
     ];
     args.extend(user_manager_environment(&uid));
-    args.extend([
-        spec.container_name(),
-        "tuios".into(),
-        "session-info".into(),
-        "-s".into(),
-        spec.session_name(),
-        "--json".into(),
-    ]);
-    let output = Command::new("podman")
-        .args(args)
-        .output()
-        .context("read native TUIOS session")?;
-    if !output.status.success() {
-        bail!(
-            "TUIOS session inspection failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
+    args.push(spec.container_name());
+    let (read_context, failure, invalid) = match backend {
+        TerminalBackend::TuiosV3 => {
+            args.extend([
+                "tuios".into(),
+                "session-info".into(),
+                "-s".into(),
+                spec.session_name(),
+                "--json".into(),
+            ]);
+            (
+                "read native TUIOS session",
+                "TUIOS session inspection failed",
+                "TUIOS returned invalid session info",
+            )
+        }
+        TerminalBackend::Herdr => {
+            args.extend([
+                "herdr".into(),
+                "--session".into(),
+                spec.session_name(),
+                "api".into(),
+                "snapshot".into(),
+            ]);
+            (
+                "read bootstrapped Herdr session",
+                "Herdr session snapshot failed",
+                "Herdr returned an invalid session snapshot",
+            )
+        }
+    };
+    let output = r.run_output("podman", &args).context(read_context)?;
+    if output.code != 0 {
+        bail!("{failure}: {}", output.stderr.trim())
     }
-    serde_json::from_slice(&output.stdout).context("TUIOS returned invalid session info")
+    serde_json::from_str(&output.stdout).context(invalid)
+}
+
+fn tuios_session_info(spec: &LaneSpec) -> Result<serde_json::Value> {
+    session_snapshot_with_runner(&SystemRunner, spec, TerminalBackend::TuiosV3)
 }
 
 fn herdr_snapshot(spec: &LaneSpec) -> Result<serde_json::Value> {
-    let (_, uid, _) = current_identity(&SystemRunner)?;
-    let mut args = vec![
-        "exec".into(),
-        "--user".into(),
-        CONTAINER_USER.into(),
-        "--workdir".into(),
-        spec.container_home().display().to_string(),
-    ];
-    args.extend(user_manager_environment(&uid));
-    args.extend([
-        spec.container_name(),
-        "herdr".into(),
-        "--session".into(),
-        spec.session_name(),
-        "api".into(),
-        "snapshot".into(),
-    ]);
-    let output = Command::new("podman")
-        .args(args)
-        .output()
-        .context("read bootstrapped Herdr session")?;
-    if !output.status.success() {
-        bail!(
-            "Herdr session snapshot failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
-    }
-    serde_json::from_slice(&output.stdout).context("Herdr returned an invalid session snapshot")
+    session_snapshot_with_runner(&SystemRunner, spec, TerminalBackend::Herdr)
 }
 fn run_executor() -> Result<()> {
     let mut input = Vec::new();
@@ -3376,6 +3374,156 @@ mod tests {
     }
 
     #[test]
+    fn v3_bootstrap_uses_private_runtime_and_never_falls_back_after_failures() {
+        struct BootstrapRunner {
+            calls: Mutex<Vec<Vec<String>>>,
+            fail: Option<&'static str>,
+        }
+        impl Runner for BootstrapRunner {
+            fn run(&self, program: &str, args: &[String]) -> Result<String> {
+                assert_eq!(program, "id");
+                Ok(match args[0].as_str() {
+                    "-un" => "gerald",
+                    "-u" | "-g" => "1000",
+                    _ => panic!("unexpected identity query: {args:?}"),
+                }
+                .into())
+            }
+            fn run_output(&self, program: &str, args: &[String]) -> Result<ProcessOutput> {
+                assert_eq!(program, "podman");
+                self.calls.lock().unwrap().push(args.to_vec());
+                let phase = if args.iter().any(|arg| arg == "install") {
+                    "runtime"
+                } else {
+                    "session"
+                };
+                Ok(ProcessOutput {
+                    code: i32::from(self.fail == Some(phase)),
+                    stdout: String::new(),
+                    stderr: format!("private {phase} failed"),
+                })
+            }
+        }
+        let mut lane = spec("local");
+        lane.profile.terminal_backend = TerminalBackend::TuiosV3;
+        lane.profile.embedded_containerfile = false;
+        lane.profile.agent = AgentKind::Pi;
+        lane.profile.mount_codex_credentials = false;
+        lane.profile.runtime = RuntimeMode::PodmanInit;
+        for (fail, expected_calls) in [(None, 2), (Some("runtime"), 1), (Some("session"), 2)] {
+            let runner = BootstrapRunner {
+                calls: Mutex::new(vec![]),
+                fail,
+            };
+            let result = bootstrap_tuios_with_runner(&runner, &lane);
+            assert_eq!(result.is_err(), fail.is_some());
+            let calls = runner.calls.lock().unwrap();
+            assert_eq!(calls.len(), expected_calls);
+            assert_eq!(
+                calls[0][..4],
+                ["exec", "--user", "0", lane.container_name().as_str()]
+            );
+            assert!(calls[0].contains(&"/run/user/1000".into()));
+            if expected_calls == 2 {
+                let shell = &calls[1];
+                assert!(shell.contains(&"WORKLANE_SESSION=test".into()));
+                assert!(
+                    shell.contains(&"tuios integration install pi --no-skill --command".into())
+                        || shell
+                            .iter()
+                            .any(|part| part.contains("tuios integration install pi --no-skill"))
+                );
+                assert!(!shell.iter().any(|part| part.contains("herdr")));
+            }
+        }
+        let runner = BootstrapRunner {
+            calls: Mutex::new(vec![]),
+            fail: None,
+        };
+        lane.profile.runtime = RuntimeMode::Systemd;
+        bootstrap_tuios_with_runner(&runner, &lane).unwrap();
+        assert_eq!(runner.calls.lock().unwrap().len(), 1); // user manager owns /run/user on systemd
+        lane.profile.agent = AgentKind::Codex;
+        assert!(bootstrap_tuios_with_runner(&runner, &lane).is_err());
+        assert_eq!(runner.calls.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn native_and_legacy_session_reads_keep_their_own_protocols() {
+        struct SnapshotRunner {
+            calls: Mutex<Vec<Vec<String>>>,
+            output: ProcessOutput,
+        }
+        impl Runner for SnapshotRunner {
+            fn run(&self, program: &str, args: &[String]) -> Result<String> {
+                assert_eq!(program, "id");
+                Ok(match args[0].as_str() {
+                    "-un" => "gerald",
+                    "-u" | "-g" => "1000",
+                    _ => panic!("unexpected id query"),
+                }
+                .into())
+            }
+            fn run_output(&self, program: &str, args: &[String]) -> Result<ProcessOutput> {
+                assert_eq!(program, "podman");
+                self.calls.lock().unwrap().push(args.to_vec());
+                Ok(self.output.clone())
+            }
+        }
+        let lane = spec("local");
+        for backend in [TerminalBackend::TuiosV3, TerminalBackend::Herdr] {
+            let runner = SnapshotRunner {
+                calls: Mutex::new(vec![]),
+                output: ProcessOutput {
+                    code: 0,
+                    stdout: r#"{"session_name":"test","window_count":1}"#.into(),
+                    stderr: String::new(),
+                },
+            };
+            assert_eq!(
+                session_snapshot_with_runner(&runner, &lane, backend).unwrap()["window_count"],
+                1
+            );
+            let calls = runner.calls.lock().unwrap();
+            let args = &calls[0];
+            assert!(args.contains(&"XDG_RUNTIME_DIR=/run/user/1000".into()));
+            assert!(args.contains(&lane.container_name()));
+            match backend {
+                TerminalBackend::TuiosV3 => {
+                    assert!(args
+                        .windows(4)
+                        .any(|w| w == ["tuios", "session-info", "-s", "test"]));
+                    assert!(!args.contains(&"herdr".into()));
+                }
+                TerminalBackend::Herdr => {
+                    assert!(args
+                        .windows(4)
+                        .any(|w| w == ["herdr", "--session", "test", "api"]));
+                    assert!(!args.contains(&"tuios".into()));
+                }
+            }
+            drop(calls);
+            for (code, stdout, needle) in [(1, "", "failed"), (0, "not-json", "invalid session")] {
+                let broken = SnapshotRunner {
+                    calls: Mutex::new(vec![]),
+                    output: ProcessOutput {
+                        code,
+                        stdout: stdout.into(),
+                        stderr: "private lane error".into(),
+                    },
+                };
+                let err = session_snapshot_with_runner(&broken, &lane, backend)
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    err.contains(needle) && (code == 0 || err.contains("private lane error")),
+                    "{err}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn tuios_headless_bootstrap_creates_once_and_rejects_missing_binary() {
         use std::os::unix::fs::PermissionsExt;
         let root =
@@ -4110,6 +4258,52 @@ CMD ["sleep", "infinity"]
         custom.profile.embedded_containerfile = false;
         assert!(!upgrade_rebuild_without_cache(&custom, false));
         assert!(upgrade_rebuild_without_cache(&custom, true));
+    }
+
+    #[test]
+    fn v3_mounts_no_host_secrets_and_legacy_mountpoints_reject_existing_data() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let root = std::env::temp_dir().join(format!(
+            "worklane-credential-mount-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut lane = spec("local");
+        lane.project_path = root.join("lane");
+        fs::create_dir_all(&lane.project_path).unwrap();
+        lane.profile.terminal_backend = TerminalBackend::TuiosV3;
+        lane.profile.agent = AgentKind::Pi;
+        lane.profile.embedded_containerfile = false;
+        lane.profile.mount_codex_credentials = false;
+        lane.profile.mount_gh_credentials = false;
+        assert!(credential_mounts(&lane).unwrap().is_empty());
+        let mut args = Vec::new();
+        append_credential_mounts(&mut args, &lane).unwrap();
+        assert!(args.is_empty());
+
+        let source = root.join("test-hosts.yml");
+        fs::write(&source, b"fixture-only-token").unwrap();
+        let target = lane.container_home().join(".config/gh/hosts.yml");
+        let destination = lane.project_path.join(".config/gh/hosts.yml");
+        assert!(prepare_credential_mountpoint(&lane, "GitHub CLI", &source, &target).unwrap());
+        assert_eq!(
+            fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(prepare_credential_mountpoint(&lane, "GitHub CLI", &source, &target).unwrap());
+        fs::write(&destination, b"lane-owned-credential").unwrap();
+        assert!(
+            prepare_credential_mountpoint(&lane, "GitHub CLI", &source, &target)
+                .unwrap_err()
+                .to_string()
+                .contains("refusing to hide")
+        );
+        fs::remove_file(&destination).unwrap();
+        symlink(&source, &destination).unwrap();
+        assert!(prepare_credential_mountpoint(&lane, "GitHub CLI", &source, &target).is_err());
+        fs::remove_file(&destination).unwrap();
+        fs::create_dir(&destination).unwrap();
+        assert!(prepare_credential_mountpoint(&lane, "GitHub CLI", &source, &target).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -1150,4 +1150,167 @@ mod tests {
             .to_string()
             .contains("pane_id"));
     }
+
+    #[test]
+    fn durable_jobs_validate_identity_permissions_order_and_terminal_recovery() {
+        use std::{ffi::OsString, os::unix::fs::PermissionsExt};
+        struct Restore {
+            old_state: Option<OsString>,
+            old_inline: Option<OsString>,
+            old_path: Option<OsString>,
+            old_log: Option<OsString>,
+            root: PathBuf,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (name, previous) in [
+                    ("XDG_STATE_HOME", &self.old_state),
+                    ("WORKLANE_API_INLINE", &self.old_inline),
+                    ("PATH", &self.old_path),
+                    ("WORKLANE_API_TEST_LOG", &self.old_log),
+                ] {
+                    if let Some(value) = previous {
+                        std::env::set_var(name, value);
+                    } else {
+                        std::env::remove_var(name);
+                    }
+                }
+                let _ = fs::remove_dir_all(&self.root);
+            }
+        }
+        let root = std::env::temp_dir().join(format!("worklane-api-jobs-{}", Uuid::new_v4()));
+        let guard = Restore {
+            old_state: std::env::var_os("XDG_STATE_HOME"),
+            old_inline: std::env::var_os("WORKLANE_API_INLINE"),
+            old_path: std::env::var_os("PATH"),
+            old_log: std::env::var_os("WORKLANE_API_TEST_LOG"),
+            root: root.clone(),
+        };
+        std::env::set_var("XDG_STATE_HOME", &root);
+        std::env::set_var("WORKLANE_API_INLINE", "1");
+        let id = Uuid::new_v4().to_string();
+        let second_id = Uuid::new_v4().to_string();
+        let now = Utc::now();
+        let mut job = ApiJob {
+            operation_id: id.clone(),
+            request_id: "request-a".into(),
+            method: "lane.open".into(),
+            params: json!({"lane":"v3-private"}),
+            state: "cancel_requested".into(),
+            created_at: now,
+            updated_at: now,
+            events: Vec::new(),
+            result: None,
+            error: None,
+        };
+        write_job(&job).unwrap();
+        assert_eq!(
+            fs::metadata(state_dir()).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(job_path(&id).unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(read_job(&id).unwrap().request_id, "request-a");
+        assert!(read_job("../../escape").is_err());
+        let request = |method: &str, params: Value| ApiRequest {
+            version: API_VERSION,
+            request_id: "test-request".into(),
+            method: method.into(),
+            params,
+        };
+        assert_eq!(
+            dispatch(&request("operation.get", json!({"operation_id":id}))).unwrap()["state"],
+            "cancel_requested"
+        );
+        assert_eq!(
+            dispatch(&request("operation.list", json!({})))
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            dispatch(&request("schema", json!({}))).unwrap()["version"],
+            API_VERSION
+        );
+        assert!(dispatch(&ApiRequest {
+            version: API_VERSION + 1,
+            ..request("schema", json!({}))
+        })
+        .is_err());
+        assert!(dispatch(&ApiRequest {
+            request_id: String::new(),
+            ..request("schema", json!({}))
+        })
+        .is_err());
+        worker(&id).unwrap(); // A cancellation must not invoke the lane CLI.
+        assert_eq!(read_job(&id).unwrap().state, "cancelled");
+        worker(&id).unwrap(); // Terminal jobs remain terminal on retry.
+        assert_eq!(cancel_job(&id).unwrap()["state"], "cancelled");
+        job.operation_id = second_id.clone();
+        job.state = "succeeded".into();
+        job.created_at = now - chrono::Duration::minutes(1);
+        write_job(&job).unwrap();
+        assert_eq!(
+            list_jobs()
+                .unwrap()
+                .iter()
+                .map(|j| j.operation_id.clone())
+                .collect::<Vec<_>>(),
+            vec![id, second_id]
+        );
+        recover_jobs().unwrap(); // Inline mode must not access the host's user manager.
+        assert!(worker("not-an-id").is_err());
+
+        // Durable systemd operations are tested against private command fixtures;
+        // never call the host user manager or a real lane.
+        let bin = root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let log = root.join("manager.log");
+        for (name, script) in [
+            ("systemd-run", "#!/bin/sh\nprintf 'run %s\\n' \"$*\" >> \"$WORKLANE_API_TEST_LOG\"\ntest ! -e \"$WORKLANE_API_TEST_LOG.fail\"\n"),
+            ("systemctl", "#!/bin/sh\nprintf 'ctl %s\\n' \"$*\" >> \"$WORKLANE_API_TEST_LOG\"\ncase \"$*\" in *is-active*) exit 1 ;; esac\n"),
+        ] {
+            let path = bin.join(name);
+            fs::write(&path, script).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::env::set_var(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        );
+        std::env::set_var("WORKLANE_API_TEST_LOG", &log);
+        std::env::remove_var("WORKLANE_API_INLINE");
+        let queued = submit(&request("lane.stop", json!({"lane":"v3-private"}))).unwrap();
+        let queued_id = queued["operation_id"].as_str().unwrap();
+        assert_eq!(queued["state"], "queued");
+        let manager_calls = fs::read_to_string(&log).unwrap();
+        assert!(manager_calls.contains(&format!("worklane-api-{queued_id}")));
+        assert!(manager_calls.contains("--setenv=XDG_STATE_HOME="));
+        fs::write(root.join("manager.log.fail"), b"").unwrap();
+        let failed = submit(&request("lane.open", json!({"lane":"v3-private"}))).unwrap();
+        assert_eq!(failed["state"], "failed");
+        assert_eq!(failed["error"]["code"], "job-start-failed");
+        assert_eq!(failed["error"]["retryable"], true);
+        recover_jobs().unwrap(); // No live unit: a failed restart attempt stays queued.
+        assert_eq!(read_job(queued_id).unwrap().state, "queued");
+        assert_eq!(cancel_job(queued_id).unwrap()["state"], "cancelled");
+        assert!(fs::read_to_string(&log)
+            .unwrap()
+            .contains("ctl --user stop"));
+        assert!(submit(&request("lane.open", json!({}))).is_err());
+
+        fs::write(state_dir().join("unfinished.json.new"), b"not json").unwrap();
+        assert_eq!(list_jobs().unwrap().len(), 4); // Ignore incomplete atomic write.
+        fs::write(state_dir().join("broken.json"), b"not json").unwrap();
+        assert!(list_jobs().is_err());
+        drop(guard);
+    }
 }
