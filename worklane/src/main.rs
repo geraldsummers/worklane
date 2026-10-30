@@ -1578,6 +1578,32 @@ fn delete_local_lane(runner: &impl Runner, store: &Store, spec: &LaneSpec) -> Re
     }
     clear_operation_journal(spec)
 }
+fn lane_diff_with_runner(
+    runner: &impl Runner,
+    store: &Store,
+    spec: &LaneSpec,
+    raw: bool,
+) -> Result<serde_json::Value> {
+    // Match the CLI output and dashboard cache to the same drift policy.
+    refresh(runner, store, spec)?;
+    if spec.host == "local" {
+        let output = podman(runner, ["diff", &spec.container_name()])?;
+        let diff = if raw {
+            output.lines().map(str::to_owned).collect()
+        } else {
+            meaningful_drift_lines_for_spec(&output, spec)
+        };
+        Ok(serde_json::json!({"lane_id":spec.id,"lane_name":spec.name,"diff":diff,"raw":raw}))
+    } else {
+        let mut args = vec!["lane".into(), "diff".into(), spec.id.clone()];
+        if raw {
+            args.push("--raw".into());
+        }
+        let out = remote(runner, store, spec, args)?
+            .context("remote host unexpectedly treated as local")?;
+        serde_json::from_str(&out).context("remote lane diff returned invalid JSON")
+    }
+}
 fn refresh_all<R: Runner>(runner: &R, store: &Store) -> Result<Vec<LaneStatus>> {
     let specs = store
         .lanes()?
@@ -1745,6 +1771,63 @@ fn reconcile_local(
         }
     }
     Ok(report)
+}
+fn reconcile_selected(
+    runner: &impl Runner,
+    store: &Store,
+    selector: Option<&str>,
+    all: bool,
+    apply: bool,
+) -> Result<Vec<ReconcileReport>> {
+    let indices = if all {
+        store
+            .lanes()?
+            .into_iter()
+            .map(|status| store.index(&status.spec.id))
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        vec![store.index(selector.context("provide a lane or --all")?)?]
+    };
+    let mut reports = Vec::new();
+    for index in indices {
+        if index.host == "local" {
+            reports.push(reconcile_local(runner, store, &index, apply)?);
+            continue;
+        }
+        let cached = store.lane(&index.id)?;
+        let mut args = vec!["lane".into(), "reconcile".into(), index.id.clone()];
+        if apply {
+            args.push("--apply".into());
+        }
+        let output = remote(runner, store, &cached, args)?
+            .context("remote host unexpectedly treated as local")?;
+        let remote_reports: Vec<ReconcileReport> = serde_json::from_str(&output)?;
+        reports.extend(remote_reports);
+        if apply {
+            let refreshed = remote(
+                runner,
+                store,
+                &cached,
+                vec![
+                    "lane".into(),
+                    "inspect".into(),
+                    index.id.clone(),
+                    "--fast".into(),
+                ],
+            )?
+            .context("remote host unexpectedly treated as local")?;
+            let mut status: LaneStatus = serde_json::from_str(&refreshed)?;
+            status.spec.host = index.host.clone();
+            status.spec.project_path = index
+                .manifest_path
+                .parent()
+                .and_then(Path::parent)
+                .unwrap_or(Path::new("."))
+                .to_path_buf();
+            store.save_lane(&status.spec, &status.state, status.drift)?;
+        }
+    }
+    Ok(reports)
 }
 fn lane_attach_args(
     session: &str,
@@ -2924,31 +3007,7 @@ fn main() -> Result<()> {
                 }
                 LaneAction::Diff { lane, raw } => {
                     let s = store.lane(&lane)?;
-                    // Keep the dashboard cache in sync with the same filtered diff
-                    // that this command exposes.  Without this, a stale drift bit can
-                    // survive after `lane diff` reports no meaningful changes.
-                    refresh(&runner, &store, &s)?;
-                    if s.host == "local" {
-                        let output = podman(&SystemRunner, ["diff", &s.container_name()])?;
-                        let diff = if raw {
-                            output.lines().map(str::to_owned).collect()
-                        } else {
-                            meaningful_drift_lines_for_spec(&output, &s)
-                        };
-                        emit(
-                            cli.json,
-                            &serde_json::json!({"lane_id":s.id,"lane_name":s.name,"diff":diff,"raw":raw}),
-                        )
-                    } else {
-                        let mut args = vec!["lane".into(), "diff".into(), s.id.clone()];
-                        if raw {
-                            args.push("--raw".into());
-                        }
-                        let out = remote(&runner, &store, &s, args)?
-                            .context("remote host unexpectedly treated as local")?;
-                        let value: serde_json::Value = serde_json::from_str(&out)?;
-                        emit(cli.json, &value)
-                    }
+                    emit(cli.json, &lane_diff_with_runner(&runner, &store, &s, raw)?)
                 }
                 LaneAction::Start { lane } => {
                     let s = store.lane(&lane)?;
@@ -3290,57 +3349,10 @@ fn main() -> Result<()> {
                     store.remove_lane(&index.id)?;
                     emit(cli.json, &serde_json::json!({"forgot":index.name}))
                 }
-                LaneAction::Reconcile { lane, all, apply } => {
-                    let indices = if all {
-                        store
-                            .lanes()?
-                            .into_iter()
-                            .map(|status| store.index(&status.spec.id))
-                            .collect::<Result<Vec<_>>>()?
-                    } else {
-                        vec![store.index(&lane.context("provide a lane or --all")?)?]
-                    };
-                    let mut reports = Vec::new();
-                    for index in indices {
-                        if index.host == "local" {
-                            reports.push(reconcile_local(&runner, &store, &index, apply)?);
-                            continue;
-                        }
-                        let cached = store.lane(&index.id)?;
-                        let mut args = vec!["lane".into(), "reconcile".into(), index.id.clone()];
-                        if apply {
-                            args.push("--apply".into());
-                        }
-                        let output = remote(&runner, &store, &cached, args)?
-                            .context("remote host unexpectedly treated as local")?;
-                        let remote_reports: Vec<ReconcileReport> = serde_json::from_str(&output)?;
-                        reports.extend(remote_reports);
-                        if apply {
-                            let refreshed = remote(
-                                &runner,
-                                &store,
-                                &cached,
-                                vec![
-                                    "lane".into(),
-                                    "inspect".into(),
-                                    index.id.clone(),
-                                    "--fast".into(),
-                                ],
-                            )?
-                            .context("remote host unexpectedly treated as local")?;
-                            let mut status: LaneStatus = serde_json::from_str(&refreshed)?;
-                            status.spec.host = index.host.clone();
-                            status.spec.project_path = index
-                                .manifest_path
-                                .parent()
-                                .and_then(Path::parent)
-                                .unwrap_or(Path::new("."))
-                                .to_path_buf();
-                            store.save_lane(&status.spec, &status.state, status.drift)?;
-                        }
-                    }
-                    emit(cli.json, &reports)
-                }
+                LaneAction::Reconcile { lane, all, apply } => emit(
+                    cli.json,
+                    &reconcile_selected(&runner, &store, lane.as_deref(), all, apply)?,
+                ),
             }
         }
     }
@@ -4555,6 +4567,137 @@ esac
     }
 
     #[test]
+    fn selected_reconcile_uses_explicit_lane_ids_and_rebinds_remote_cache_locators() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../target/tmp/reconcile-selection-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(root.join("registry.db")).unwrap();
+        let mut local = spec("local");
+        local.project_path = root.join("local");
+        local.profile.terminal_backend = TerminalBackend::TuiosV3;
+        local.profile.agent = AgentKind::Pi;
+        local.profile.embedded_containerfile = false;
+        std::fs::create_dir_all(&local.project_path).unwrap();
+        write_lane_spec(&local).unwrap();
+        store.save_lane(&local, "stopped", false).unwrap();
+        let mut remote_spec = local.clone();
+        remote_spec.id = uuid::Uuid::new_v4().to_string();
+        remote_spec.name = "remote-fixture".into();
+        remote_spec.host = "sandbox".into();
+        remote_spec.project_path = root.join("remote");
+        remote_spec.container_name =
+            stable_container_name(&remote_spec.session_name, &remote_spec.id);
+        store.save_lane(&remote_spec, "stopped", false).unwrap();
+        store
+            .upsert_host(&Host {
+                name: "sandbox".into(),
+                ssh_target: "fixture@example.test".into(),
+                local: false,
+                installed_version: None,
+                last_seen: None,
+            })
+            .unwrap();
+        struct ReconcileRunner {
+            remote: LaneSpec,
+            calls: Mutex<Vec<Vec<String>>>,
+        }
+        impl Runner for ReconcileRunner {
+            fn run(&self, program: &str, args: &[String]) -> Result<String> {
+                assert_eq!(
+                    (program, args.first().map(String::as_str)),
+                    ("podman", Some("inspect"))
+                );
+                Ok("exited".into())
+            }
+            fn run_output(&self, program: &str, args: &[String]) -> Result<ProcessOutput> {
+                assert_eq!(
+                    (program, args.first().map(String::as_str)),
+                    ("podman", Some("container"))
+                );
+                Ok(ProcessOutput {
+                    code: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+            fn run_with_input(
+                &self,
+                program: &str,
+                args: &[String],
+                input: &[u8],
+            ) -> Result<String> {
+                assert_eq!(program, "ssh");
+                assert!(args.iter().any(|arg| arg.contains("fixture@example.test")));
+                let request: ExecutorRequest = serde_json::from_slice(input)?;
+                assert_eq!(request.args[0], "lane");
+                assert!(matches!(request.args[1].as_str(), "reconcile" | "inspect"));
+                assert_eq!(request.args[2], self.remote.id);
+                self.calls.lock().unwrap().push(request.args.clone());
+                let payload = if request.args[1] == "reconcile" {
+                    serde_json::to_value(vec![ReconcileReport {
+                        lane_id: self.remote.id.clone(),
+                        lane_name: self.remote.name.clone(),
+                        applied: request.args.contains(&"--apply".into()),
+                        findings: vec![],
+                        changes: vec![],
+                        unresolved: vec![],
+                    }])?
+                } else {
+                    assert_eq!(request.args.last().unwrap(), "--fast");
+                    let mut forged = self.remote.clone();
+                    forged.host = "foreign".into();
+                    forged.project_path = PathBuf::from("/foreign/project");
+                    serde_json::to_value(LaneStatus {
+                        runtime: RuntimeMode::PodmanInit,
+                        spec: forged,
+                        state: "running".into(),
+                        drift: false,
+                        drift_reasons: vec![],
+                        cached_at: Utc::now(),
+                        runtime_started_at: None,
+                    })?
+                };
+                Ok(serde_json::to_string(&ExecutorResponse {
+                    protocol_version: EXECUTOR_PROTOCOL,
+                    request_id: request.request_id,
+                    success: true,
+                    payload: Some(payload),
+                    error: None,
+                })?)
+            }
+        }
+        let runner = ReconcileRunner {
+            remote: remote_spec.clone(),
+            calls: Mutex::new(vec![]),
+        };
+        assert!(reconcile_selected(&runner, &store, None, false, false)
+            .unwrap_err()
+            .to_string()
+            .contains("lane or --all"));
+        let dry = reconcile_selected(&runner, &store, None, true, false).unwrap();
+        assert_eq!(dry.len(), 2);
+        assert!(dry.iter().any(|report| report.lane_id == local.id));
+        assert!(dry.iter().any(|report| report.lane_id == remote_spec.id));
+        assert_eq!(store.index(&remote_spec.id).unwrap().state, "stopped");
+        let applied =
+            reconcile_selected(&runner, &store, Some(&remote_spec.id), false, true).unwrap();
+        assert_eq!(applied.len(), 1);
+        assert_eq!(store.index(&remote_spec.id).unwrap().state, "running");
+        assert_eq!(store.index(&remote_spec.id).unwrap().host, "sandbox");
+        assert_eq!(
+            store.lane(&remote_spec.id).unwrap().project_path,
+            remote_spec.project_path
+        );
+        let calls = runner.calls.lock().unwrap();
+        assert_eq!(calls.len(), 3); // dry reconcile; apply reconcile; fast inspect.
+        assert!(calls[1].contains(&"--apply".into()));
+        drop(calls);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn reconciliation_reports_and_repairs_verified_partial_states() {
         let root =
             std::env::temp_dir().join(format!("worklane-reconcile-test-{}", uuid::Uuid::new_v4()));
@@ -5101,6 +5244,68 @@ esac
         ensure_no_pending_operation(&lane, "start").unwrap();
         assert_eq!(store.index(&lane.id).unwrap().state, "exited");
         assert!(store.index(&lane.id).unwrap().drift);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_lane_diff_updates_cached_drift_from_the_same_filtered_policy() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../target/tmp/v3-diff-fixture-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(root.join("registry.db")).unwrap();
+        let mut lane = spec("local");
+        lane.project_path = root.join("lane");
+        lane.profile.terminal_backend = TerminalBackend::TuiosV3;
+        lane.profile.agent = AgentKind::Pi;
+        lane.profile.embedded_containerfile = false;
+        store.save_lane(&lane, "running", false).unwrap();
+        struct DiffRunner(&'static str);
+        impl Runner for DiffRunner {
+            fn run(&self, program: &str, args: &[String]) -> Result<String> {
+                assert_eq!(program, "podman");
+                match args.first().map(String::as_str) {
+                    Some("diff") => Ok(self.0.into()),
+                    Some("inspect") if args.iter().any(|arg| arg.contains("StartedAt")) => {
+                        Ok("2026-01-01T00:00:00Z".into())
+                    }
+                    Some("inspect") if args.iter().any(|arg| arg.contains("config-sha256")) => {
+                        Ok("<no value>".into())
+                    }
+                    Some("inspect") => Ok("running".into()),
+                    other => panic!("unexpected diff fixture command: {other:?}"),
+                }
+            }
+            fn run_output(&self, program: &str, args: &[String]) -> Result<ProcessOutput> {
+                assert_eq!(
+                    (program, args.first().map(String::as_str)),
+                    ("podman", Some("container"))
+                );
+                Ok(ProcessOutput {
+                    code: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+        }
+        let dirty = DiffRunner("A /etc/private-fixture\nA /tmp/cache\n");
+        let meaningful = lane_diff_with_runner(&dirty, &store, &lane, false).unwrap();
+        assert_eq!(
+            meaningful["diff"],
+            serde_json::json!(["A /etc/private-fixture"])
+        );
+        assert!(store.index(&lane.id).unwrap().drift);
+        let raw = lane_diff_with_runner(&dirty, &store, &lane, true).unwrap();
+        assert_eq!(
+            raw["diff"],
+            serde_json::json!(["A /etc/private-fixture", "A /tmp/cache"])
+        );
+        assert_eq!(raw["raw"], true);
+        let transient_only =
+            lane_diff_with_runner(&DiffRunner("A /tmp/cache\n"), &store, &lane, false).unwrap();
+        assert_eq!(transient_only["diff"], serde_json::json!([]));
+        assert!(!store.index(&lane.id).unwrap().drift);
         std::fs::remove_dir_all(root).unwrap();
     }
 
