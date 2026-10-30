@@ -27,7 +27,7 @@ impl Default for PiLaunch {
         Self {
             executable: "pi",
             name: PI_PANE_NAME,
-            args: &["--provider", "openai-codex", "--model", "gpt-6-sol"],
+            args: &["--provider", "openai", "--model", "gpt-6-sol"],
         }
     }
 }
@@ -112,6 +112,20 @@ pub fn decode_start_reply(reply: &Value, session: &str) -> Result<AgentObservati
     }
     if reply["outcome"] != "ready" || reply["ready"] != true {
         bail!("TUIOS Pi is not ready; its pane may have been kept, inspect before retrying")
+    }
+    let command = reply["command"]
+        .as_str()
+        .context("TUIOS Pi start-agent omitted command; cannot verify provider override")?;
+    let tokens = command.split_whitespace().collect::<Vec<_>>();
+    for (flag, required) in [("--provider", "openai"), ("--model", "gpt-6-sol")] {
+        let found = tokens
+            .iter()
+            .enumerate()
+            .filter(|(_, token)| **token == flag)
+            .collect::<Vec<_>>();
+        if found.len() != 1 || tokens.get(found[0].0 + 1) != Some(&required) {
+            bail!("TUIOS Pi command did not preserve the required {flag} {required} override")
+        }
     }
     let window_id = reply["window_id"]
         .as_str()
@@ -246,7 +260,7 @@ mod tests {
             assert_eq!(launch.name, PI_PANE_NAME);
             assert_eq!(
                 launch.args,
-                ["--provider", "openai-codex", "--model", "gpt-6-sol"]
+                ["--provider", "openai", "--model", "gpt-6-sol"]
             );
             self.calls
                 .push(format!("start:{session}:pi:{}", workspace.display()));
@@ -391,12 +405,12 @@ mod tests {
             "v3-agent"
         )
         .is_err());
-        let timeout = serde_json::json!({"success":true,"session":"v3-agent","name":"worklane-pi","agent":"pi","outcome":"timeout","ready":false,"state":"none","window_id":"w-pi"});
+        let timeout = serde_json::json!({"success":true,"session":"v3-agent","name":"worklane-pi","agent":"pi","outcome":"timeout","ready":false,"state":"none","window_id":"w-pi","command":"/bin/pi --provider openai --model gpt-6-sol"});
         assert!(decode_start_reply(&timeout, "v3-agent")
             .unwrap_err()
             .to_string()
             .contains("pane may have been kept"));
-        let native_timeout = serde_json::json!({"type":"agent_started","session":"v3-agent","name":"worklane-pi","agent":"pi","outcome":"timeout","ready":false,"state":"none","window_id":"w-pi"});
+        let native_timeout = serde_json::json!({"type":"agent_started","session":"v3-agent","name":"worklane-pi","agent":"pi","outcome":"timeout","ready":false,"state":"none","window_id":"w-pi","command":"/bin/pi --provider openai --model gpt-6-sol"});
         assert!(decode_start_reply(&native_timeout, "v3-agent").is_err());
         let mut ready = timeout;
         ready["outcome"] = "ready".into();
@@ -406,6 +420,12 @@ mod tests {
             decode_start_reply(&ready, "v3-agent").unwrap().window_id,
             "w-pi"
         );
+        ready["command"] = "/bin/pi --provider openai-codex --model gpt-6-sol".into();
+        assert!(decode_start_reply(&ready, "v3-agent").is_err());
+        ready["command"] =
+            "/bin/pi --provider openai --provider openai-codex --model gpt-6-sol".into();
+        assert!(decode_start_reply(&ready, "v3-agent").is_err());
+        ready["command"] = "/bin/pi --provider openai --model gpt-6-sol".into();
         ready["state"] = "done".into();
         assert!(decode_start_reply(&ready, "v3-agent").is_err());
         ready["state"] = "unknown_future_value".into();
