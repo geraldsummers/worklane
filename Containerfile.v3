@@ -31,7 +31,33 @@ RUN curl --proto '=https' --tlsv1.2 -fsSL \
  && chmod 755 /usr/local/bin/tuios \
  && tuios --version | grep -F "${TUIOS_VERSION}" \
  && rm /tmp/tuios.tar.gz
-RUN groupadd -g 1000 dev && useradd -u 1000 -g 1000 -m -s /usr/bin/zsh dev
+RUN groupadd -g 1000 dev && useradd -u 1000 -g 1000 -m -s /usr/bin/zsh dev \
+ && truncate -s 0 /etc/machine-id \
+ && ln -sfn /etc/machine-id /var/lib/dbus/machine-id \
+ && ln -sfn /dev/null /etc/systemd/system/systemd-logind.service \
+ && install -d /etc/systemd/system/user@.service.d /etc/systemd/system/user-runtime-dir@.service.d /etc/systemd/system/user-.slice.d /etc/systemd/user.conf.d /usr/lib/systemd/user/default.target.wants \
+ && printf '%s\n' '[Unit]' 'Description=Worklane native v3 runtime' \
+    'Requires=basic.target' \
+    'Wants=systemd-user-sessions.service user-runtime-dir@1000.service user@1000.service' \
+    'After=basic.target systemd-user-sessions.service user-runtime-dir@1000.service user@1000.service' \
+    'AllowIsolate=yes' > /usr/lib/systemd/system/worklane.target \
+ && ln -sfn /usr/lib/systemd/system/worklane.target /etc/systemd/system/default.target \
+ && printf '%s\n' '[Service]' 'Environment=XDG_RUNTIME_DIR=/run/user/%i' \
+    'Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%i/bus' \
+    'PassEnvironment=WORKLANE_NAME WORKLANE_SESSION WORKLANE_WORKSPACE' \
+    > /etc/systemd/system/user@.service.d/worklane.conf \
+ && printf '%s\n' '[Slice]' 'TasksMax=90%' > /etc/systemd/system/user-.slice.d/worklane.conf \
+ && printf '%s\n' '[Manager]' 'DefaultTasksMax=90%' > /etc/systemd/user.conf.d/worklane.conf \
+ && printf '%s\n' '[Service]' 'ExecStart=' \
+    'ExecStart=/usr/bin/install -d -m 0700 -o %i -g %i /run/user/%i' \
+    'ExecStop=' 'ExecStop=/usr/bin/rm -rf /run/user/%i' \
+    > /etc/systemd/system/user-runtime-dir@.service.d/worklane.conf \
+ && printf '%s\n' '[Unit]' 'Description=Worklane native TUIOS daemon (no model launch)' \
+    '[Service]' 'Type=simple' 'WorkingDirectory=%h' \
+    'ExecStart=/usr/local/bin/tuios daemon' 'Restart=on-failure' 'RestartSec=2s' \
+    'KillMode=control-group' 'UMask=0077' \
+    > /usr/lib/systemd/user/worklane-tuios.service \
+ && ln -sfn ../worklane-tuios.service /usr/lib/systemd/user/default.target.wants/worklane-tuios.service
 USER dev
 WORKDIR /home/dev
 RUN install -d -m 0700 /home/dev/.pi/agent \

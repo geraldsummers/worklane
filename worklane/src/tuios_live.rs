@@ -34,6 +34,46 @@ print(json.dumps({'pid':pid,'tty':fd0,'fd0':fd0,'argv0':argv0,'exe':exe,
     'start_ticks':start}))
 "#;
 
+/// Write-ahead fence: a failed/timeout start may have created a pane even if
+/// the daemon later forgets it. Never use a missing pane as permission to retry.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LaunchIntent {
+    schema_version: u32,
+    lane_id: String,
+    session: String,
+    attempt_id: String,
+    command: Vec<String>,
+}
+fn intent_path(root: &Path, spec: &LaneSpec) -> PathBuf {
+    root.join(format!("{}.launch.json", spec.id))
+}
+fn begin_launch(root: &Path, spec: &LaneSpec, launch: &PiLaunch) -> Result<()> {
+    ensure_proof_root(root)?;
+    let intent = LaunchIntent {
+        schema_version: 1,
+        lane_id: spec.id.clone(),
+        session: spec.session_name(),
+        attempt_id: uuid::Uuid::new_v4().to_string(),
+        command: std::iter::once(launch.executable)
+            .chain(launch.args.iter().copied())
+            .map(str::to_owned)
+            .collect(),
+    };
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(intent_path(root, spec))
+        .context("prior Pi launch intent remains; uncertain launches must not be retried")?;
+    // A partial record is intentionally retained as a fence on write failure.
+    serde_json::to_writer(&mut file, &intent)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    fs::File::open(root)?.sync_all()?;
+    Ok(())
+}
+
 fn proof_path(root: &Path, spec: &LaneSpec) -> PathBuf {
     root.join(format!("{}.json", spec.id))
 }
@@ -46,7 +86,7 @@ fn read_proof(root: &Path, spec: &LaneSpec) -> Result<PiProcessProof> {
     }
     serde_json::from_slice(&fs::read(path)?).context("invalid Pi launch proof")
 }
-fn ensure_proof_root(root: &Path) -> Result<()> {
+pub(crate) fn ensure_proof_root(root: &Path) -> Result<()> {
     if !root.exists() {
         fs::create_dir_all(root)?;
         fs::set_permissions(root, fs::Permissions::from_mode(0o700))?;
@@ -68,15 +108,11 @@ fn save_proof(root: &Path, spec: &LaneSpec, proof: &PiProcessProof) -> Result<()
         .create_new(true)
         .mode(0o600)
         .open(&path)?;
-    if let Err(error) = (|| -> Result<()> {
-        serde_json::to_writer(&mut file, proof)?;
-        file.write_all(b"\n")?;
-        file.sync_all()?;
-        Ok(())
-    })() {
-        let _ = fs::remove_file(&path);
-        return Err(error);
-    }
+    // Never remove partial proof: the launch may already be running.
+    serde_json::to_writer(&mut file, proof)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    fs::File::open(root)?.sync_all()?;
     Ok(())
 }
 
@@ -166,9 +202,20 @@ impl<R: Runner> NativePiControl for LivePi<'_, R> {
             "--ready-timeout".into(),
             "6000".into(),
             "--json".into(),
-            "--".into(),
         ];
+        let managed =
+            super::managed_pi::scope(self.proof_root, self.spec, chrono::Utc::now().timestamp())?
+                .is_some();
+        let (environment, extra) = super::managed_pi::launch_args(self.spec);
+        if managed {
+            args.extend(environment);
+        }
+        args.push("--".into());
         args.extend(launch.args.iter().map(|arg| (*arg).into()));
+        if managed {
+            args.extend(extra);
+        }
+        begin_launch(self.proof_root, self.spec, launch)?;
         let reply = self.call(&args)?;
         tuios_agent::decode_start_reply(&reply, session)
     }
@@ -215,6 +262,39 @@ impl<R: Runner> NativePiControl for LivePi<'_, R> {
     }
 }
 
+/// Observation-only recovery: validate the existing process against the durable
+/// proof. Never creates a session, starts an agent, clears an intent, or adopts
+/// a restored shell. A lost caller acknowledgement can safely use this path.
+pub(crate) fn inspect_live_pi_with_runner<R: Runner>(
+    runner: &R,
+    spec: &LaneSpec,
+    root: &Path,
+) -> Result<Value> {
+    if spec.host != "local" || spec.profile.terminal_backend != TerminalBackend::TuiosV3 {
+        bail!("native Pi observation requires a local opt-in v3 lane")
+    }
+    let _lock = lock_lane_operation(spec)?;
+    let credential = super::managed_pi::scope(root, spec, chrono::Utc::now().timestamp())?;
+    let (_, uid, _) = current_identity(runner)?;
+    let mut control = LivePi {
+        runner,
+        spec,
+        uid,
+        proof_root: root,
+    };
+    let candidates = control.list_candidates(&spec.session_name())?;
+    let [agent] = candidates.as_slice() else {
+        bail!("Pi observation requires exactly one reserved window; no effects were retried")
+    };
+    control.verify_live_process(agent, false)?;
+    Ok(serde_json::json!({
+        "schema_version":1, "lane_id":spec.id, "session":spec.session_name(),
+        "activity":agent.activity.as_str(), "proof":read_proof(root, spec)?,
+        "credential_scope":credential, "observation_only":true,
+        "model_authenticated":false
+    }))
+}
+
 pub(crate) fn ensure_live_pi_with_runner<R: Runner>(
     runner: &R,
     spec: &LaneSpec,
@@ -228,6 +308,9 @@ pub(crate) fn ensure_live_pi_with_runner<R: Runner>(
     let _lock = lock_lane_operation(spec)?;
     // Check the host-only location before making a TUIOS mutation.
     ensure_proof_root(root)?;
+    // Expired/pending scoped delivery blocks both new launch and existing reuse.
+    // It is not a provider-side revocation mechanism for an already running Pi.
+    super::managed_pi::scope(root, spec, chrono::Utc::now().timestamp())?;
     let (_, uid, _) = current_identity(runner)?;
     let mut control = LivePi {
         runner,
@@ -318,6 +401,9 @@ mod tests {
                         .any(|args| args == ["--model", "gpt-6-sol"]));
                     state.started = true;
                     state.launches += 1;
+                    if state.mode == "lost-start-reply" {
+                        return Err(anyhow::anyhow!("synthetic transport interruption"));
+                    }
                     Ok(serde_json::json!({"success":true,"session":session,"name":"worklane-pi",
                         "agent":"pi","outcome":"ready","ready":true,"state":"idle",
                         "window_id":"window-private","command":"/usr/local/bin/pi --provider openai --model gpt-6-sol"}).to_string())
@@ -370,6 +456,11 @@ mod tests {
         );
         ensure_live_pi_with_runner(&fake, &spec, &proof_dir).unwrap();
         assert_eq!(fake.0.lock().unwrap().launches, 1);
+        let observation = inspect_live_pi_with_runner(&fake, &spec, &proof_dir).unwrap();
+        assert_eq!(observation["proof"]["pid"], 52);
+        assert_eq!(observation["observation_only"], true);
+        assert_eq!(observation["model_authenticated"], false);
+        assert_eq!(fake.0.lock().unwrap().launches, 1);
         fake.0.lock().unwrap().mode = "shell";
         assert!(ensure_live_pi_with_runner(&fake, &spec, &proof_dir)
             .unwrap_err()
@@ -389,6 +480,53 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("prior Pi launch proof"));
+        assert_eq!(fake.0.lock().unwrap().launches, 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn uncertain_launch_is_durably_fenced_even_when_daemon_forgets_the_pane() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../target/tmp/live-pi-intent-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let spec = lane(&root);
+        let proofs = root.join("proofs");
+        let fake = FakeNative::new();
+        fake.0.lock().unwrap().mode = "lost-start-reply";
+        assert!(ensure_live_pi_with_runner(&fake, &spec, &proofs).is_err());
+        let intent: LaunchIntent =
+            serde_json::from_slice(&fs::read(intent_path(&proofs, &spec)).unwrap()).unwrap();
+        assert_eq!(intent.lane_id, spec.id);
+        assert_eq!(intent.session, spec.session_name());
+        assert_eq!(
+            intent.command,
+            ["pi", "--provider", "openai", "--model", "gpt-6-sol"]
+        );
+        assert_eq!(
+            fs::metadata(intent_path(&proofs, &spec))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        {
+            let mut state = fake.0.lock().unwrap();
+            state.started = false;
+            state.mode = "live";
+        }
+        assert!(ensure_live_pi_with_runner(&fake, &spec, &proofs)
+            .unwrap_err()
+            .to_string()
+            .contains("prior Pi launch intent"));
+        assert_eq!(fake.0.lock().unwrap().launches, 1);
+        // Corrupt and dangling-symlink intents are also barriers, never absence.
+        fs::write(intent_path(&proofs, &spec), b"partial").unwrap();
+        assert!(ensure_live_pi_with_runner(&fake, &spec, &proofs).is_err());
+        fs::remove_file(intent_path(&proofs, &spec)).unwrap();
+        std::os::unix::fs::symlink(root.join("missing"), intent_path(&proofs, &spec)).unwrap();
+        assert!(ensure_live_pi_with_runner(&fake, &spec, &proofs).is_err());
         assert_eq!(fake.0.lock().unwrap().launches, 1);
         fs::remove_dir_all(root).unwrap();
     }
@@ -443,6 +581,11 @@ mod tests {
         legacy.profile.terminal_backend = TerminalBackend::Herdr;
         assert!(ensure_live_pi_with_runner(&fake, &legacy, &root.join("proofs")).is_err());
         assert_eq!(fake.0.lock().unwrap().calls, ["list-agents"]);
+        assert!(inspect_live_pi_with_runner(&fake, &legacy, &root.join("proofs")).is_err());
+        legacy.profile.terminal_backend = TerminalBackend::TuiosV3;
+        fake.0.lock().unwrap().mode = "live";
+        assert!(inspect_live_pi_with_runner(&fake, &legacy, &root.join("proofs")).is_err());
+        assert_eq!(fake.0.lock().unwrap().launches, 0);
         fs::remove_dir_all(root).unwrap();
     }
 }

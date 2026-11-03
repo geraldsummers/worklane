@@ -14,6 +14,7 @@ use std::{
 use worklane_core::*;
 
 mod api;
+mod managed_pi;
 mod tuios_live;
 
 /// The standard lane image recipe travels with every `worklane` binary.
@@ -215,6 +216,11 @@ enum LaneAction {
         #[arg(long)]
         raw: bool,
     },
+    /// Deliver one explicitly scoped Pi API key from JSON stdin, before first agent launch.
+    /// Never reads ambient host authentication. Local opt-in v3 lanes only.
+    PiCredential { lane: String },
+    /// Observe an existing Pi against its recorded process proof; never launches or retries.
+    PiInspect { lane: String },
     /// Start the existing lane container.
     Start { lane: String },
     /// Start and bootstrap a lane's persistent Herdr workspace without attaching a TTY.
@@ -3166,6 +3172,58 @@ fn main() -> Result<()> {
                 LaneAction::Diff { lane, raw } => {
                     let s = store.lane(&lane)?;
                     emit(cli.json, &lane_diff_with_runner(&runner, &store, &s, raw)?)
+                }
+                LaneAction::PiInspect { lane } => {
+                    let s = store.lane(&lane)?;
+                    if s.host != "local" || s.profile.terminal_backend != TerminalBackend::TuiosV3 {
+                        bail!("Pi observation requires a local v3 lane")
+                    }
+                    verify_container_owner(&runner, &s.container_name(), &s)?;
+                    emit(
+                        cli.json,
+                        &tuios_live::inspect_live_pi_with_runner(
+                            &runner,
+                            &s,
+                            &data_dir().join("v3-pi-process"),
+                        )?,
+                    )
+                }
+                LaneAction::PiCredential { lane } => {
+                    let s = store.lane(&lane)?;
+                    if s.host != "local" || s.profile.terminal_backend != TerminalBackend::TuiosV3 {
+                        bail!("Pi credential delivery requires a local v3 lane")
+                    }
+                    let _lock = lock_lane_operation(&s)?;
+                    ensure_no_pending_operation(&s, "pi-credential")?;
+                    let mut input = Vec::new();
+                    io::stdin()
+                        .take((managed_pi::MAX_INPUT + 1) as u64)
+                        .read_to_end(&mut input)?;
+                    verify_container_owner(&runner, &s.container_name(), &s)?;
+                    if runner
+                        .run(
+                            "podman",
+                            &[
+                                "info".into(),
+                                "--format".into(),
+                                "{{.Host.Security.Rootless}}".into(),
+                            ],
+                        )?
+                        .trim()
+                        != "true"
+                    {
+                        bail!("Pi credential delivery requires rootless Podman")
+                    }
+                    let (_, uid, _) = current_identity(&runner)?;
+                    let scope = managed_pi::deliver(
+                        &runner,
+                        &s,
+                        &data_dir().join("v3-pi-process"),
+                        &uid,
+                        &input,
+                        Utc::now().timestamp(),
+                    )?;
+                    emit(cli.json, &scope)
                 }
                 LaneAction::Start { lane } => {
                     let s = store.lane(&lane)?;
