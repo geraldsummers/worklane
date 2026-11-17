@@ -48,6 +48,17 @@ struct LaunchIntent {
 fn intent_path(root: &Path, spec: &LaneSpec) -> PathBuf {
     root.join(format!("{}.launch.json", spec.id))
 }
+fn selected_path(root: &Path, spec: &LaneSpec, suffix: &str) -> Result<PathBuf> {
+    let receipt = super::managed_pi::active_receipt(root, spec)?;
+    let name = receipt.file_name().and_then(|v| v.to_str())
+        .context("non-UTF8 managed Pi receipt")?;
+    let key = name.strip_suffix(".credential.json").context("foreign Pi receipt name")?;
+    if key != spec.id && !key.starts_with(&format!("{}.resume-", spec.id)) {
+        bail!("foreign managed Pi receipt key")
+    }
+    if key == spec.id && suffix == "proof" { return Ok(proof_path(root,spec)) }
+    Ok(root.join(format!("{key}.{suffix}.json")))
+}
 fn begin_launch(root: &Path, spec: &LaneSpec, launch: &PiLaunch) -> Result<()> {
     ensure_proof_root(root)?;
     let intent = LaunchIntent {
@@ -64,7 +75,7 @@ fn begin_launch(root: &Path, spec: &LaneSpec, launch: &PiLaunch) -> Result<()> {
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(intent_path(root, spec))
+        .open(selected_path(root, spec, "launch")?)
         .context("prior Pi launch intent remains; uncertain launches must not be retried")?;
     // A partial record is intentionally retained as a fence on write failure.
     serde_json::to_writer(&mut file, &intent)?;
@@ -78,7 +89,7 @@ fn proof_path(root: &Path, spec: &LaneSpec) -> PathBuf {
     root.join(format!("{}.json", spec.id))
 }
 fn read_proof(root: &Path, spec: &LaneSpec) -> Result<PiProcessProof> {
-    let path = proof_path(root, spec);
+    let path = selected_path(root, spec, "proof")?;
     let metadata = fs::symlink_metadata(&path)
         .context("no verified Worklane Pi launch is recorded; refusing to adopt a pane")?;
     if !metadata.file_type().is_file() || metadata.permissions().mode() & 0o077 != 0 {
@@ -99,7 +110,7 @@ pub(crate) fn ensure_proof_root(root: &Path) -> Result<()> {
 }
 fn save_proof(root: &Path, spec: &LaneSpec, proof: &PiProcessProof) -> Result<()> {
     ensure_proof_root(root)?;
-    let path = proof_path(root, spec);
+    let path = selected_path(root, spec, "proof")?;
     if path.exists() || fs::symlink_metadata(&path).is_ok() {
         bail!("Pi launch proof already exists; refusing to overwrite or launch a second agent")
     }
@@ -183,7 +194,7 @@ impl<R: Runner> NativePiControl for LivePi<'_, R> {
         launch: &PiLaunch,
         workspace: &Path,
     ) -> Result<AgentObservation> {
-        match fs::symlink_metadata(proof_path(self.proof_root, self.spec)) {
+        match fs::symlink_metadata(selected_path(self.proof_root, self.spec, "proof")?) {
             Ok(_) => bail!(
                 "prior Pi launch proof remains; inspect the lane instead of launching another Pi"
             ),
@@ -295,6 +306,30 @@ pub(crate) fn inspect_live_pi_with_runner<R: Runner>(
     }))
 }
 
+/** Read-only Pi process observation for a device turn. Unlike a new launch,
+ * this verifies the broker's newest chained native refresh after the original
+ * five-minute credential receipt expires. Never starts or retries a Pi process.
+ */
+pub(crate) fn inspect_live_pi_for_chat_with_runner<R: Runner>(
+    runner: &R, spec: &LaneSpec, root: &Path,
+) -> Result<Value> {
+    if spec.host != "local" || spec.profile.terminal_backend != TerminalBackend::TuiosV3 {
+        bail!("Pi chat observation requires a local managed v3 lane")
+    }
+    let _lock = lock_lane_operation(spec)?;
+    let (_, uid, _) = current_identity(runner)?;
+    let native_hash = super::managed_pi::current_broker_hash(runner,spec,&uid)?;
+    let scope = super::managed_pi::scope_for_chat(root,spec,chrono::Utc::now().timestamp(),&native_hash)?;
+    let mut control = LivePi { runner, spec, uid, proof_root: root };
+    let candidates = control.list_candidates(&spec.session_name())?;
+    let [agent] = candidates.as_slice() else {
+        bail!("Pi chat requires exactly one reserved original process")
+    };
+    control.verify_live_process(agent,false)?;
+    Ok(serde_json::json!({"lane_id":spec.id,"generation":scope.generation,
+        "proof":read_proof(root,spec)?,"observation_only":true}))
+}
+
 pub(crate) fn ensure_live_pi_with_runner<R: Runner>(
     runner: &R,
     spec: &LaneSpec,
@@ -310,7 +345,11 @@ pub(crate) fn ensure_live_pi_with_runner<R: Runner>(
     ensure_proof_root(root)?;
     // Expired/pending scoped delivery blocks both new launch and existing reuse.
     // It is not a provider-side revocation mechanism for an already running Pi.
-    super::managed_pi::scope(root, spec, chrono::Utc::now().timestamp())?;
+    let scope = super::managed_pi::scope(root, spec, chrono::Utc::now().timestamp())?;
+    if super::managed_pi::is_managed(spec)? {
+        let scoped = scope.as_ref().context("managed lane requires a delivered broker bearer before Pi launch")?;
+        super::managed_pi::start_broker_bridge(runner, spec, root, scoped)?;
+    }
     let (_, uid, _) = current_identity(runner)?;
     let mut control = LivePi {
         runner,

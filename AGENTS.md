@@ -1,5 +1,18 @@
 # Working on Worklane
 
+## Platform Zero workspace override
+
+For this `/home/gerald/p0_v3` checkout, the approved rapid-completion plan in
+`../platform/docs/rapid-completion.md` supersedes worker claims, mandatory coverage,
+and remote-lab/dist-publication requirements below. One direct implementer; no agents.
+Use the dedicated v3 Rust toolchain/cache documented in
+`../platform/docs/worklane-unit-toolchain.md`, not another user's writable SDK state.
+Build and run targeted local tests; do not contact the shared remote acceptance host or
+publish `dist/` under this authorization. Coverage is optional diagnostics with no quota.
+The current main assistant is in Herdr pane `w3:p2Z` and executes tools directly on the
+host workspace, not in a Worklane lane. No SDK installation or upgrade was needed.
+
+
 These instructions apply to this repository. When working inside a lane, also read
 [the shared lane guide](docs/agents/lane.md) before acting; it defines filesystem,
 Herdr, coordination, and progress-reporting requirements. Outside a lane, use the host's

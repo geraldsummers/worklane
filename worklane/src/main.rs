@@ -15,6 +15,7 @@ use worklane_core::*;
 
 mod api;
 mod managed_pi;
+mod managed_pi_chat;
 mod tuios_live;
 
 /// The standard lane image recipe travels with every `worklane` binary.
@@ -200,6 +201,9 @@ enum LaneAction {
         /// Skip writable-root drift detection; intended for fast dashboard polling.
         #[arg(long, hide = true)]
         fast: bool,
+        /// Observe the exact local Podman state without rewriting the frozen source registry.
+        #[arg(long, hide = true)]
+        readonly: bool,
     },
     /// Change the display name, preserving UUID, container, and Herdr session identity.
     Rename { lane: String, new_name: String },
@@ -219,8 +223,12 @@ enum LaneAction {
     /// Deliver one explicitly scoped Pi API key from JSON stdin, before first agent launch.
     /// Never reads ambient host authentication. Local opt-in v3 lanes only.
     PiCredential { lane: String },
+    /// Deliver only a generation-bound broker bearer; never the upstream provider key.
+    PiBroker { lane: String },
     /// Observe an existing Pi against its recorded process proof; never launches or retries.
     PiInspect { lane: String },
+    /// One bounded Pi RPC turn in the existing managed lane; JSON request on stdin.
+    PiChat { lane: String },
     /// Start the existing lane container.
     Start { lane: String },
     /// Start and bootstrap a lane's persistent Herdr workspace without attaching a TTY.
@@ -856,6 +864,7 @@ fn append_credential_mounts(args: &mut Vec<String>, spec: &LaneSpec) -> Result<(
     append_credential_mounts_with(args, spec, credential_mounts(spec)?, &export_gh_credentials)
 }
 fn create_local_container<R: Runner>(r: &R, spec: &LaneSpec, name: &str) -> Result<()> {
+    let managed_memory_mib = managed_pi::managed_memory_mib(spec)?;
     let mut credential_args = Vec::new();
     append_credential_mounts(&mut credential_args, spec)?;
     if !image_exists(r, &spec.profile.image)? {
@@ -875,7 +884,7 @@ fn create_local_container<R: Runner>(r: &R, spec: &LaneSpec, name: &str) -> Resu
         "--name".into(),
         name.into(),
         "--pids-limit".into(),
-        LANE_PIDS_LIMIT.into(),
+        if managed_memory_mib.is_some() { "256".into() } else { LANE_PIDS_LIMIT.into() },
         "--userns=keep-id".into(),
         "--read-only".into(),
         "--volume".into(),
@@ -905,6 +914,10 @@ fn create_local_container<R: Runner>(r: &R, spec: &LaneSpec, name: &str) -> Resu
             spec.container_home().display()
         ),
     ];
+    if let Some(memory) = managed_memory_mib {
+        a.extend(["--memory".into(), format!("{memory}m"), "--memory-swap".into(),
+            format!("{memory}m")]);
+    }
     match runtime {
         RuntimeMode::Systemd => a.extend([
             "--systemd=always".into(),
@@ -1821,7 +1834,11 @@ fn import_local_lane(runner: &impl Runner, store: &Store, path: &Path) -> Result
         bail!("manifest must be located at <directory>/.worklane/lane.toml")
     }
     let spec = read_lane_spec(&manifest, "local".into(), None)?;
-    validate_profile(&spec.profile, &spec.container_home(), true)?;
+    // Import registers a stopped lane before graph-owned runtime authorities
+    // (such as the managed Pi broker socket) exist. Mount paths are checked
+    // structurally here; local START rechecks their actual sources BEFORE
+    // creating a container. Never synthesize a broker socket for import.
+    validate_profile(&spec.profile, &spec.container_home(), false)?;
     if let Ok(existing) = store.index(&spec.id) {
         if existing.host != spec.host || existing.manifest_path != manifest {
             bail!(
@@ -2736,9 +2753,24 @@ fn execute_local_session(
     if spec.host != "local" {
         bail!("local session operation requires a local lane")
     }
+    // Import may precede the late broker socket. Every local session path
+    // must attest its real mount source before EnsureStarted or any runner
+    // action; a missing socket can never start a native container.
+    validate_profile(&spec.profile, &spec.container_home(), true)?;
     validate_tuios_image(spec)?;
     let mut snapshot = None;
-    for step in local_session_steps(spec.profile.terminal_backend, activity) {
+    // A managed broker bearer is delivered only after the container exists. Do not
+    // launch Pi during Start: Open alone launches it after broker delivery.
+    const MANAGED_START: &[LocalSessionStep] = &[
+        LocalSessionStep::EnsureStarted, LocalSessionStep::Shell, LocalSessionStep::Tuios,
+    ];
+    let steps = if spec.profile.terminal_backend == TerminalBackend::TuiosV3
+        && activity == LocalSessionActivity::Start && managed_pi::is_managed(spec)? {
+        MANAGED_START
+    } else {
+        local_session_steps(spec.profile.terminal_backend, activity)
+    };
+    for step in steps {
         let result = ops.perform(spec, *step)?;
         match step {
             LocalSessionStep::TuiosSnapshot | LocalSessionStep::HerdrSnapshot => {
@@ -3152,9 +3184,17 @@ fn main() -> Result<()> {
                 LaneAction::Import { path } => {
                     emit(cli.json, &import_local_lane(&runner, &store, &path)?)
                 }
-                LaneAction::Inspect { lane, fast } => {
+                LaneAction::Inspect { lane, fast, readonly } => {
                     let s = store.lane(&lane)?;
-                    let status = if fast {
+                    let status = if readonly {
+                        if s.host != "local" { bail!("read-only native observation requires a local lane") }
+                        let mut observed = store.lanes()?.into_iter().find(|status| status.spec.id == s.id)
+                            .context("selected lane absent from native registry")?;
+                        observed.state = host_runtime_state(&runner, &s)?;
+                        observed.runtime_started_at = host_runtime_started_at(&runner, &s, &observed.state)?;
+                        observed.cached_at = Utc::now();
+                        observed
+                    } else if fast {
                         refresh_state_only(&runner, &store, &s)?
                     } else {
                         refresh(&runner, &store, &s)?
@@ -3187,6 +3227,48 @@ fn main() -> Result<()> {
                             &data_dir().join("v3-pi-process"),
                         )?,
                     )
+                }
+                LaneAction::PiChat { lane } => {
+                    let s = store.lane(&lane)?;
+                    if s.host != "local" || s.profile.terminal_backend != TerminalBackend::TuiosV3 ||
+                        !managed_pi::is_managed(&s)? {
+                        bail!("Pi RPC chat requires the existing managed v3 lane")
+                    }
+                    // PiInspect acquires the lane lock itself; never recursively acquire it.
+                    tuios_live::inspect_live_pi_for_chat_with_runner(&runner, &s,
+                        &data_dir().join("v3-pi-process"))?;
+                    let _lock = lock_lane_operation(&s)?;
+                    ensure_no_pending_operation(&s, "pi-chat")?;
+                    verify_container_owner(&runner, &s.container_name(), &s)?;
+                    if runner.run("podman", &["info".into(), "--format".into(),
+                        "{{.Host.Security.Rootless}}".into()])?.trim() != "true" {
+                        bail!("Pi RPC chat requires rootless Podman")
+                    }
+                    let mut input = Vec::new();
+                    io::stdin().take(16385).read_to_end(&mut input)?;
+                    if input.len() > 16384 { bail!("oversized Pi RPC turn") }
+                    let request: managed_pi_chat::ChatRequest = serde_json::from_slice(&input)?;
+                    let answer = managed_pi_chat::chat(&s, &request, &data_dir())?;
+                    emit(cli.json, &managed_pi_chat::ChatResult::new(&request, &answer))
+                }
+                LaneAction::PiBroker { lane } => {
+                    let s = store.lane(&lane)?;
+                    if s.host != "local" || s.profile.terminal_backend != TerminalBackend::TuiosV3 {
+                        bail!("managed Pi broker requires a local v3 lane")
+                    }
+                    let _lock = lock_lane_operation(&s)?;
+                    ensure_no_pending_operation(&s, "pi-broker")?;
+                    let mut input = Vec::new();
+                    io::stdin().take((managed_pi::MAX_INPUT + 1) as u64).read_to_end(&mut input)?;
+                    verify_container_owner(&runner, &s.container_name(), &s)?;
+                    if runner.run("podman", &["info".into(), "--format".into(),
+                        "{{.Host.Security.Rootless}}".into()])?.trim() != "true" {
+                        bail!("managed broker requires rootless Podman")
+                    }
+                    let (_, uid, _) = current_identity(&runner)?;
+                    let scope = managed_pi::deliver_broker(&runner, &s,
+                        &data_dir().join("v3-pi-process"), &uid, &input, Utc::now().timestamp())?;
+                    emit(cli.json, &scope)
                 }
                 LaneAction::PiCredential { lane } => {
                     let s = store.lane(&lane)?;
@@ -3884,6 +3966,37 @@ mod tests {
         bad.profile.agent = AgentKind::Pi;
         bad.profile.embedded_containerfile = true;
         assert!(execute_local_session(&mock(), &bad, LocalSessionActivity::Start).is_err());
+        let missing_broker =
+            std::env::temp_dir().join(format!("worklane-missing-broker-{}", uuid::Uuid::new_v4()));
+        let mut late = native.clone();
+        late.profile.mounts.push(MountSpec {
+            source: missing_broker.clone(),
+            target: PathBuf::from("/run/worklane-pi/broker.sock"),
+            read_only: true,
+        });
+        assert!(!missing_broker.exists());
+        let no_socket = mock();
+        assert!(
+            execute_local_session(&no_socket, &late, LocalSessionActivity::Start)
+                .unwrap_err()
+                .to_string()
+                .contains("profile mount source does not exist")
+        );
+        assert!(
+            no_socket.calls.lock().unwrap().is_empty(),
+            "missing broker must not invoke EnsureStarted"
+        );
+        let no_open = mock();
+        assert!(
+            execute_local_session(&no_open, &late, LocalSessionActivity::Open)
+                .unwrap_err()
+                .to_string()
+                .contains("profile mount source does not exist")
+        );
+        assert!(
+            no_open.calls.lock().unwrap().is_empty(),
+            "missing broker must not launch Pi"
+        );
         bad = native;
         bad.host = "remote".into();
         assert!(
@@ -5459,6 +5572,16 @@ esac
         lane.profile.terminal_backend = TerminalBackend::TuiosV3;
         lane.profile.agent = AgentKind::Pi;
         lane.profile.embedded_containerfile = false;
+        let late_broker = root.join("control/run/broker.sock");
+        lane.profile.mounts.push(MountSpec {
+            source: late_broker.clone(),
+            target: PathBuf::from("/run/worklane-pi/broker.sock"),
+            read_only: true,
+        });
+        assert!(
+            !late_broker.exists(),
+            "import must not fabricate a runtime broker"
+        );
         std::fs::create_dir_all(&lane.project_path).unwrap();
         write_lane_spec(&lane).unwrap();
         std::fs::write(lane.project_path.join("user-data"), "persistent").unwrap();

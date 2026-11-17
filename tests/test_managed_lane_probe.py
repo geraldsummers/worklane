@@ -66,6 +66,18 @@ class ManagedPiDeliveryTests(unittest.TestCase):
             self.assertNotEqual(self.run_program(link).returncode, 0)
             self.assertEqual(list(external.iterdir()), [])
 
+    def test_scoped_broker_delivery_keeps_upstream_key_out_of_lane_and_preserves_model(self):
+        source = SOURCE.read_text()
+        broker = re.findall(r'const BROKER_INSTALL: &str = r#"(.*?)"#;', source, re.S)
+        self.assertEqual(len(broker), 1)
+        self.assertIn('broker_token', broker[0])
+        self.assertIn("'baseUrl': 'http://127.0.0.1:8765/v1'", broker[0])
+        self.assertIn("('auth.json'", broker[0])
+        self.assertNotIn('OPENAI_API_KEY', broker[0])
+        self.assertIn('managed generation forbids direct upstream credential delivery', source)
+        self.assertIn('broker relay launch already attempted; no automatic retry', source)
+        self.assertIn('SOCKET = \'/run/worklane-pi/broker.sock\'', source)
+
     def test_v3_image_supervises_native_daemon_without_automatic_agent_replay(self):
         image = (ROOT / 'Containerfile.v3').read_text()
         for text in ('user-runtime-dir@1000.service', 'user@1000.service',
